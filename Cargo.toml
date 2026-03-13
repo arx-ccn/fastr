@@ -1,0 +1,55 @@
+[package]
+name    = "fastr"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fastr"
+path = "src/main.rs"
+
+[lib]
+name = "fastr"
+path = "src/lib.rs"
+
+[dependencies]
+tokio             = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.29"
+# futures-util: SinkExt/StreamExt traits for WebSocket split; re-exported by tungstenite but must be in scope
+futures-util       = { version = "0.3", default-features = false, features = ["sink", "async-await"] }
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+thiserror         = "2"
+tracing           = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes             = "1"
+# secp256k1: NIP-01 mandates schnorr sig verify; std has no crypto primitives
+secp256k1         = "0.31"
+# anyhow: error handling in the binary (main.rs); not used in library code
+anyhow            = "1"
+# sha2: event ID is SHA-256 of canonical JSON; std has no hash implementation
+sha2              = "0.10"
+# arc-swap: lock-free atomic Arc swap for mmap hot-swapping during compaction
+arc-swap          = "1"
+# httparse: NIP-11 HTTP header parsing for relay info requests; already a transitive dep of tokio-tungstenite
+httparse          = "1"
+
+[dev-dependencies]
+criterion = { version = "0.8" }
+# tempfile: isolated temp dirs for storage integration tests; no std equivalent
+tempfile = "3"
+
+[[bin]]
+name = "fastr-bench"
+path = "bench/driver.rs"
+
+[[bench]]
+name    = "pack"
+harness = false
+
+[[bench]]
+name    = "validate"
+harness = false
+
+[[bench]]
+name    = "query"
+harness = false

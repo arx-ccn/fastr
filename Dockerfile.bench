@@ -1,0 +1,111 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Dockerfile.bench - fastr vs strfry end-to-end benchmark
+#
+# Requires BuildKit (Docker 20.10+):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.bench -t fastr-bench .
+#
+# Run (appends a result table to BENCHMARKS.md in the repo checkout):
+#   docker run --rm \
+#     -v "$(pwd)/BENCHMARKS.md:/results/BENCHMARKS.md" \
+#     --privileged \
+#     --cpus 2 --memory 2g \
+#     fastr-bench
+#
+# The container starts each relay on an isolated port, drives both with the
+# fastr-bench driver, then appends a timestamped markdown table.
+#
+# Environment variables (all optional):
+#   EVENTS      - events to ingest per relay   (default: 50000)
+#   QUERIES     - REQ queries to run per relay  (default: 5000)
+#   CONCURRENCY - parallel workers              (default: 8)
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Stage 1 - build fastr release binaries
+# -----------------------------------------------------------------------------
+FROM rust:slim-trixie AS fastr-builder
+
+WORKDIR /build
+
+# Cache dependency compilation separately from source.
+COPY Cargo.toml Cargo.lock ./
+COPY benches/ benches/
+COPY bench/   bench/
+
+# Stub src/ so Cargo can resolve the workspace graph without real source.
+RUN mkdir -p src && \
+  printf 'pub fn _stub() {}\n' > src/lib.rs && \
+  printf 'fn main() {}\n'      > src/main.rs && \
+  cargo build --release --bin fastr --bin fastr-bench 2>/dev/null || true
+
+# Real source - touch to force rebuild of the stubs.
+COPY src/ src/
+RUN touch src/lib.rs src/main.rs && \
+  cargo build --release --bin fastr --bin fastr-bench
+
+RUN strip target/release/fastr target/release/fastr-bench
+
+
+# -----------------------------------------------------------------------------
+# Stage 2 - build strfry from source
+#
+# Dependencies follow the Debian/Ubuntu section of the strfry README exactly.
+# strfry bundles its own WebSocket + HTTP stack (golpe/uWS), so libwebsockets
+# is NOT needed.
+# -----------------------------------------------------------------------------
+FROM debian:trixie AS strfry-builder
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+  git ca-certificates \
+  g++ make cmake pkg-config \
+  libssl-dev zlib1g-dev \
+  liblmdb-dev \
+  libflatbuffers-dev flatbuffers-compiler \
+  libsecp256k1-dev \
+  libzstd-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+ARG STRFRY_REF=master
+RUN git clone --depth 1 --branch "${STRFRY_REF}" \
+  https://github.com/hoytech/strfry.git . && \
+  git submodule update --init --recursive
+
+# strfry README: make setup-golpe && make -j4
+RUN make setup-golpe && make -j"$(nproc)"
+
+RUN strip strfry
+
+
+# -----------------------------------------------------------------------------
+# Stage 3 - benchmark runner
+# -----------------------------------------------------------------------------
+FROM debian:trixie-slim AS runner
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+  ca-certificates \
+  liblmdb0 libzstd1 libssl3 libsecp256k1-2 \
+  procps linux-perf \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=fastr-builder  /build/target/release/fastr       /usr/local/bin/fastr
+COPY --from=fastr-builder  /build/target/release/fastr-bench /usr/local/bin/fastr-bench
+COPY --from=strfry-builder /build/strfry                     /usr/local/bin/strfry
+
+# run_bench.sh generates a per-run config for strfry into a tmpfile.
+# No static config file needed here.
+
+ENV RESULTS_FILE=/results/BENCHMARKS.md \
+  EVENTS=50000 \
+  QUERIES=5000 \
+  CONCURRENCY=8
+
+RUN mkdir -p /results
+
+COPY bench/run_bench.sh /usr/local/bin/run_bench.sh
+RUN chmod +x /usr/local/bin/run_bench.sh
+
+ENTRYPOINT ["/usr/local/bin/run_bench.sh"]
