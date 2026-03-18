@@ -1,0 +1,26 @@
+services:
+  fastr:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: fastr:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - fastr-data:/data
+    environment:
+      FASTR_ADDR: "0.0.0.0"
+      FASTR_PORT: "8080"
+      FASTR_DATA_DIR: "/data"
+      # FASTR_MAX_CONNECTIONS: "1024"
+      # FASTR_MAX_SUBSCRIPTIONS: "20"
+      # FASTR_MAX_FILTERS: "10"
+      # FASTR_MAX_LIMIT: "500"
+      # FASTR_MAX_MESSAGE_BYTES: "131072"
+      # FASTR_COMPACT_INTERVAL: "21600"
+
+volumes:
+  fastr-data:
+    # For host bind mounts, the directory must be owned by UID 65532:
+    #   mkdir -p /path/to/data && chown 65532:65532 /path/to/data

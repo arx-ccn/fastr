@@ -22,26 +22,25 @@ We did it, nostr!
 
 500k events, 8 CPU / 8 GB RAM, 50k queries:
 
-```
-Metric                         fastr       strfry      difference
-────────────────────────────────────────────────────────────────────
-Ingest throughput (ev/s)       60,477         240           252x (brrrrrrrr)
-Ingest OK p50 latency (us)        127      27,918           219x (Speedrun)
-Ingest OK p99 latency (us)        292      83,870           287x
-REQ query throughput (q/s)     22,438       2,799             8x
-REQ->EOSE p50 latency (us)        337       2,799             8x
-REQ->EOSE p99 latency (us)        555       4,010             7x
-Peak RSS @ 500k events          53 MB       494 MB            9x (Smol brain memory)
-Disk usage @ 500k events       119 MB       526 MB            4x
-Disk I/O written               119 MB    94,154 MB          791x  <-- not a troll
-CPU Mcycles (user)            120,505     495,299             4x
-CPU Mcycles (kernel)           56,091   2,091,482            37x (Low effort)
-Syscalls                    4,852,642  73,960,150            15x (Less yap)
-Context switches            1,172,371  23,315,664            20x (Stay focused)
-```
+| Metric | fastr | strfry | difference |
+|--------|------:|-------:|------------|
+| Ingest throughput (ev/s) | 60,477 | 240 | **252x** (brrrrrrrr) |
+| Ingest OK p50 latency (us) | 127 | 27,918 | **219x** (Speedrun) |
+| Ingest OK p99 latency (us) | 292 | 83,870 | **287x** |
+| REQ query throughput (q/s) | 22,438 | 2,799 | **8x** |
+| REQ->EOSE p50 latency (us) | 337 | 2,799 | **8x** |
+| REQ->EOSE p99 latency (us) | 555 | 4,010 | **7x** |
+| Peak RSS @ 500k events | 53 MB | 494 MB | **9x** (Smol brain memory) |
+| Disk usage @ 500k events | 119 MB | 526 MB | **4x** |
+| Disk I/O written | 119 MB | 94,154 MB | **791x** ← not a troll |
+| CPU Mcycles (user) | 120,505 | 495,299 | **4x** |
+| CPU Mcycles (kernel) | 56,091 | 2,091,482 | **37x** (Low effort) |
+| Syscalls | 4,852,642 | 73,960,150 | **15x** (Less yap) |
+| Context switches | 1,172,371 | 23,315,664 | **20x** (Stay focused) |
+| Docker image size | 5.76 MB | 190 MB | **33x** (Tiny box) |
 
 strfry wrote **94 GB** of journal brainrot just to ingest 500k immutable events.
-fastr wrote **119 MB**.  
+fastr wrote **119 MB**.
 
 <div align="center">
  <img src="https://blossom.primal.net/d038c06bb3a209af4fb178906ec11e754578bc820bfb2fae81b531bd21064702.png" alt="fastr war criminal mogging strfry" width="600" />
@@ -150,6 +149,127 @@ Import events:
 ```
 
 Accepts bare event objects or `["EVENT", {...}]` envelopes, because the world is chaotic and we accept both.
+
+---
+
+## Deploy
+
+### Quick install
+
+```sh
+cargo build --release
+sudo ./deploy/install.sh
+```
+
+Auto-detects systemd, OpenRC, runit, FreeBSD rc.d, or macOS launchd.
+
+---
+
+### systemd
+
+```sh
+install -m 755 target/release/fastr /usr/local/bin/fastr
+useradd -r -s /usr/sbin/nologin fastr
+install -d -o fastr -g fastr /var/lib/fastr/data
+cp deploy/fastr.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now fastr
+```
+
+### OpenRC (Alpine Linux, Gentoo, Artix)
+
+```sh
+install -m 755 target/release/fastr /usr/local/bin/fastr
+adduser -S -D -H -s /sbin/nologin fastr
+install -d -o fastr -g fastr /var/lib/fastr/data
+install -m 755 deploy/fastr.openrc /etc/init.d/fastr
+rc-update add fastr default
+rc-service fastr start
+```
+
+### runit (Void Linux)
+
+```sh
+install -m 755 target/release/fastr /usr/local/bin/fastr
+useradd -r -s /usr/sbin/nologin fastr
+install -d -o fastr -g fastr /var/lib/fastr/data
+mkdir -p /etc/sv/fastr
+install -m 755 deploy/fastr.runit /etc/sv/fastr/run
+ln -s /etc/sv/fastr /var/service/fastr
+```
+
+### FreeBSD
+
+```sh
+install -m 755 target/release/fastr /usr/local/bin/fastr
+pw useradd fastr -s /usr/sbin/nologin -d /nonexistent -c "fastr nostr relay"
+install -d -o fastr -g fastr /var/db/fastr/data
+install -m 555 deploy/fastr.rc /usr/local/etc/rc.d/fastr
+sysrc fastr_enable="YES"
+service fastr start
+```
+
+### macOS
+
+```sh
+install -m 755 target/release/fastr /usr/local/bin/fastr
+sudo install -m 644 deploy/fastr.plist /Library/LaunchDaemons/com.arx-ccn.fastr.plist
+sudo launchctl load -w /Library/LaunchDaemons/com.arx-ccn.fastr.plist
+```
+
+### Docker
+
+```sh
+docker build --network=host -f deploy/Dockerfile -t fastr .
+docker run -d \
+  -p 127.0.0.1:8080:8080 \
+  -v fastr-data:/data \
+  --name fastr \
+  fastr
+```
+
+Or with Compose:
+
+```sh
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+`--network=host` may be needed at build time for Cargo to reach crates.io. The container itself runs without it, as a non-root user.
+
+---
+
+### TLS
+
+fastr does not handle TLS. Put a reverse proxy in front of it. nginx example:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name relay.example.com;
+
+    ssl_certificate     /etc/ssl/certs/relay.example.com.pem;
+    ssl_certificate_key /etc/ssl/private/relay.example.com.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+Caddy handles cert renewal automatically:
+
+```caddy
+relay.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+fastr doesn't do TLS. TLS termination belongs at the edge, not in the relay. One proxy, one job.
 
 ---
 

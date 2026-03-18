@@ -1,0 +1,36 @@
+#!/bin/sh
+
+# PROVIDE: fastr
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="fastr"
+rcvar="fastr_enable"
+
+load_rc_config $name
+
+: ${fastr_enable:="NO"}
+: ${fastr_user:="fastr"}
+: ${fastr_group:="fastr"}
+: ${fastr_addr:="127.0.0.1"}
+: ${fastr_port:="8080"}
+: ${fastr_data_dir:="/var/db/fastr/data"}
+: ${fastr_log:="/var/log/fastr.log"}
+
+command="/usr/local/bin/fastr"
+command_interpreter=""
+pidfile="/var/run/${name}.pid"
+
+start_precmd="fastr_prestart"
+fastr_prestart()
+{
+    install -d -o ${fastr_user} -g ${fastr_group} ${fastr_data_dir}
+}
+
+export FASTR_ADDR="${fastr_addr}"
+export FASTR_PORT="${fastr_port}"
+export FASTR_DATA_DIR="${fastr_data_dir}"
+
+run_rc_command "$1"

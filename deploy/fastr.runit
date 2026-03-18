@@ -1,0 +1,25 @@
+#!/bin/sh
+# runit service script for fastr
+# Install: cp -r /path/to/fastr-sv /etc/sv/fastr
+#          ln -s /etc/sv/fastr /var/service/fastr
+#
+# This file must be named 'run' in the service directory.
+# runit requires exec; the process must stay in the foreground.
+
+exec 2>&1
+
+# Drop privileges if running as root
+if [ "$(id -u)" = "0" ]; then
+    exec chpst -u fastr:fastr \
+        env \
+            FASTR_ADDR="${FASTR_ADDR:-127.0.0.1}" \
+            FASTR_PORT="${FASTR_PORT:-8080}" \
+            FASTR_DATA_DIR="${FASTR_DATA_DIR:-/var/lib/fastr/data}" \
+        /usr/local/bin/fastr
+else
+    exec env \
+        FASTR_ADDR="${FASTR_ADDR:-127.0.0.1}" \
+        FASTR_PORT="${FASTR_PORT:-8080}" \
+        FASTR_DATA_DIR="${FASTR_DATA_DIR:-/var/lib/fastr/data}" \
+    /usr/local/bin/fastr
+fi
