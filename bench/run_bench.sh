@@ -184,7 +184,7 @@ bench_relay() {
 
   local neg_wall_ms
   neg_wall_ms="$(printf '%s\n' "${neg_out}" |
-    awk '/^Wall time:/{gsub(/[^0-9.]/,"",$NF); print $NF; exit}')"
+    awk '/^Wall time:/{gsub(/[^0-9.]/,"",$NF); printf "%.0f\n", $NF; exit}')"
 
   log "--- ${label}: query (${QUERIES} queries, concurrency ${CONCURRENCY}) ---"
   local query_out

@@ -938,14 +938,18 @@ impl Store {
     /// the same p-tag semantics as `query_authed`. The callback `f` is invoked once per matching
     /// event with its `created_at` timestamp and event `id`.
     ///
+    /// # Errors
+    ///
+    /// Returns an `Err` if internal locking fails (e.g., tombstone lock is poisoned).
+    ///
     /// # Examples
     ///
     /// ```
     /// let mut collected: Vec<(i64, [u8;32])> = Vec::new();
-    /// store.iter_negentropy(&filter, None, |ts, id| collected.push((ts, id)));
+    /// store.iter_negentropy(&filter, None, |ts, id| collected.push((ts, id)))?;
     /// // `collected` is sorted ascending by (created_at, id)
     /// ```
-    pub fn iter_negentropy<F>(&self, filter: &Filter, auth_pk: Option<&[u8; 32]>, mut f: F)
+    pub fn iter_negentropy<F>(&self, filter: &Filter, auth_pk: Option<&[u8; 32]>, mut f: F) -> Result<(), Error>
     where
         F: FnMut(i64, [u8; 32]),
     {
@@ -996,10 +1000,10 @@ impl Store {
         };
 
         let now = unix_now();
-        let tombstones = match self.tombstones.read() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
+        let tombstones = self
+            .tombstones
+            .read()
+            .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?;
 
         let mut items: Vec<(i64, [u8; 32])> = Vec::new();
 
@@ -1045,6 +1049,7 @@ impl Store {
         for (ts, id) in items {
             f(ts, id);
         }
+        Ok(())
     }
 
     /// Returns the number of tombstoned events.

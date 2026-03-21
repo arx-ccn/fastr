@@ -621,11 +621,15 @@ async fn handle_neg_open(
     let auth_pk = auth.authenticated.as_ref().map(|pk| &pk.0);
     let mut storage = NegentropyStorageVector::new();
 
-    store.iter_negentropy(&filter, auth_pk, |ts, id| {
+    if let Err(e) = store.iter_negentropy(&filter, auth_pk, |ts, id| {
         // Errors from insert are non-fatal (e.g. out-of-order should not happen since
         // iter_negentropy returns sorted items).
         let _ = storage.insert(ts as u64, NegId::from_byte_array(id));
-    });
+    }) {
+        let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+        let _ = out_tx.send(Out::Text(err)).await;
+        return;
+    }
 
     if let Err(e) = storage.seal() {
         let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
