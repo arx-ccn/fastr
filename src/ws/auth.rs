@@ -58,11 +58,7 @@ impl AuthState {
 /// 5. Signature valid (via `validate_event`)
 ///
 /// Returns `Ok(Pubkey)` on success, `Err(reason)` on failure.
-pub fn verify_auth_event(
-    ev: &Event,
-    expected_challenge: &str,
-    relay_url: &str,
-) -> Result<Pubkey, String> {
+pub fn verify_auth_event(ev: &Event, expected_challenge: &str, relay_url: &str) -> Result<Pubkey, String> {
     // 1. Kind check.
     if ev.kind != KIND_AUTH {
         return Err("auth-required: wrong event kind".to_owned());
@@ -87,10 +83,7 @@ pub fn verify_auth_event(
     let relay_domain = url_domain(relay_url);
     let has_relay = ev.tags.iter().any(|t| {
         t.fields.first().map(String::as_str) == Some("relay")
-            && t.fields
-                .get(1)
-                .map(|u| url_domain(u) == relay_domain)
-                .unwrap_or(false)
+            && t.fields.get(1).map(|u| url_domain(u) == relay_domain).unwrap_or(false)
     });
     if !has_relay {
         return Err("auth-required: bad relay URL".to_owned());
@@ -131,13 +124,7 @@ mod tests {
     use secp256k1::{Keypair, Secp256k1, SecretKey};
     use sha2::{Digest, Sha256};
 
-    fn make_auth_event(
-        sk_scalar: u8,
-        kind: u16,
-        created_at: i64,
-        challenge: &str,
-        relay_url: &str,
-    ) -> Event {
+    fn make_auth_event(sk_scalar: u8, kind: u16, created_at: i64, challenge: &str, relay_url: &str) -> Event {
         let secp = Secp256k1::new();
         let mut sk_bytes = [0u8; 32];
         sk_bytes[31] = sk_scalar;
@@ -221,10 +208,7 @@ mod tests {
 
     #[test]
     fn test_url_domain_extraction() {
-        assert_eq!(
-            url_domain("ws://relay.example.com/path"),
-            "relay.example.com"
-        );
+        assert_eq!(url_domain("ws://relay.example.com/path"), "relay.example.com");
         assert_eq!(url_domain("wss://relay.example.com"), "relay.example.com");
         assert_eq!(url_domain("ws://127.0.0.1:8080"), "127.0.0.1:8080");
         assert_eq!(url_domain("noscheme"), "noscheme");

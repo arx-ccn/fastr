@@ -12,7 +12,9 @@ use tracing::{debug, warn};
 use crate::config::Config;
 use crate::db::Store;
 use crate::error::Error;
-use crate::nostr::{classify_kind, has_protected_tag, parse_client_msg, validate_event, ClientMsg, Filter, KindClass, ServerMsg};
+use crate::nostr::{
+    classify_kind, has_protected_tag, parse_client_msg, validate_event, ClientMsg, Filter, KindClass, ServerMsg,
+};
 use crate::pack::{self, Event, EventId};
 use crate::ws::auth::{verify_auth_event, AuthState};
 use crate::ws::fanout::{Fanout, LiveEvent};
@@ -137,9 +139,7 @@ where
             // NIP-17: kind-1059 (gift-wrapped DM) only delivered to the p-tag recipient.
             if le.event.kind == crate::nostr::KIND_GIFT_WRAP {
                 let auth_pk = auth_pk_fwd.read().ok().and_then(|g| g.clone());
-                let allowed = auth_pk.map_or(false, |pk| {
-                    crate::nostr::event_has_p_tag(&le.event, &pk.0)
-                });
+                let allowed = auth_pk.is_some_and(|pk| crate::nostr::event_has_p_tag(&le.event, &pk.0));
                 if !allowed {
                     continue;
                 }
@@ -263,9 +263,7 @@ where
                     Ok(ClientMsg::NegOpen { sub_id, filter, msg }) => {
                         // If replacing a Live subscription, unsubscribe from fanout first.
                         remove_sub(&sub_id, &mut subs, &fanout, &live_tx).await;
-                        handle_neg_open(
-                            sub_id, filter, msg, &store, &config, &auth, &out_tx, &mut subs,
-                        ).await;
+                        handle_neg_open(sub_id, filter, msg, &store, &config, &auth, &out_tx, &mut subs).await;
                     }
                     Ok(ClientMsg::NegMsg { sub_id, msg }) => {
                         handle_neg_msg(sub_id, msg, &out_tx, &mut subs).await;
@@ -338,11 +336,9 @@ async fn handle_event(
     }
 
     // NIP-70: reject protected events unless AUTH'd as the event author
-    if has_protected_tag(&ev.tags) {
-        if auth.authenticated.as_ref() != Some(&ev.pubkey) {
-            send_ok(&id, false, "auth-required: protected event", out_tx).await;
-            return;
-        }
+    if has_protected_tag(&ev.tags) && auth.authenticated.as_ref() != Some(&ev.pubkey) {
+        send_ok(&id, false, "auth-required: protected event", out_tx).await;
+        return;
     }
 
     // Kind classification - ephemeral events skip storage
@@ -446,6 +442,7 @@ async fn handle_event(
 /// ).await;
 /// # }
 /// ```
+#[allow(clippy::too_many_arguments)]
 async fn handle_req(
     sub_id: String,
     mut filters: Vec<Filter>,
@@ -532,12 +529,7 @@ async fn handle_req(
 /// let msg = format!(r#"["COUNT",{},{{"count":{}}}]"#, escaped_id, total);
 /// assert_eq!(msg, r#"["COUNT","s1",{"count":42}]"#);
 /// ```
-async fn handle_count(
-    sub_id: &str,
-    filters: &[Filter],
-    store: &Arc<Store>,
-    out_tx: &mpsc::Sender<Out>,
-) {
+async fn handle_count(sub_id: &str, filters: &[Filter], store: &Arc<Store>, out_tx: &mpsc::Sender<Out>) {
     let total: u64 = filters.iter().map(|f| store.count(f)).sum();
     let escaped_id = serde_json::to_string(sub_id).unwrap_or_else(|_| "\"\"".to_owned());
     let msg = format!(r#"["COUNT",{},{{"count":{}}}]"#, escaped_id, total);
@@ -600,6 +592,7 @@ async fn remove_sub(
 /// // handle_neg_open(sub_id, filter, msg, &store, &config, &auth, &out_tx, &mut subs).await;
 /// # }
 /// ```
+#[allow(clippy::too_many_arguments)]
 async fn handle_neg_open(
     sub_id: String,
     filter: Filter,
@@ -612,7 +605,10 @@ async fn handle_neg_open(
 ) {
     // Check subscription limit (caller already removed any existing sub with this id).
     if subs.len() >= config.max_subscriptions_per_conn {
-        let notice = ServerMsg::Notice { message: "too many subscriptions" }.to_json();
+        let notice = ServerMsg::Notice {
+            message: "too many subscriptions",
+        }
+        .to_json();
         let _ = out_tx.send(Out::Text(notice)).await;
         return;
     }
@@ -629,19 +625,31 @@ async fn handle_neg_open(
             }
         }
     }) {
-        let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+        let err = ServerMsg::NegErr {
+            sub_id: &sub_id,
+            reason: &e.to_string(),
+        }
+        .to_json();
         let _ = out_tx.send(Out::Text(err)).await;
         return;
     }
 
     if let Some(err_msg) = insert_error {
-        let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &err_msg }.to_json();
+        let err = ServerMsg::NegErr {
+            sub_id: &sub_id,
+            reason: &err_msg,
+        }
+        .to_json();
         let _ = out_tx.send(Out::Text(err)).await;
         return;
     }
 
     if let Err(e) = storage.seal() {
-        let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+        let err = ServerMsg::NegErr {
+            sub_id: &sub_id,
+            reason: &e.to_string(),
+        }
+        .to_json();
         let _ = out_tx.send(Out::Text(err)).await;
         return;
     }
@@ -649,7 +657,11 @@ async fn handle_neg_open(
     let mut neg = match Negentropy::owned(storage, config.max_message_bytes as u64) {
         Ok(n) => n,
         Err(e) => {
-            let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+            let err = ServerMsg::NegErr {
+                sub_id: &sub_id,
+                reason: &e.to_string(),
+            }
+            .to_json();
             let _ = out_tx.send(Out::Text(err)).await;
             return;
         }
@@ -658,11 +670,19 @@ async fn handle_neg_open(
     // Reconcile.
     match neg.reconcile(&msg) {
         Err(e) => {
-            let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+            let err = ServerMsg::NegErr {
+                sub_id: &sub_id,
+                reason: &e.to_string(),
+            }
+            .to_json();
             let _ = out_tx.send(Out::Text(err)).await;
         }
         Ok(reply) => {
-            let resp = ServerMsg::NegMsg { sub_id: &sub_id, msg: &reply }.to_json();
+            let resp = ServerMsg::NegMsg {
+                sub_id: &sub_id,
+                msg: &reply,
+            }
+            .to_json();
             let _ = out_tx.send(Out::Text(resp)).await;
             // Always store the session — the client drives NEG-CLOSE when done.
             // The server-side reconcile reply is never empty (always contains at
@@ -697,16 +717,15 @@ async fn handle_neg_open(
 /// let incoming = vec![ /* negentropy payload bytes */ ];
 /// // handle_neg_msg(sub_id, incoming, &out_tx, &mut subs).await;
 /// ```
-async fn handle_neg_msg(
-    sub_id: String,
-    msg: Vec<u8>,
-    out_tx: &mpsc::Sender<Out>,
-    subs: &mut HashMap<String, Sub>,
-) {
+async fn handle_neg_msg(sub_id: String, msg: Vec<u8>, out_tx: &mpsc::Sender<Out>, subs: &mut HashMap<String, Sub>) {
     let neg = match subs.get_mut(&sub_id) {
         Some(Sub::Neg(n)) => n,
         _ => {
-            let err = ServerMsg::NegErr { sub_id: &sub_id, reason: "session not found" }.to_json();
+            let err = ServerMsg::NegErr {
+                sub_id: &sub_id,
+                reason: "session not found",
+            }
+            .to_json();
             let _ = out_tx.send(Out::Text(err)).await;
             return;
         }
@@ -714,12 +733,20 @@ async fn handle_neg_msg(
 
     match neg.reconcile(&msg) {
         Err(e) => {
-            let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+            let err = ServerMsg::NegErr {
+                sub_id: &sub_id,
+                reason: &e.to_string(),
+            }
+            .to_json();
             let _ = out_tx.send(Out::Text(err)).await;
             subs.remove(&sub_id);
         }
         Ok(reply) => {
-            let resp = ServerMsg::NegMsg { sub_id: &sub_id, msg: &reply }.to_json();
+            let resp = ServerMsg::NegMsg {
+                sub_id: &sub_id,
+                msg: &reply,
+            }
+            .to_json();
             let _ = out_tx.send(Out::Text(resp)).await;
             // Session stays alive until client sends NEG-CLOSE.
         }
@@ -755,9 +782,7 @@ mod tests {
         format!("[\"EVENT\",{}]", event_json(ev))
     }
 
-    type WsClient = tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >;
+    type WsClient = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
     async fn connect(port: u16) -> WsClient {
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
@@ -858,9 +883,7 @@ mod tests {
     async fn test_req_stored_events_and_eose() {
         let (port, store) = spawn_server().await;
         for i in 1u8..=3 {
-            store
-                .append(&make_event(i, 1, i as i64 * 1000, vec![]))
-                .unwrap();
+            store.append(&make_event(i, 1, i as i64 * 1000, vec![])).unwrap();
         }
 
         let mut ws = connect(port).await;
@@ -894,9 +917,7 @@ mod tests {
     async fn test_req_empty_store_eose() {
         let (port, _) = spawn_server().await;
         let mut ws = connect(port).await;
-        ws.send(TMsg::Text(r#"["REQ","s1",{}]"#.into()))
-            .await
-            .unwrap();
+        ws.send(TMsg::Text(r#"["REQ","s1",{}]"#.into())).await.unwrap();
         let resp = recv_text(&mut ws).await;
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v[0], "EOSE");
@@ -949,21 +970,14 @@ mod tests {
             }
         }
 
-        subscriber
-            .send(TMsg::Text(r#"["CLOSE","live"]"#.into()))
-            .await
-            .unwrap();
+        subscriber.send(TMsg::Text(r#"["CLOSE","live"]"#.into())).await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
 
         let ev = make_event(2, 1, 1_700_000_002, vec![]);
         publisher.send(TMsg::Text(event_msg(&ev).into())).await.unwrap();
         let _ = recv_text(&mut publisher).await;
 
-        let r = tokio::time::timeout(
-            tokio::time::Duration::from_millis(80),
-            recv_text(&mut subscriber),
-        )
-        .await;
+        let r = tokio::time::timeout(tokio::time::Duration::from_millis(80), recv_text(&mut subscriber)).await;
         assert!(r.is_err(), "no live event expected after CLOSE");
     }
 
@@ -977,14 +991,9 @@ mod tests {
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("NOTICE"), "expected NOTICE: {resp}");
         // Connection must remain alive.
-        ws.send(TMsg::Text(r#"["REQ","alive",{}]"#.into()))
-            .await
-            .unwrap();
+        ws.send(TMsg::Text(r#"["REQ","alive",{}]"#.into())).await.unwrap();
         let eose = recv_text(&mut ws).await;
-        assert!(
-            eose.contains("EOSE"),
-            "connection must still be alive: {eose}"
-        );
+        assert!(eose.contains("EOSE"), "connection must still be alive: {eose}");
     }
 
     #[tokio::test]
@@ -994,11 +1003,9 @@ mod tests {
         store.append(&make_event(2, 2, 2000, vec![])).unwrap();
 
         let mut ws = connect(port).await;
-        ws.send(TMsg::Text(
-            r#"["REQ","s1",{"kinds":[1]},{"kinds":[2]}]"#.into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(TMsg::Text(r#"["REQ","s1",{"kinds":[1]},{"kinds":[2]}]"#.into()))
+            .await
+            .unwrap();
 
         let mut events = 0;
         for _ in 0..20 {
@@ -1057,12 +1064,7 @@ mod tests {
 
     // NIP-42 handler tests
 
-    fn make_auth_event_for_conn(
-        sk_scalar: u8,
-        challenge: &str,
-        relay_url: &str,
-        created_at_offset: i64,
-    ) -> Event {
+    fn make_auth_event_for_conn(sk_scalar: u8, challenge: &str, relay_url: &str, created_at_offset: i64) -> Event {
         use crate::nostr::canonical_json;
         use crate::pack::{EventId, Sig, Tag};
         use secp256k1::{Keypair, Secp256k1, SecretKey};
@@ -1075,10 +1077,7 @@ mod tests {
         let sk = SecretKey::from_byte_array(sk_bytes).unwrap();
         let kp = Keypair::from_secret_key(&secp, &sk);
         let (xonly, _) = kp.x_only_public_key();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
         let mut ev = Event {
             id: EventId([0u8; 32]),
@@ -1169,9 +1168,7 @@ mod tests {
         let _ = recv_text(&mut ws).await; // consume OK
 
         // A REQ for all events should return 0 stored events (AUTH event not stored).
-        ws.send(TMsg::Text(r#"["REQ","s1",{}]"#.into()))
-            .await
-            .unwrap();
+        ws.send(TMsg::Text(r#"["REQ","s1",{}]"#.into())).await.unwrap();
         let mut event_count = 0;
         loop {
             let r = recv_text(&mut ws).await;
@@ -1202,7 +1199,7 @@ mod tests {
         assert!(resp.contains("true"), "ephemeral event should be accepted: {resp}");
 
         // Query for it - should NOT be stored
-        let req = format!(r#"["REQ","sub1",{{"kinds":[20001]}}]"#);
+        let req = r#"["REQ","sub1",{"kinds":[20001]}]"#.to_string();
         ws.send(req.into()).await.unwrap();
         let resp = recv_text(&mut ws).await;
         // Should get EOSE immediately with no events
@@ -1238,7 +1235,14 @@ mod tests {
         // recv_text() already skips AUTH challenges transparently
 
         // Send event with protected tag ["-"] - without AUTH
-        let ev = make_event(1, 1, 0, vec![Tag { fields: vec!["-".into()] }]);
+        let ev = make_event(
+            1,
+            1,
+            0,
+            vec![Tag {
+                fields: vec!["-".into()],
+            }],
+        );
         let msg = event_msg(&ev);
         ws.send(msg.into()).await.unwrap();
 
@@ -1265,7 +1269,14 @@ mod tests {
         assert!(resp.contains("true"), "vanish should be accepted: {resp}");
 
         // Try to send another event from author 1 - should be blocked
-        let ev2 = make_event(1, 1, 0, vec![Tag { fields: vec!["x".into()] }]);
+        let ev2 = make_event(
+            1,
+            1,
+            0,
+            vec![Tag {
+                fields: vec!["x".into()],
+            }],
+        );
         ws.send(event_msg(&ev2).into()).await.unwrap();
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("false"), "post-vanish event should be rejected: {resp}");
@@ -1275,9 +1286,7 @@ mod tests {
     #[tokio::test]
     async fn test_nip42_unauthenticated_req_works() {
         let (port, store) = spawn_server().await;
-        store
-            .append(&make_event(1, 1, 1_700_000_000, vec![]))
-            .unwrap();
+        store.append(&make_event(1, 1, 1_700_000_000, vec![])).unwrap();
 
         let mut ws = connect(port).await;
         ws.send(TMsg::Text(r#"["REQ","s1",{"kinds":[1]}]"#.into()))
@@ -1309,7 +1318,14 @@ mod tests {
         ws.send(event_msg(&ev1).into()).await.unwrap();
         let _ = recv_text(&mut ws).await; // OK
 
-        let ev2 = make_event(1, 1, 0, vec![Tag { fields: vec!["x".into()] }]);
+        let ev2 = make_event(
+            1,
+            1,
+            0,
+            vec![Tag {
+                fields: vec!["x".into()],
+            }],
+        );
         ws.send(event_msg(&ev2).into()).await.unwrap();
         let _ = recv_text(&mut ws).await; // OK
 
@@ -1356,15 +1372,21 @@ mod tests {
         let recipient_hex = crate::nostr::hex_encode_bytes(&xonly.serialize());
 
         // Store a kind-1059 gift-wrapped event with p-tag pointing to recipient.
-        let ev = make_event(1, 1059, 1_700_000_000, vec![
-            Tag { fields: vec!["p".into(), recipient_hex] },
-        ]);
+        let ev = make_event(
+            1,
+            1059,
+            1_700_000_000,
+            vec![Tag {
+                fields: vec!["p".into(), recipient_hex],
+            }],
+        );
         store.append(&ev).unwrap();
 
         // Unauthenticated client queries for kind 1059 - should get nothing.
         let mut ws = connect(port).await;
         ws.send(TMsg::Text(r#"["REQ","s1",{"kinds":[1059]}]"#.into()))
-            .await.unwrap();
+            .await
+            .unwrap();
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("EOSE"), "unauthenticated should get only EOSE: {resp}");
     }
@@ -1383,9 +1405,14 @@ mod tests {
         let recipient_hex = crate::nostr::hex_encode_bytes(&xonly.serialize());
 
         // Store a kind-1059 event with p-tag pointing to recipient (sk=1).
-        let ev = make_event(3, 1059, 1_700_000_000, vec![
-            Tag { fields: vec!["p".into(), recipient_hex] },
-        ]);
+        let ev = make_event(
+            3,
+            1059,
+            1_700_000_000,
+            vec![Tag {
+                fields: vec!["p".into(), recipient_hex],
+            }],
+        );
         store.append(&ev).unwrap();
 
         // Connect and authenticate as the recipient (sk=1).
@@ -1394,7 +1421,8 @@ mod tests {
 
         // Query for kind 1059 - should get the event.
         ws.send(TMsg::Text(r#"["REQ","s1",{"kinds":[1059]}]"#.into()))
-            .await.unwrap();
+            .await
+            .unwrap();
         let mut event_count = 0;
         loop {
             let r = recv_text(&mut ws).await;
@@ -1422,9 +1450,14 @@ mod tests {
         let recipient_hex = crate::nostr::hex_encode_bytes(&xonly.serialize());
 
         // Store a kind-1059 event addressed to sk=2.
-        let ev = make_event(3, 1059, 1_700_000_000, vec![
-            Tag { fields: vec!["p".into(), recipient_hex] },
-        ]);
+        let ev = make_event(
+            3,
+            1059,
+            1_700_000_000,
+            vec![Tag {
+                fields: vec!["p".into(), recipient_hex],
+            }],
+        );
         store.append(&ev).unwrap();
 
         // Connect and authenticate as a DIFFERENT user (sk=1).
@@ -1433,7 +1466,8 @@ mod tests {
 
         // Query for kind 1059 - should NOT see events addressed to someone else.
         ws.send(TMsg::Text(r#"["REQ","s1",{"kinds":[1059]}]"#.into()))
-            .await.unwrap();
+            .await
+            .unwrap();
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("EOSE"), "non-recipient should get only EOSE: {resp}");
     }
@@ -1498,7 +1532,10 @@ mod tests {
         let mut need_ids = Vec::new();
         let mut current_reply = initial_reply;
         loop {
-            match client.reconcile_with_ids(&current_reply, &mut have_ids, &mut need_ids).unwrap() {
+            match client
+                .reconcile_with_ids(&current_reply, &mut have_ids, &mut need_ids)
+                .unwrap()
+            {
                 None => break,
                 Some(next_msg) => {
                     let hex = crate::nostr::hex_encode_bytes(&next_msg);
@@ -1583,11 +1620,7 @@ mod tests {
         store.append(&ev3).unwrap();
 
         // Client has the same 3 events.
-        let client_items: Vec<(u64, [u8; 32])> = vec![
-            (1000, ev1.id.0),
-            (2000, ev2.id.0),
-            (3000, ev3.id.0),
-        ];
+        let client_items: Vec<(u64, [u8; 32])> = vec![(1000, ev1.id.0), (2000, ev2.id.0), (3000, ev3.id.0)];
         let (client_storage, hex_msg) = neg_initiate(&client_items);
 
         let mut ws = connect(port).await;
@@ -1613,10 +1646,7 @@ mod tests {
         store.append(&ev4).unwrap();
 
         // Client has [2, 4].
-        let client_items: Vec<(u64, [u8; 32])> = vec![
-            (2000, ev2.id.0),
-            (4000, ev4.id.0),
-        ];
+        let client_items: Vec<(u64, [u8; 32])> = vec![(2000, ev2.id.0), (4000, ev4.id.0)];
         let (client_storage, hex_msg) = neg_initiate(&client_items);
 
         let mut ws = connect(port).await;
@@ -1624,11 +1654,14 @@ mod tests {
         let (_have_ids, need_ids) = neg_reconcile(&mut ws, "neg1", &client_storage, reply).await;
 
         // Client needs events [1, 3] from server.
-        let need_set: std::collections::HashSet<[u8; 32]> = need_ids.iter().map(|id| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(id.as_bytes());
-            arr
-        }).collect();
+        let need_set: std::collections::HashSet<[u8; 32]> = need_ids
+            .iter()
+            .map(|id| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(id.as_bytes());
+                arr
+            })
+            .collect();
         assert!(need_set.contains(&ev1.id.0), "client should need event 1");
         assert!(need_set.contains(&ev3.id.0), "client should need event 3");
         assert!(!need_set.contains(&ev2.id.0), "client should NOT need event 2");
@@ -1728,11 +1761,7 @@ mod tests {
         let ev1 = make_event(1, 1, 1000, vec![]);
         let ev2 = make_event(2, 1, 2000, vec![]);
         let ev3 = make_event(3, 1, 3000, vec![]);
-        let client_items: Vec<(u64, [u8; 32])> = vec![
-            (1000, ev1.id.0),
-            (2000, ev2.id.0),
-            (3000, ev3.id.0),
-        ];
+        let client_items: Vec<(u64, [u8; 32])> = vec![(1000, ev1.id.0), (2000, ev2.id.0), (3000, ev3.id.0)];
         let (client_storage, hex_msg) = neg_initiate(&client_items);
 
         let mut ws = connect(port).await;
@@ -1765,9 +1794,14 @@ mod tests {
         let hex64 = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 
         // Store events: one with the tag, one without.
-        let ev_tagged = make_event(1, 1, 1000, vec![Tag {
-            fields: vec!["e".into(), hex64.into()],
-        }]);
+        let ev_tagged = make_event(
+            1,
+            1,
+            1000,
+            vec![Tag {
+                fields: vec!["e".into(), hex64.into()],
+            }],
+        );
         let ev_untagged = make_event(2, 1, 2000, vec![]);
         store.append(&ev_tagged).unwrap();
         store.append(&ev_untagged).unwrap();
@@ -1782,14 +1816,20 @@ mod tests {
         let (_have_ids, need_ids) = neg_reconcile(&mut ws, "neg1", &client_storage, reply).await;
 
         // Client should need only the tagged event, not the untagged one.
-        let need_set: std::collections::HashSet<[u8; 32]> = need_ids.iter().map(|id| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(id.as_bytes());
-            arr
-        }).collect();
+        let need_set: std::collections::HashSet<[u8; 32]> = need_ids
+            .iter()
+            .map(|id| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(id.as_bytes());
+                arr
+            })
+            .collect();
         assert_eq!(need_set.len(), 1, "should need exactly 1 event");
         assert!(need_set.contains(&ev_tagged.id.0), "should need the tagged event");
-        assert!(!need_set.contains(&ev_untagged.id.0), "should not need the untagged event");
+        assert!(
+            !need_set.contains(&ev_untagged.id.0),
+            "should not need the untagged event"
+        );
     }
 
     /// Ensures the connection's per-connection subscription limit applies to Negentropy sessions.
@@ -1857,6 +1897,4 @@ mod tests {
             "NOTICE should mention subscription limit: {resp}",
         );
     }
-
-
 }

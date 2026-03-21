@@ -54,7 +54,8 @@ pub fn classify_kind(kind: u16, tags: &[Tag]) -> KindClass {
         k if is_replaceable_kind(k) => KindClass::Replaceable,
         20000..=29999 => KindClass::Ephemeral,
         k if is_addressable_kind(k) => {
-            let d_val = tags.iter()
+            let d_val = tags
+                .iter()
                 .find(|t| t.fields.len() >= 2 && t.fields[0] == "d")
                 .map(|t| t.fields[1].as_str())
                 .unwrap_or("");
@@ -169,7 +170,6 @@ fn secp() -> &'static Secp256k1<secp256k1::VerifyOnly> {
 
 // --- Helpers ---
 
-
 /// Decode exactly `N` bytes from a lowercase hex string of length `2*N`.
 fn decode_hex_exact<const N: usize>(s: &str, field: &str) -> Result<[u8; N], String> {
     if s.len() != 2 * N {
@@ -207,11 +207,10 @@ pub fn event_expiry(ev: &Event) -> Option<i64> {
 pub fn event_has_p_tag(ev: &Event, pubkey: &[u8; 32]) -> bool {
     ev.tags.iter().any(|t| {
         t.fields.first().map(String::as_str) == Some("p")
-            && t.fields.get(1).map_or(false, |v| {
+            && t.fields.get(1).is_some_and(|v| {
                 if v.len() == 64 {
                     let mut decoded = [0u8; 32];
-                    hex::decode(v.as_bytes(), &mut decoded).is_ok()
-                        && decoded == *pubkey
+                    hex::decode(v.as_bytes(), &mut decoded).is_ok() && decoded == *pubkey
                 } else {
                     false
                 }
@@ -234,15 +233,12 @@ pub fn event_has_p_tag(ev: &Event, pubkey: &[u8; 32]) -> bool {
 /// assert_eq!(bytes, vec![0x0a, 0x0b]);
 /// ```
 fn decode_hex_field(val: &Value, field: &str) -> Result<Vec<u8>, String> {
-    let hex_str = val
-        .as_str()
-        .ok_or(format!("invalid: {field} not a string"))?;
+    let hex_str = val.as_str().ok_or(format!("invalid: {field} not a string"))?;
     if hex_str.len() % 2 != 0 {
         return Err(format!("invalid: {field} not valid hex"));
     }
     let mut out = vec![0u8; hex_str.len() / 2];
-    hex::decode(hex_str.as_bytes(), &mut out)
-        .map_err(|_| format!("invalid: {field} not valid hex"))?;
+    hex::decode(hex_str.as_bytes(), &mut out).map_err(|_| format!("invalid: {field} not valid hex"))?;
     Ok(out)
 }
 
@@ -359,9 +355,7 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
             "authors" => {
                 let arr = value.as_array().ok_or("invalid: authors not an array")?;
                 for v in arr {
-                    let s = v
-                        .as_str()
-                        .ok_or("invalid: pubkey in authors not a string")?;
+                    let s = v.as_str().ok_or("invalid: pubkey in authors not a string")?;
                     let bytes = decode_hex_exact::<32>(s, "authors entry")?;
                     authors.push(Pubkey(bytes));
                 }
@@ -369,9 +363,7 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
             "kinds" => {
                 let arr = value.as_array().ok_or("invalid: kinds not an array")?;
                 for v in arr {
-                    let k = v
-                        .as_u64()
-                        .ok_or("invalid: kind not a non-negative integer")?;
+                    let k = v.as_u64().ok_or("invalid: kind not a non-negative integer")?;
                     kinds.push(u16::try_from(k).map_err(|_| "invalid: kind out of range for u16")?);
                 }
             }
@@ -382,9 +374,7 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
                 until = Some(value.as_i64().ok_or("invalid: until not an integer")?);
             }
             "limit" => {
-                let n = value
-                    .as_u64()
-                    .ok_or("invalid: limit not a non-negative integer")?;
+                let n = value.as_u64().ok_or("invalid: limit not a non-negative integer")?;
                 limit = Some(n as usize);
             }
             k if k.starts_with('#') && k.len() == 2 => {
@@ -393,11 +383,7 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
                 let arr = value.as_array().ok_or("invalid: tag filter not an array")?;
                 let mut vals = Vec::with_capacity(arr.len());
                 for v in arr {
-                    vals.push(
-                        v.as_str()
-                            .ok_or("invalid: tag filter value not a string")?
-                            .to_owned(),
-                    );
+                    vals.push(v.as_str().ok_or("invalid: tag filter value not a string")?.to_owned());
                 }
                 tag_filters.insert(ch, vals);
             }
@@ -453,9 +439,7 @@ fn parse_sub_and_filters(arr: &[Value], verb: &str) -> Result<(String, Vec<Filte
 /// ```
 pub fn parse_client_msg(raw: &str) -> Result<ClientMsg, String> {
     let val: Value = serde_json::from_str(raw).map_err(|_| "invalid: not valid JSON".to_owned())?;
-    let arr = val
-        .as_array()
-        .ok_or("invalid: message is not a JSON array")?;
+    let arr = val.as_array().ok_or("invalid: message is not a JSON array")?;
     if arr.is_empty() {
         return Err("invalid: empty array".to_owned());
     }
@@ -466,9 +450,7 @@ pub fn parse_client_msg(raw: &str) -> Result<ClientMsg, String> {
             if arr.len() < 2 {
                 return Err("invalid: EVENT missing event object".to_owned());
             }
-            let obj = arr[1]
-                .as_object()
-                .ok_or("invalid: EVENT payload not an object")?;
+            let obj = arr[1].as_object().ok_or("invalid: EVENT payload not an object")?;
             let ev = parse_event_obj(obj)?;
             Ok(ClientMsg::Event(Box::new(ev)))
         }
@@ -484,19 +466,14 @@ pub fn parse_client_msg(raw: &str) -> Result<ClientMsg, String> {
             if arr.len() < 2 {
                 return Err("invalid: CLOSE missing sub_id".to_owned());
             }
-            let sub_id = arr[1]
-                .as_str()
-                .ok_or("invalid: CLOSE sub_id not a string")?
-                .to_owned();
+            let sub_id = arr[1].as_str().ok_or("invalid: CLOSE sub_id not a string")?.to_owned();
             Ok(ClientMsg::Close { sub_id })
         }
         "AUTH" => {
             if arr.len() < 2 {
                 return Err("invalid: AUTH missing event object".to_owned());
             }
-            let obj = arr[1]
-                .as_object()
-                .ok_or("invalid: AUTH payload not an object")?;
+            let obj = arr[1].as_object().ok_or("invalid: AUTH payload not an object")?;
             let ev = parse_event_obj(obj)?;
             Ok(ClientMsg::Auth(Box::new(ev)))
         }
@@ -550,14 +527,7 @@ pub fn canonical_json(ev: &Event) -> String {
             .map(|t| Value::Array(t.fields.iter().map(|f| Value::String(f.clone())).collect()))
             .collect(),
     );
-    let tuple = (
-        0u8,
-        &pubkey_hex,
-        ev.created_at,
-        ev.kind,
-        &tags_val,
-        &ev.content,
-    );
+    let tuple = (0u8, &pubkey_hex, ev.created_at, ev.kind, &tags_val, &ev.content);
     serde_json::to_string(&tuple).expect("canonical_json serialization must not fail")
 }
 
@@ -585,8 +555,7 @@ pub fn validate_event(ev: &Event) -> Result<(), String> {
     }
 
     // Step 4: schnorr signature
-    let pubkey = XOnlyPublicKey::from_byte_array(ev.pubkey.0)
-        .map_err(|_| "invalid: bad signature".to_owned())?;
+    let pubkey = XOnlyPublicKey::from_byte_array(ev.pubkey.0).map_err(|_| "invalid: bad signature".to_owned())?;
     let sig = Signature::from_byte_array(ev.sig.0);
     secp()
         .verify_schnorr(&sig, &ev.id.0, &pubkey)
@@ -662,11 +631,7 @@ impl ServerMsg<'_> {
                 write_event_json(sub_id, event, &mut buf);
                 buf
             }
-            ServerMsg::Ok {
-                id,
-                accepted,
-                reason,
-            } => {
+            ServerMsg::Ok { id, accepted, reason } => {
                 let id_hex = hex_encode_bytes(&id.0);
                 format!(
                     "[\"OK\",\"{}\",{},{}]",
@@ -966,10 +931,7 @@ mod tests {
         let sig = secp.sign_schnorr_no_aux_rand(hash.as_slice(), &kp);
         ev.sig.0.copy_from_slice(&sig.to_byte_array());
 
-        assert!(
-            validate_event(&ev).is_ok(),
-            "172799s in future must be accepted"
-        );
+        assert!(validate_event(&ev).is_ok(), "172799s in future must be accepted");
     }
 
     #[test]
@@ -1036,11 +998,7 @@ mod tests {
         let ev = make_golden_event();
         let canon = canonical_json(&ev);
         let hash = Sha256::digest(canon.as_bytes());
-        assert_eq!(
-            hash.as_slice(),
-            &ev.id.0,
-            "hash of canonical JSON must equal ev.id"
-        );
+        assert_eq!(hash.as_slice(), &ev.id.0, "hash of canonical JSON must equal ev.id");
     }
 
     #[test]
@@ -1094,10 +1052,7 @@ mod tests {
         }
         .to_json();
         let id_hex = "bb".repeat(32);
-        assert_eq!(
-            s,
-            format!("[\"OK\",\"{id_hex}\",false,\"invalid: bad signature\"]")
-        );
+        assert_eq!(s, format!("[\"OK\",\"{id_hex}\",false,\"invalid: bad signature\"]"));
     }
 
     #[test]
@@ -1138,7 +1093,9 @@ mod tests {
     // classify_kind tests
 
     fn tag(fields: &[&str]) -> Tag {
-        Tag { fields: fields.iter().map(|s| s.to_string()).collect() }
+        Tag {
+            fields: fields.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     #[test]

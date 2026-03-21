@@ -13,8 +13,8 @@ use fastr::config::Config;
 use fastr::db::Store;
 use fastr::error::Error;
 use fastr::http::{
-    index_page_html, index_page_response, is_relay_info_request, is_websocket_request,
-    relay_info_json, relay_info_response, RelayInfo,
+    index_page_html, index_page_response, is_relay_info_request, is_websocket_request, relay_info_json,
+    relay_info_response, RelayInfo,
 };
 use fastr::nostr::{parse_client_msg, validate_event, ClientMsg};
 use fastr::ws::{handle_connection, Fanout};
@@ -25,12 +25,8 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("import") => {
-            let dir = args
-                .get(2)
-                .context("usage: fastr import <dir> <jsonl-file>")?;
-            let file = args
-                .get(3)
-                .context("usage: fastr import <dir> <jsonl-file>")?;
+            let dir = args.get(2).context("usage: fastr import <dir> <jsonl-file>")?;
+            let file = args.get(3).context("usage: fastr import <dir> <jsonl-file>")?;
             let (imported, duplicates, failures) = import(Path::new(dir), Path::new(file))?;
             println!("imported: {imported}  duplicates: {duplicates}  failures: {failures}");
             Ok(())
@@ -60,7 +56,11 @@ async fn serve(t0: std::time::Instant) -> Result<()> {
         .init();
 
     eprintln!("fastr listening on {}", config.listen_addr);
-    info!("fastr listening on {} ({}µs)", config.listen_addr, t0.elapsed().as_micros());
+    info!(
+        "fastr listening on {} ({}µs)",
+        config.listen_addr,
+        t0.elapsed().as_micros()
+    );
 
     let store = Arc::new(Store::open(&config.data_dir).context("opening store")?);
     let fanout = Fanout::new();
@@ -145,7 +145,7 @@ async fn dispatch(
     // Plain browser visit: HTTP but no WS upgrade and no NIP-11 Accept header.
     if is_http && !is_websocket_request(req.headers) {
         let body = index_page_html();
-        let resp = index_page_response(&body);
+        let resp = index_page_response(body);
         if let Ok(mut tcp) = read_half.reunite(write_half) {
             let _ = tcp.write_all(resp.as_bytes()).await;
         }
@@ -279,9 +279,7 @@ mod tests {
     #[test]
     fn test_import_bad_sig_skipped() {
         let dir = tempfile::tempdir().unwrap();
-        let mut lines: Vec<String> = (1u8..=3)
-            .map(|i| make_event_json(i, 1, i as i64 * 1000))
-            .collect();
+        let mut lines: Vec<String> = (1u8..=3).map(|i| make_event_json(i, 1, i as i64 * 1000)).collect();
         let bad = r#"{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":9999,"kind":1,"tags":[],"content":"bad","sig":"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}"#;
         lines.insert(1, bad.to_owned());
         let jsonl = lines.join("\n");

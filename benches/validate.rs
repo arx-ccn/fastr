@@ -41,17 +41,13 @@ fn make_event_json(ev: &Event) -> String {
 
 fn bench_validate_event(c: &mut Criterion) {
     let ev = make_valid_event();
-    c.bench_function("validate_event", |b| {
-        b.iter(|| validate_event(&ev).unwrap())
-    });
+    c.bench_function("validate_event", |b| b.iter(|| validate_event(&ev).unwrap()));
 }
 
 fn bench_parse_client_msg(c: &mut Criterion) {
     let ev = make_valid_event();
     let raw = make_event_json(&ev);
-    c.bench_function("parse_client_msg", |b| {
-        b.iter(|| parse_client_msg(&raw).unwrap())
-    });
+    c.bench_function("parse_client_msg", |b| b.iter(|| parse_client_msg(&raw).unwrap()));
 }
 
 criterion_group!(benches, bench_validate_event, bench_parse_client_msg);

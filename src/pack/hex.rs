@@ -126,10 +126,7 @@ unsafe fn encode_simd(src: &[u8], dst: &mut [u8]) {
         let v = _mm_loadu_si128(src.as_ptr().add(o) as *const __m128i);
         let hi = nib(_mm_and_si128(_mm_srli_epi16(v, 4), mask));
         let lo = nib(_mm_and_si128(v, mask));
-        _mm_storeu_si128(
-            dst.as_mut_ptr().add(o * 2) as *mut __m128i,
-            _mm_unpacklo_epi8(hi, lo),
-        );
+        _mm_storeu_si128(dst.as_mut_ptr().add(o * 2) as *mut __m128i, _mm_unpacklo_epi8(hi, lo));
         _mm_storeu_si128(
             dst.as_mut_ptr().add(o * 2 + 16) as *mut __m128i,
             _mm_unpackhi_epi8(hi, lo),

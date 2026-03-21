@@ -44,14 +44,7 @@ pub fn iter_entries_rev(buf: &[u8]) -> impl Iterator<Item = (usize, IndexEntry)>
 }
 
 impl IndexEntry {
-    pub fn new(
-        offset: u64,
-        created_at: i64,
-        expiry: i64,
-        kind: u16,
-        id: [u8; 32],
-        pubkey: [u8; 32],
-    ) -> Self {
+    pub fn new(offset: u64, created_at: i64, expiry: i64, kind: u16, id: [u8; 32], pubkey: [u8; 32]) -> Self {
         IndexEntry {
             offset,
             created_at,

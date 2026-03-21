@@ -193,6 +193,15 @@ struct StoreWriter {
     dtags: WriterFile,
 }
 
+/// (created_at, event_id, index_offset)
+pub(crate) type LiveEntry = (i64, [u8; 32], u64);
+
+/// Addressable event dedup key: (pubkey, kind, d_hash).
+pub(crate) type AddressableKey = ([u8; 32], u16, [u8; 32]);
+
+/// Tag filter spec: tag_letter prefix byte + list of (value_hash, prefix_len) pairs.
+pub(crate) type TagSpec = (u8, Vec<([u8; 32], u8)>);
+
 // Store - the public storage handle.
 //
 // Each of the four files has a MappedFile (ArcSwap mmap + AtomicU64 length) for
@@ -207,10 +216,10 @@ pub struct Store {
     /// NIP-09 tombstone set: event IDs that have been deleted by a kind-5 request.
     /// `std::sync::RwLock` (not tokio's) - critical section is always short (HashSet lookup).
     tombstones: RwLock<HashSet<[u8; 32]>>,
-    /// In-memory map for replaceable event dedup: (pubkey, kind) -> (created_at, id, index_offset)
-    replaceable_live: RwLock<HashMap<([u8; 32], u16), (i64, [u8; 32], u64)>>,
-    /// In-memory map for addressable event dedup: (pubkey, kind, d_hash) -> (created_at, id, index_offset)
-    addressable_live: RwLock<HashMap<([u8; 32], u16, [u8; 32]), (i64, [u8; 32], u64)>>,
+    /// In-memory map for replaceable event dedup: (pubkey, kind) -> LiveEntry
+    replaceable_live: RwLock<HashMap<([u8; 32], u16), LiveEntry>>,
+    /// In-memory map for addressable event dedup: (pubkey, kind, d_hash) -> LiveEntry
+    addressable_live: RwLock<HashMap<AddressableKey, LiveEntry>>,
     /// NIP-62: set of vanished pubkeys (banned from future events).
     vanished: RwLock<HashSet<[u8; 32]>>,
     /// NIP-62: append-only file for persisting vanished pubkeys.
@@ -258,7 +267,11 @@ fn blob_bounds(idx: &[u8], i: usize, total: usize, data_len: usize, offset: u64)
     } else {
         data_len
     };
-    if start <= end && end <= data_len { Some((start, end)) } else { None }
+    if start <= end && end <= data_len {
+        Some((start, end))
+    } else {
+        None
+    }
 }
 
 // NIP-09 tombstone helpers
@@ -388,10 +401,7 @@ impl Store {
 
     /// Check whether an event ID has been tombstoned by a NIP-09 deletion.
     pub fn is_tombstoned(&self, id: &[u8; 32]) -> bool {
-        self.tombstones
-            .read()
-            .map(|t| t.contains(id))
-            .unwrap_or(false)
+        self.tombstones.read().map(|t| t.contains(id)).unwrap_or(false)
     }
 
     /// Check if a pubkey has been vanished (NIP-62).
@@ -418,8 +428,14 @@ impl Store {
                 filter.kinds.iter().map(|k| counts.get(k).copied().unwrap_or(0)).sum()
             }
             (false, true) => {
-                let Ok(counts) = self.author_counts.read() else { return 0 };
-                filter.authors.iter().map(|a| counts.get(&a.0).copied().unwrap_or(0)).sum()
+                let Ok(counts) = self.author_counts.read() else {
+                    return 0;
+                };
+                filter
+                    .authors
+                    .iter()
+                    .map(|a| counts.get(&a.0).copied().unwrap_or(0))
+                    .sum()
             }
             _ => 0, // combined or empty - unsupported
         }
@@ -432,19 +448,25 @@ impl Store {
 
         // 1. Add to in-memory set
         {
-            let mut set = self.vanished.write()
+            let mut set = self
+                .vanished
+                .write()
                 .map_err(|_| std::io::Error::other("vanished lock poisoned"))?;
             set.insert(ev.pubkey.0);
         }
         // 2. Persist to vanished.r
         {
-            let mut f = self.vanish_file.lock()
+            let mut f = self
+                .vanish_file
+                .lock()
                 .map_err(|_| std::io::Error::other("vanish file lock poisoned"))?;
             vanish::append(&mut f, &ev.pubkey.0)?;
         }
         // 3. Tombstone all events from this pubkey (except kind-62)
         let idx = self.index.slice();
-        let mut ts = self.tombstones.write()
+        let mut ts = self
+            .tombstones
+            .write()
             .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?;
         for (_, entry) in index::iter_entries(&idx) {
             // Skip kind-62 events - they must remain queryable per NIP-62 spec
@@ -547,10 +569,7 @@ impl Store {
                 let mut found_dtag = false;
                 while dtag_cursor < dtags_total {
                     let dt_off = dtag_cursor * DTAG_ENTRY_SIZE;
-                    let dt_bytes: &[u8; DTAG_ENTRY_SIZE] =
-                        dtags[dt_off..dt_off + DTAG_ENTRY_SIZE]
-                            .try_into()
-                            .unwrap();
+                    let dt_bytes: &[u8; DTAG_ENTRY_SIZE] = dtags[dt_off..dt_off + DTAG_ENTRY_SIZE].try_into().unwrap();
                     let dt = DtagEntry::from_bytes(dt_bytes);
                     if dt.data_offset == entry.offset {
                         let key = (entry.pubkey, entry.kind, dt.d_hash);
@@ -657,7 +676,9 @@ impl Store {
 
         // Dedup: O(1) lookup against the full set of known event IDs.
         {
-            let ids = self.known_ids.read()
+            let ids = self
+                .known_ids
+                .read()
                 .map_err(|_| std::io::Error::other("known_ids lock poisoned"))?;
             if ids.contains(&ev.id.0) {
                 return Err(Error::Duplicate);
@@ -684,14 +705,7 @@ impl Store {
         w.data.offset += pack_buf.len() as u64;
 
         // Write index entry (includes NIP-40 expiry field).
-        let ie = IndexEntry::new(
-            data_offset,
-            ev.created_at,
-            expiry,
-            ev.kind,
-            ev.id.0,
-            ev.pubkey.0,
-        );
+        let ie = IndexEntry::new(data_offset, ev.created_at, expiry, ev.kind, ev.id.0, ev.pubkey.0);
         let ie_bytes = ie.to_bytes();
         w.index.file.write_all(&ie_bytes)?;
         w.index.offset += ie_bytes.len() as u64;
@@ -832,10 +846,7 @@ impl Store {
         // NIP-17: pre-compute set of data_offsets where the p-tag matches auth_pubkey.
         // Only scan tags.s when the filter could actually match kind-1059 events.
         let nip17_allowed: Option<HashSet<u64>> = auth_pubkey
-            .filter(|_| {
-                filter.kinds.is_empty()
-                    || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP)
-            })
+            .filter(|_| filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP))
             .map(|pk| tags::matching_offsets(&tags_slice, b'p', pk));
 
         // Pre-compute tag offset sets via a single pass over tags.s.
@@ -843,7 +854,7 @@ impl Store {
         let tag_sets: Vec<(u8, HashSet<u64>)> = if filter.tags.is_empty() {
             vec![]
         } else {
-            let specs: Vec<(u8, Vec<([u8; 32], u8)>)> = filter
+            let specs: Vec<TagSpec> = filter
                 .tags
                 .iter()
                 .map(|(ch, values)| {
@@ -918,11 +929,9 @@ impl Store {
                 }
             }
 
-            let (start, end) = blob_bounds(&idx_slice, i, total, data_slice.len(), entry.offset)
-                .ok_or_else(|| std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "corrupt index: offset out of range",
-                ))?;
+            let (start, end) = blob_bounds(&idx_slice, i, total, data_slice.len(), entry.offset).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt index: offset out of range")
+            })?;
 
             cb(&data_slice[start..end])?;
             count += 1;
@@ -959,17 +968,14 @@ impl Store {
 
         // NIP-17: pre-compute set of data_offsets where the p-tag matches auth_pk.
         let nip17_allowed: Option<HashSet<u64>> = auth_pk
-            .filter(|_| {
-                filter.kinds.is_empty()
-                    || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP)
-            })
+            .filter(|_| filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP))
             .map(|pk| tags::matching_offsets(&tags_slice, b'p', pk));
 
         // Pre-compute tag offset sets via a single pass over tags.s.
         let tag_sets: Vec<(u8, HashSet<u64>)> = if filter.tags.is_empty() {
             vec![]
         } else {
-            let specs: Vec<(u8, Vec<([u8; 32], u8)>)> = filter
+            let specs: Vec<TagSpec> = filter
                 .tags
                 .iter()
                 .map(|(ch, values)| {
@@ -1067,7 +1073,9 @@ impl Store {
     ///
     /// Returns an error if the tombstone lock is poisoned.
     pub fn tombstone_count(&self) -> Result<usize, Error> {
-        Ok(self.tombstones.read()
+        Ok(self
+            .tombstones
+            .read()
             .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?
             .len())
     }
@@ -1095,9 +1103,13 @@ impl Store {
             return Ok(0);
         }
 
-        let tombstones = self.tombstones.read()
+        let tombstones = self
+            .tombstones
+            .read()
             .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?;
-        let vanished = self.vanished.read()
+        let vanished = self
+            .vanished
+            .read()
             .map_err(|_| std::io::Error::other("vanished lock poisoned"))?;
 
         // Collect indices of live entries.
@@ -1144,7 +1156,8 @@ impl Store {
 
         for &i in &live_indices {
             let b: &[u8; INDEX_ENTRY_SIZE] = idx_slice[i * INDEX_ENTRY_SIZE..(i + 1) * INDEX_ENTRY_SIZE]
-                .try_into().unwrap();
+                .try_into()
+                .unwrap();
             let entry = IndexEntry::from_bytes(b);
 
             let (start, end) = match blob_bounds(&idx_slice, i, total, data_slice.len(), entry.offset) {
@@ -1177,7 +1190,8 @@ impl Store {
         let tags_total = tags_slice.len() / tags::TAG_ENTRY_SIZE;
         for i in 0..tags_total {
             let b: &[u8; tags::TAG_ENTRY_SIZE] = tags_slice[i * tags::TAG_ENTRY_SIZE..(i + 1) * tags::TAG_ENTRY_SIZE]
-                .try_into().unwrap();
+                .try_into()
+                .unwrap();
             let te = tags::TagEntry::from_bytes(b);
             if let Some(&new_off) = old_to_new_offset.get(&te.data_offset) {
                 let new_te = tags::TagEntry {
@@ -1195,7 +1209,8 @@ impl Store {
         let dtags_total = dtags_slice.len() / DTAG_ENTRY_SIZE;
         for i in 0..dtags_total {
             let b: &[u8; DTAG_ENTRY_SIZE] = dtags_slice[i * DTAG_ENTRY_SIZE..(i + 1) * DTAG_ENTRY_SIZE]
-                .try_into().unwrap();
+                .try_into()
+                .unwrap();
             let de = DtagEntry::from_bytes(b);
             if let Some(&new_off) = old_to_new_offset.get(&de.data_offset) {
                 let new_de = DtagEntry {
@@ -1221,7 +1236,9 @@ impl Store {
         drop(new_dtags);
 
         // Phase 3: Lock writer, rename temps over originals, swap mmaps.
-        let mut w = self.writer.lock()
+        let mut w = self
+            .writer
+            .lock()
             .map_err(|_| std::io::Error::other("writer lock poisoned"))?;
 
         // Rename temp files over originals.
@@ -1306,7 +1323,9 @@ impl Store {
             std::fs::rename(&tmp_vanish, &vanish_path)?;
             // Reopen vanish file for appending.
             let new_vf = OpenOptions::new().create(true).append(true).open(&vanish_path)?;
-            let mut vf = self.vanish_file.lock()
+            let mut vf = self
+                .vanish_file
+                .lock()
                 .map_err(|_| std::io::Error::other("vanish file lock poisoned"))?;
             *vf = new_vf;
         }
@@ -1387,9 +1406,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         for (i, &kind) in [1u16, 1, 2, 1, 3].iter().enumerate() {
-            store
-                .append(&make_event(i as u8 + 1, kind, i as i64, vec![]))
-                .unwrap();
+            store.append(&make_event(i as u8 + 1, kind, i as i64, vec![])).unwrap();
         }
         let f = Filter {
             kinds: vec![1],
@@ -1410,9 +1427,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         for i in 0..10u8 {
-            store
-                .append(&make_event(i + 1, 1, i as i64, vec![]))
-                .unwrap();
+            store.append(&make_event(i + 1, 1, i as i64, vec![])).unwrap();
         }
         let f = Filter {
             limit: Some(3),
@@ -1570,10 +1585,7 @@ mod tests {
         // expiry = unix epoch (0) - definitely in the past
         let ev = make_event(1, 1, 1_700_000_000, vec![expiry_tag(1)]);
         let err = store.append(&ev).unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidEvent("event has expired")),
-            "got: {err:?}"
-        );
+        assert!(matches!(err, Error::InvalidEvent("event has expired")), "got: {err:?}");
     }
 
     #[test]
@@ -1718,10 +1730,7 @@ mod tests {
 
         // Now "ingest" a matching event - but we can't actually ingest it with that id
         // because real id/sig validation would fail. Just verify the tombstone is set.
-        assert!(
-            store.is_tombstoned(&future_id),
-            "preemptive tombstone must be set"
-        );
+        assert!(store.is_tombstoned(&future_id), "preemptive tombstone must be set");
     }
 
     #[test]
@@ -1749,10 +1758,7 @@ mod tests {
             .unwrap();
         // target's id should not appear (kind-5 rebuilt from disk).
         let target_check = make_event(1, 1, 1_000, vec![]);
-        assert!(
-            !ids.contains(&target_check.id.0),
-            "tombstone must survive restart"
-        );
+        assert!(!ids.contains(&target_check.id.0), "tombstone must survive restart");
     }
 
     // Replaceable event (Task 4) tests
@@ -1853,17 +1859,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
 
-        let ev1 = make_event(1, 30001, 1000, vec![Tag { fields: vec!["d".into(), "my-list".into()] }]);
-        let ev2 = make_event(1, 30001, 2000, vec![Tag { fields: vec!["d".into(), "my-list".into()] }]);
+        let ev1 = make_event(
+            1,
+            30001,
+            1000,
+            vec![Tag {
+                fields: vec!["d".into(), "my-list".into()],
+            }],
+        );
+        let ev2 = make_event(
+            1,
+            30001,
+            2000,
+            vec![Tag {
+                fields: vec!["d".into(), "my-list".into()],
+            }],
+        );
 
         store.append(&ev1).unwrap();
         store.append(&ev2).unwrap();
 
         let mut results = Vec::new();
-        store.query(&Filter { kinds: vec![30001], ..empty_filter() }, |bytes| {
-            results.push(pack::deserialize_trusted(bytes).unwrap());
-            Ok(())
-        }).unwrap();
+        store
+            .query(
+                &Filter {
+                    kinds: vec![30001],
+                    ..empty_filter()
+                },
+                |bytes| {
+                    results.push(pack::deserialize_trusted(bytes).unwrap());
+                    Ok(())
+                },
+            )
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].created_at, 2000);
@@ -1874,17 +1902,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
 
-        let ev1 = make_event(1, 30001, 1000, vec![Tag { fields: vec!["d".into(), "list-a".into()] }]);
-        let ev2 = make_event(1, 30001, 1000, vec![Tag { fields: vec!["d".into(), "list-b".into()] }]);
+        let ev1 = make_event(
+            1,
+            30001,
+            1000,
+            vec![Tag {
+                fields: vec!["d".into(), "list-a".into()],
+            }],
+        );
+        let ev2 = make_event(
+            1,
+            30001,
+            1000,
+            vec![Tag {
+                fields: vec!["d".into(), "list-b".into()],
+            }],
+        );
 
         store.append(&ev1).unwrap();
         store.append(&ev2).unwrap();
 
         let mut results = Vec::new();
-        store.query(&Filter { kinds: vec![30001], ..empty_filter() }, |bytes| {
-            results.push(pack::deserialize_trusted(bytes).unwrap());
-            Ok(())
-        }).unwrap();
+        store
+            .query(
+                &Filter {
+                    kinds: vec![30001],
+                    ..empty_filter()
+                },
+                |bytes| {
+                    results.push(pack::deserialize_trusted(bytes).unwrap());
+                    Ok(())
+                },
+            )
+            .unwrap();
 
         assert_eq!(results.len(), 2, "different d-tags should coexist");
     }
@@ -1894,8 +1944,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
 
-        let ev1 = make_event(1, 30001, 2000, vec![Tag { fields: vec!["d".into(), "x".into()] }]);
-        let ev2 = make_event(1, 30001, 1000, vec![Tag { fields: vec!["d".into(), "x".into()] }]);
+        let ev1 = make_event(
+            1,
+            30001,
+            2000,
+            vec![Tag {
+                fields: vec!["d".into(), "x".into()],
+            }],
+        );
+        let ev2 = make_event(
+            1,
+            30001,
+            1000,
+            vec![Tag {
+                fields: vec!["d".into(), "x".into()],
+            }],
+        );
 
         store.append(&ev1).unwrap();
         let result = store.append(&ev2);
@@ -1913,13 +1977,22 @@ mod tests {
         store.append(&make_event(1, 1, 2000, vec![])).unwrap();
         store.append(&make_event(1, 7, 3000, vec![])).unwrap();
 
-        let filter = Filter { kinds: vec![1], ..empty_filter() };
+        let filter = Filter {
+            kinds: vec![1],
+            ..empty_filter()
+        };
         assert_eq!(store.count(&filter), 2);
 
-        let filter = Filter { kinds: vec![7], ..empty_filter() };
+        let filter = Filter {
+            kinds: vec![7],
+            ..empty_filter()
+        };
         assert_eq!(store.count(&filter), 1);
 
-        let filter = Filter { kinds: vec![1, 7], ..empty_filter() };
+        let filter = Filter {
+            kinds: vec![1, 7],
+            ..empty_filter()
+        };
         assert_eq!(store.count(&filter), 3);
     }
 
@@ -1965,15 +2038,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = Store::open(dir.path()).unwrap();
-            let ev1 = make_event(1, 30001, 1000, vec![Tag { fields: vec!["d".into(), "test".into()] }]);
-            let ev2 = make_event(1, 30001, 2000, vec![Tag { fields: vec!["d".into(), "test".into()] }]);
+            let ev1 = make_event(
+                1,
+                30001,
+                1000,
+                vec![Tag {
+                    fields: vec!["d".into(), "test".into()],
+                }],
+            );
+            let ev2 = make_event(
+                1,
+                30001,
+                2000,
+                vec![Tag {
+                    fields: vec!["d".into(), "test".into()],
+                }],
+            );
             store.append(&ev1).unwrap();
             store.append(&ev2).unwrap();
         }
         {
             let store = Store::open(dir.path()).unwrap();
             // After boot rebuild, the addressable map should know about the latest.
-            let ev3 = make_event(1, 30001, 500, vec![Tag { fields: vec!["d".into(), "test".into()] }]);
+            let ev3 = make_event(
+                1,
+                30001,
+                500,
+                vec![Tag {
+                    fields: vec!["d".into(), "test".into()],
+                }],
+            );
             let result = store.append(&ev3);
             assert!(result.is_err(), "boot should have rebuilt addressable map");
         }
@@ -1990,7 +2084,10 @@ mod tests {
         }
         {
             let store = Store::open(dir.path()).unwrap();
-            let filter = Filter { kinds: vec![1], ..empty_filter() };
+            let filter = Filter {
+                kinds: vec![1],
+                ..empty_filter()
+            };
             assert_eq!(store.count(&filter), 3);
         }
     }
@@ -2009,7 +2106,10 @@ mod tests {
         {
             let store = Store::open(dir.path()).unwrap();
             // kind-1 was tombstoned, so count should be 0 for kind 1
-            let filter = Filter { kinds: vec![1], ..empty_filter() };
+            let filter = Filter {
+                kinds: vec![1],
+                ..empty_filter()
+            };
             assert_eq!(store.count(&filter), 0);
         }
     }
@@ -2024,7 +2124,10 @@ mod tests {
             // Reopen empty store - boot_rebuild should handle gracefully
             let store = Store::open(dir.path()).unwrap();
             assert_eq!(store.event_count(), 0);
-            let filter = Filter { kinds: vec![1], ..empty_filter() };
+            let filter = Filter {
+                kinds: vec![1],
+                ..empty_filter()
+            };
             assert_eq!(store.count(&filter), 0);
         }
     }
@@ -2055,13 +2158,15 @@ mod tests {
 
         // Verify the live event is still queryable.
         let mut found = false;
-        store.query(&empty_filter(), |bytes| {
-            let ev = deserialize_trusted(bytes).unwrap();
-            if ev.id.0 == live.id.0 {
-                found = true;
-            }
-            Ok(())
-        }).unwrap();
+        store
+            .query(&empty_filter(), |bytes| {
+                let ev = deserialize_trusted(bytes).unwrap();
+                if ev.id.0 == live.id.0 {
+                    found = true;
+                }
+                Ok(())
+            })
+            .unwrap();
         assert!(found, "live event must survive compaction");
     }
 
@@ -2089,7 +2194,10 @@ mod tests {
 
         // After compaction, maps should still reject older replaceable.
         let ev3 = make_event(1, 0, 500, vec![]);
-        assert!(store.append(&ev3).is_err(), "old replaceable still rejected after compact");
+        assert!(
+            store.append(&ev3).is_err(),
+            "old replaceable still rejected after compact"
+        );
     }
 
     #[test]
@@ -2098,9 +2206,14 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
 
         let hex64 = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
-        let ev = make_event(1, 1, 1000, vec![Tag {
-            fields: vec!["e".into(), hex64.into()],
-        }]);
+        let ev = make_event(
+            1,
+            1,
+            1000,
+            vec![Tag {
+                fields: vec!["e".into(), hex64.into()],
+            }],
+        );
         store.append(&ev).unwrap();
 
         store.compact().unwrap();
@@ -2108,9 +2221,17 @@ mod tests {
         // Tag query should still work after compaction.
         let mut tags_f = std::collections::HashMap::new();
         tags_f.insert('e', vec![hex64.to_owned()]);
-        let f = Filter { tags: tags_f, ..empty_filter() };
+        let f = Filter {
+            tags: tags_f,
+            ..empty_filter()
+        };
         let mut count = 0;
-        store.query(&f, |_| { count += 1; Ok(()) }).unwrap();
+        store
+            .query(&f, |_| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(count, 1, "tag index must survive compaction");
     }
 
@@ -2129,7 +2250,12 @@ mod tests {
         store.append(&ev2).unwrap();
 
         let mut count = 0;
-        store.query(&empty_filter(), |_| { count += 1; Ok(()) }).unwrap();
+        store
+            .query(&empty_filter(), |_| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(count, 2, "append after compact must work");
     }
 
@@ -2148,7 +2274,10 @@ mod tests {
 
         store.compact().unwrap();
 
-        let filter = Filter { kinds: vec![1], ..empty_filter() };
+        let filter = Filter {
+            kinds: vec![1],
+            ..empty_filter()
+        };
         assert_eq!(store.count(&filter), 2, "count should reflect compacted state");
     }
 
@@ -2157,8 +2286,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
 
-        let ev1 = make_event(1, 30001, 1000, vec![Tag { fields: vec!["d".into(), "x".into()] }]);
-        let ev2 = make_event(1, 30001, 2000, vec![Tag { fields: vec!["d".into(), "x".into()] }]);
+        let ev1 = make_event(
+            1,
+            30001,
+            1000,
+            vec![Tag {
+                fields: vec!["d".into(), "x".into()],
+            }],
+        );
+        let ev2 = make_event(
+            1,
+            30001,
+            2000,
+            vec![Tag {
+                fields: vec!["d".into(), "x".into()],
+            }],
+        );
         store.append(&ev1).unwrap();
         store.append(&ev2).unwrap();
 
@@ -2166,15 +2309,30 @@ mod tests {
 
         // After compaction, only the latest addressable should exist.
         let mut results = Vec::new();
-        store.query(&Filter { kinds: vec![30001], ..empty_filter() }, |bytes| {
-            results.push(pack::deserialize_trusted(bytes).unwrap());
-            Ok(())
-        }).unwrap();
+        store
+            .query(
+                &Filter {
+                    kinds: vec![30001],
+                    ..empty_filter()
+                },
+                |bytes| {
+                    results.push(pack::deserialize_trusted(bytes).unwrap());
+                    Ok(())
+                },
+            )
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].created_at, 2000);
 
         // Older addressable still rejected.
-        let ev3 = make_event(1, 30001, 500, vec![Tag { fields: vec!["d".into(), "x".into()] }]);
+        let ev3 = make_event(
+            1,
+            30001,
+            500,
+            vec![Tag {
+                fields: vec!["d".into(), "x".into()],
+            }],
+        );
         assert!(store.append(&ev3).is_err());
     }
 }

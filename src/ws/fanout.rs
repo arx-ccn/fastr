@@ -33,12 +33,7 @@ impl Fanout {
 
     /// Register or replace a subscription. A REQ with a duplicate sub_id on the same
     /// sender replaces the previous one per NIP-01.
-    pub async fn subscribe(
-        &self,
-        sub_id: String,
-        filters: Vec<Filter>,
-        sender: mpsc::Sender<LiveEvent>,
-    ) {
+    pub async fn subscribe(&self, sub_id: String, filters: Vec<Filter>, sender: mpsc::Sender<LiveEvent>) {
         let mut subs = self.subs.write().await;
         // Replace existing entry with the same sub_id + sender identity.
         if let Some(pos) = subs
@@ -164,12 +159,8 @@ mod tests {
         let (tx1, mut rx1) = mpsc::channel::<LiveEvent>(8);
         let (tx2, mut rx2) = mpsc::channel::<LiveEvent>(8);
 
-        fanout
-            .subscribe("s1".to_owned(), vec![any_filter()], tx1)
-            .await;
-        fanout
-            .subscribe("s2".to_owned(), vec![any_filter()], tx2)
-            .await;
+        fanout.subscribe("s1".to_owned(), vec![any_filter()], tx1).await;
+        fanout.subscribe("s2".to_owned(), vec![any_filter()], tx2).await;
 
         let ev = make_event(1);
         fanout.broadcast(Arc::clone(&ev)).await;
@@ -183,9 +174,7 @@ mod tests {
         let fanout = Fanout::new();
         let (tx, mut rx) = mpsc::channel::<LiveEvent>(8);
 
-        fanout
-            .subscribe("s1".to_owned(), vec![any_filter()], tx.clone())
-            .await;
+        fanout.subscribe("s1".to_owned(), vec![any_filter()], tx.clone()).await;
         fanout.unsubscribe("s1", &tx).await;
 
         fanout.broadcast(make_event(1)).await;
@@ -197,12 +186,8 @@ mod tests {
         let fanout = Fanout::new();
         let (tx, mut rx) = mpsc::channel::<LiveEvent>(8);
 
-        fanout
-            .subscribe("s1".to_owned(), vec![any_filter()], tx.clone())
-            .await;
-        fanout
-            .subscribe("s2".to_owned(), vec![any_filter()], tx.clone())
-            .await;
+        fanout.subscribe("s1".to_owned(), vec![any_filter()], tx.clone()).await;
+        fanout.subscribe("s2".to_owned(), vec![any_filter()], tx.clone()).await;
         fanout.unsubscribe_all(&tx).await;
 
         fanout.broadcast(make_event(1)).await;
@@ -216,12 +201,8 @@ mod tests {
         let (tx1, mut rx1) = mpsc::channel::<LiveEvent>(1);
         let (tx2, mut rx2) = mpsc::channel::<LiveEvent>(8);
 
-        fanout
-            .subscribe("s1".to_owned(), vec![any_filter()], tx1)
-            .await;
-        fanout
-            .subscribe("s2".to_owned(), vec![any_filter()], tx2)
-            .await;
+        fanout.subscribe("s1".to_owned(), vec![any_filter()], tx1).await;
+        fanout.subscribe("s2".to_owned(), vec![any_filter()], tx2).await;
 
         // Fill tx1's channel first so the next send via try_send returns Full.
         fanout.broadcast(make_event(1)).await;
@@ -231,10 +212,7 @@ mod tests {
 
         // s2 gets both events; s1 only gets the first (second was dropped).
         let _ = rx1.try_recv();
-        assert!(
-            rx1.try_recv().is_err(),
-            "s1 missed second event (full channel)"
-        );
+        assert!(rx1.try_recv().is_err(), "s1 missed second event (full channel)");
         let _ = rx2.try_recv();
         let _ = rx2.try_recv();
     }
@@ -244,9 +222,7 @@ mod tests {
         let fanout = Fanout::new();
         let (tx, mut rx) = mpsc::channel::<LiveEvent>(8);
 
-        fanout
-            .subscribe("s1".to_owned(), vec![kind_filter(2)], tx)
-            .await;
+        fanout.subscribe("s1".to_owned(), vec![kind_filter(2)], tx).await;
 
         // Broadcast a kind=1 event; filter requires kind=2 -> no delivery.
         fanout.broadcast(make_event(1)).await;

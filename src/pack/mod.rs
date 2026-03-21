@@ -86,9 +86,7 @@ fn read_field(buf: &[u8], pos: &mut usize) -> Result<String, Error> {
         hex::encode(data, &mut out);
         String::from_utf8(out).map_err(|_| PackError::Invalid.into())
     } else {
-        Ok(std::str::from_utf8(data)
-            .map_err(|_| PackError::Invalid)?
-            .to_owned())
+        Ok(std::str::from_utf8(data).map_err(|_| PackError::Invalid)?.to_owned())
     }
 }
 
