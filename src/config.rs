@@ -32,8 +32,7 @@ impl Default for Config {
             .parse()
             .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap());
 
-        let relay_url =
-            std::env::var("FASTR_URL").unwrap_or_else(|_| format!("ws://{}", listen_addr));
+        let relay_url = std::env::var("FASTR_URL").unwrap_or_else(|_| format!("ws://{}", listen_addr));
 
         Config {
             listen_addr,
@@ -52,10 +51,7 @@ impl Default for Config {
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 #[cfg(test)]

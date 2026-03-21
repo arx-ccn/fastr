@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── fast gate ──────────────────────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo +nightly fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # ── tests ──────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  # ── release build ──────────────────────────────────────────────────────
+  build:
+    name: Build (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+  # ── benchmarks ─────────────────────────────────────────────────────────
+  # Runs Criterion benchmarks and posts a summary as a PR comment.
+  # On master pushes, stores baseline results for future comparisons.
+  bench:
+    name: Bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+
+      - name: Run benchmarks
+        run: cargo bench --all-targets 2>&1 | tee bench-output.txt
+
+      - name: Parse benchmark results
+        id: bench
+        run: |
+          {
+            echo 'summary<<EOF'
+            echo '### Benchmark results'
+            echo ''
+            echo '```'
+            grep -E '^\w.*time:' bench-output.txt || echo '(no benchmark timings found)'
+            echo '```'
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: bench
+          message: ${{ steps.bench.outputs.summary }}
+
+  # ── Docker image ───────────────────────────────────────────────────────
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deploy/Dockerfile .
+
+  # ── audit ──────────────────────────────────────────────────────────────
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

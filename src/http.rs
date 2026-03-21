@@ -43,6 +43,8 @@ impl RelayInfo {
     /// # Examples
     ///
     /// ```
+    /// use fastr::config::Config;
+    /// use fastr::http::RelayInfo;
     /// let cfg = Config::default();
     /// let info = RelayInfo::from_config(&cfg);
     /// assert_eq!(info.name, "fastr");

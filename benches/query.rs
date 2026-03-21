@@ -32,13 +32,7 @@ fn make_event(secp: &Secp256k1<secp256k1::All>, sk_scalar: u64, kind: u16, ts: i
     ev
 }
 
-fn make_tagged_event(
-    secp: &Secp256k1<secp256k1::All>,
-    sk_scalar: u64,
-    kind: u16,
-    ts: i64,
-    ref_id: &[u8; 32],
-) -> Event {
+fn make_tagged_event(secp: &Secp256k1<secp256k1::All>, sk_scalar: u64, kind: u16, ts: i64, ref_id: &[u8; 32]) -> Event {
     let mut sk_bytes = [0u8; 32];
     sk_bytes[24..].copy_from_slice(&sk_scalar.to_be_bytes());
     let sk = SecretKey::from_byte_array(sk_bytes).unwrap();
@@ -257,50 +251,42 @@ fn bench_transcode_vs_deserialize(c: &mut Criterion) {
         let f = kind_filter(&[3]);
 
         // Old path: deserialize -> Event struct -> hand-rolled JSON
-        group.bench_with_input(
-            BenchmarkId::new("deser+json", n),
-            &n,
-            |b, _| {
-                let mut json_buf = String::with_capacity(2048);
-                b.iter(|| {
-                    let mut count = 0usize;
-                    fixture
-                        .store
-                        .query(std::hint::black_box(&f), |dp_bytes| {
-                            json_buf.clear();
-                            let ev = fastr::pack::deserialize_trusted(dp_bytes)?;
-                            fastr::nostr::write_event_json("bench", &ev, &mut json_buf);
-                            count += 1;
-                            Ok(())
-                        })
-                        .unwrap();
-                    count
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("deser+json", n), &n, |b, _| {
+            let mut json_buf = String::with_capacity(2048);
+            b.iter(|| {
+                let mut count = 0usize;
+                fixture
+                    .store
+                    .query(std::hint::black_box(&f), |dp_bytes| {
+                        json_buf.clear();
+                        let ev = fastr::pack::deserialize_trusted(dp_bytes)?;
+                        fastr::nostr::write_event_json("bench", &ev, &mut json_buf);
+                        count += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                count
+            })
+        });
 
         // New path: BASED -> JSON transcoder (zero Event struct)
-        group.bench_with_input(
-            BenchmarkId::new("transcode", n),
-            &n,
-            |b, _| {
-                let mut json_buf = String::with_capacity(2048);
-                b.iter(|| {
-                    let mut count = 0usize;
-                    fixture
-                        .store
-                        .query(std::hint::black_box(&f), |dp_bytes| {
-                            json_buf.clear();
-                            fastr::pack::transcode_to_event_json(dp_bytes, "bench", &mut json_buf)?;
-                            count += 1;
-                            Ok(())
-                        })
-                        .unwrap();
-                    std::hint::black_box(&json_buf);
-                    count
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("transcode", n), &n, |b, _| {
+            let mut json_buf = String::with_capacity(2048);
+            b.iter(|| {
+                let mut count = 0usize;
+                fixture
+                    .store
+                    .query(std::hint::black_box(&f), |dp_bytes| {
+                        json_buf.clear();
+                        fastr::pack::transcode_to_event_json(dp_bytes, "bench", &mut json_buf)?;
+                        count += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                std::hint::black_box(&json_buf);
+                count
+            })
+        });
     }
 
     group.finish();

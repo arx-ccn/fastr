@@ -21,18 +21,11 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 async fn connect_nodelay(
     url: &str,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-> {
-    let (ws_stream, _) = tokio_tungstenite::connect_async(url)
-        .await
-        .context("ws connect")?;
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
+    let (ws_stream, _) = tokio_tungstenite::connect_async(url).await.context("ws connect")?;
     // Set TCP_NODELAY to avoid 40ms Nagle/delayed-ACK interaction.
-    match ws_stream.get_ref() {
-        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => {
-            let _ = tcp.set_nodelay(true);
-        }
-        _ => {}
+    if let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = ws_stream.get_ref() {
+        let _ = tcp.set_nodelay(true);
     }
     Ok(ws_stream)
 }
@@ -46,11 +39,7 @@ struct RawEvent {
 
 fn make_event(secp: &Secp256k1<secp256k1::All>, kp: &Keypair, idx: u64) -> RawEvent {
     let (xonly, _) = kp.x_only_public_key();
-    let pk_hex: String = xonly
-        .serialize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let pk_hex: String = xonly.serialize().iter().map(|b| format!("{b:02x}")).collect();
 
     let ts = 1_700_000_000i64 + idx as i64;
     let content = format!("bench event {idx}");
@@ -124,11 +113,7 @@ async fn cmd_ingest(url: &str, n_events: usize, concurrency: usize) -> Result<()
 
     // Pre-sign all events.
     println!("Pre-signing {n_events} events...");
-    let events: Arc<Vec<RawEvent>> = Arc::new(
-        (0..n_events as u64)
-            .map(|i| make_event(&secp, &kp, i))
-            .collect(),
-    );
+    let events: Arc<Vec<RawEvent>> = Arc::new((0..n_events as u64).map(|i| make_event(&secp, &kp, i)).collect());
     println!("Done. Starting timed ingest...");
 
     let sem = Arc::new(Semaphore::new(concurrency));
@@ -161,10 +146,7 @@ async fn cmd_ingest(url: &str, n_events: usize, concurrency: usize) -> Result<()
                 let ev = &events[idx];
                 let msg = format!(r#"["EVENT",{}]"#, ev.json);
                 let t0 = Instant::now();
-                write
-                    .send(WsMsg::Text(msg.into()))
-                    .await
-                    .context("ws send")?;
+                write.send(WsMsg::Text(msg.into())).await.context("ws send")?;
 
                 // Wait for OK.
                 let expected_id = ev.id_hex.clone();
@@ -251,10 +233,7 @@ async fn cmd_query(url: &str, n_queries: usize, concurrency: usize) -> Result<()
                 let sub_id = format!("bench-{c}-{i}");
                 let req = format!(r#"["REQ","{sub_id}",{{"kinds":[1],"limit":100}}]"#);
                 let t0 = Instant::now();
-                write
-                    .send(WsMsg::Text(req.into()))
-                    .await
-                    .context("ws send")?;
+                write.send(WsMsg::Text(req.into())).await.context("ws send")?;
 
                 // Drain until EOSE for our sub_id.
                 loop {
@@ -275,10 +254,7 @@ async fn cmd_query(url: &str, n_queries: usize, concurrency: usize) -> Result<()
 
                 // CLOSE the subscription.
                 let close = format!(r#"["CLOSE","{sub_id}"]"#);
-                write
-                    .send(WsMsg::Text(close.into()))
-                    .await
-                    .context("ws close")?;
+                write.send(WsMsg::Text(close.into())).await.context("ws close")?;
             }
 
             Ok::<Stats, anyhow::Error>(stats)
@@ -364,10 +340,7 @@ async fn cmd_rss(url: &str, n_events: usize, pid: u32) -> Result<()> {
     for idx in 0..n_events as u64 {
         let ev = make_event(&secp, &kp, idx);
         let msg = format!(r#"["EVENT",{}]"#, ev.json);
-        write
-            .send(WsMsg::Text(msg.into()))
-            .await
-            .context("ws send")?;
+        write.send(WsMsg::Text(msg.into())).await.context("ws send")?;
 
         // Consume the OK.
         loop {
@@ -402,10 +375,7 @@ async fn cmd_rss(url: &str, n_events: usize, pid: u32) -> Result<()> {
     println!("Initial RSS:    {} KB", initial_rss);
     println!("Final RSS:      {} KB", final_rss);
     println!("Peak RSS:       {} KB", peak_rss);
-    println!(
-        "Growth:         {} KB",
-        final_rss as i64 - initial_rss as i64
-    );
+    println!("Growth:         {} KB", final_rss as i64 - initial_rss as i64);
 
     Ok(())
 }
@@ -463,9 +433,7 @@ async fn cmd_neg_sync(url: &str, filter_json: &str, have_count: usize) -> Result
             .insert(ts, NegId::from_byte_array(id_bytes))
             .map_err(|e| anyhow!("negentropy insert: {e}"))?;
     }
-    storage
-        .seal()
-        .map_err(|e| anyhow!("negentropy seal: {e}"))?;
+    storage.seal().map_err(|e| anyhow!("negentropy seal: {e}"))?;
 
     println!("Client set built ({have_count} items). Connecting...");
 
@@ -473,17 +441,12 @@ async fn cmd_neg_sync(url: &str, filter_json: &str, have_count: usize) -> Result
     let (mut write, mut read) = futures_util::StreamExt::split(ws_stream);
 
     // Create the negentropy initiator.
-    let mut client = Negentropy::new(NegStorage::Borrowed(&storage), 0)
-        .map_err(|e| anyhow!("negentropy new: {e}"))?;
-    let init_msg = client
-        .initiate()
-        .map_err(|e| anyhow!("negentropy initiate: {e}"))?;
+    let mut client = Negentropy::new(NegStorage::Borrowed(&storage), 0).map_err(|e| anyhow!("negentropy new: {e}"))?;
+    let init_msg = client.initiate().map_err(|e| anyhow!("negentropy initiate: {e}"))?;
     let init_hex: String = init_msg.iter().map(|b| format!("{b:02x}")).collect();
 
     // Send NEG-OPEN.
-    let neg_open = format!(
-        r#"["NEG-OPEN","neg-bench",{filter_json},"{init_hex}"]"#
-    );
+    let neg_open = format!(r#"["NEG-OPEN","neg-bench",{filter_json},"{init_hex}"]"#);
 
     use futures_util::SinkExt;
     let start = Instant::now();
@@ -505,18 +468,11 @@ async fn cmd_neg_sync(url: &str, filter_json: &str, have_count: usize) -> Result
                     let txt = txt.as_str();
                     if txt.starts_with(r#"["NEG-MSG""#) {
                         // Extract hex from third array element.
-                        let v: serde_json::Value = serde_json::from_str(txt)
-                            .context("parse NEG-MSG")?;
-                        let hex = v[2]
-                            .as_str()
-                            .ok_or_else(|| anyhow!("NEG-MSG hex not a string"))?;
+                        let v: serde_json::Value = serde_json::from_str(txt).context("parse NEG-MSG")?;
+                        let hex = v[2].as_str().ok_or_else(|| anyhow!("NEG-MSG hex not a string"))?;
                         let mut bytes = vec![0u8; hex.len() / 2];
                         for (j, chunk) in hex.as_bytes().chunks(2).enumerate() {
-                            bytes[j] = u8::from_str_radix(
-                                std::str::from_utf8(chunk).unwrap(),
-                                16,
-                            )
-                            .unwrap();
+                            bytes[j] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
                         }
                         break bytes;
                     } else if txt.starts_with(r#"["NEG-ERR""#) {
@@ -539,10 +495,7 @@ async fn cmd_neg_sync(url: &str, filter_json: &str, have_count: usize) -> Result
             Ok(Some(next_msg)) => {
                 let hex: String = next_msg.iter().map(|b| format!("{b:02x}")).collect();
                 let neg_msg = format!(r#"["NEG-MSG","neg-bench","{hex}"]"#);
-                write
-                    .send(WsMsg::Text(neg_msg.into()))
-                    .await
-                    .context("NEG-MSG send")?;
+                write.send(WsMsg::Text(neg_msg.into())).await.context("NEG-MSG send")?;
             }
         }
     }
@@ -653,9 +606,7 @@ async fn main() -> Result<()> {
             let usage = "fastr-bench neg-sync --url <ws-url> --filter <json> [--have <N>]";
             let url = require_arg(&args, "--url", usage)?;
             let filter: String = parse_arg(&args, "--filter").unwrap_or_else(|| "{}".to_owned());
-            let have: usize = parse_arg(&args, "--have")
-                .unwrap_or_else(|| "0".to_owned())
-                .parse()?;
+            let have: usize = parse_arg(&args, "--have").unwrap_or_else(|| "0".to_owned()).parse()?;
             cmd_neg_sync(&url, &filter, have).await
         }
         _ => {

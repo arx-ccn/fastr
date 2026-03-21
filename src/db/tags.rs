@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use crate::pack::hex;
-use crate::pack::Event;
+use crate::db::store::TagSpec;
+use crate::pack::{hex, Event};
 
 /// 49-byte tag index record. Accessed via to_bytes/from_bytes.
 ///
@@ -117,10 +117,7 @@ pub fn matching_offsets(tags_mmap: &[u8], tag_name: u8, value: &[u8]) -> HashSet
 /// Single-pass scan: for each spec `(tag_name, [(value_bytes, value_len)])`, collect all
 /// data_offsets matching any value in that spec. Returns one HashSet per spec in the same
 /// order. Use this instead of calling `matching_offsets` K times for K tag dimensions.
-pub fn multi_matching_offsets(
-    tags_mmap: &[u8],
-    specs: &[(u8, Vec<([u8; 32], u8)>)],
-) -> Vec<HashSet<u64>> {
+pub fn multi_matching_offsets(tags_mmap: &[u8], specs: &[TagSpec]) -> Vec<HashSet<u64>> {
     let mut results: Vec<HashSet<u64>> = specs.iter().map(|_| HashSet::new()).collect();
     let n = tags_mmap.len() / TAG_ENTRY_SIZE;
     for i in 0..n {
@@ -133,7 +130,11 @@ pub fn multi_matching_offsets(
                 continue;
             }
             for (val, len) in values {
-                if e.value_len == *len && &e.tag_value[..*len as usize] == &val[..*len as usize] {
+                let n = *len as usize;
+                if n > e.tag_value.len() || n > val.len() {
+                    continue;
+                }
+                if e.value_len == *len && e.tag_value[..n] == val[..n] {
                     results[j].insert(e.data_offset);
                     break;
                 }

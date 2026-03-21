@@ -1,5 +1,5 @@
-/// D-tag index for addressable events (kinds 30000-39999).
-/// 74-byte fixed records: (data_offset, kind, pubkey, d_hash).
+//! D-tag index for addressable events (kinds 30000-39999).
+//! 74-byte fixed records: (data_offset, kind, pubkey, d_hash).
 
 pub const DTAG_ENTRY_SIZE: usize = 74;
 
