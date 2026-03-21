@@ -92,9 +92,9 @@ fn msg_to_json(msg: Out) -> Option<String> {
 /// use tokio::net::TcpListener;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let listener = TcpListener::bind("127.0.0.1:9000").await?;
-/// let store = Arc::new(crate::store::Store::default());
+/// let store = Arc::new(crate::db::store::Store::open(std::path::Path::new("/tmp/store"))?);
 /// let config = Arc::new(crate::config::Config::default());
-/// let fanout = Arc::new(crate::fanout::Fanout::new());
+/// let fanout = crate::ws::fanout::Fanout::new();
 ///
 /// let (stream, peer) = listener.accept().await?;
 /// // Spawn the connection handler; it runs until the client disconnects.
@@ -620,13 +620,22 @@ async fn handle_neg_open(
     // Build the negentropy storage.
     let auth_pk = auth.authenticated.as_ref().map(|pk| &pk.0);
     let mut storage = NegentropyStorageVector::new();
+    let mut insert_error: Option<String> = None;
 
     if let Err(e) = store.iter_negentropy(&filter, auth_pk, |ts, id| {
-        // Errors from insert are non-fatal (e.g. out-of-order should not happen since
-        // iter_negentropy returns sorted items).
-        let _ = storage.insert(ts as u64, NegId::from_byte_array(id));
+        if insert_error.is_none() {
+            if let Err(e) = storage.insert(ts as u64, NegId::from_byte_array(id)) {
+                insert_error = Some(e.to_string());
+            }
+        }
     }) {
         let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+        let _ = out_tx.send(Out::Text(err)).await;
+        return;
+    }
+
+    if let Some(err_msg) = insert_error {
+        let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &err_msg }.to_json();
         let _ = out_tx.send(Out::Text(err)).await;
         return;
     }
@@ -1449,7 +1458,6 @@ mod tests {
     /// assert!(!hex_msg.is_empty());
     /// assert!(storage.len() >= 2);
     /// ```
-    fn neg_initiate(items: &[(u64, [u8; 32])]) -> (NegentropyStorageVector, String) {
     fn neg_initiate(items: &[(u64, [u8; 32])]) -> (NegentropyStorageVector, String) {
         let mut storage = NegentropyStorageVector::new();
         for (ts, id) in items {

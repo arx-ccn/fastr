@@ -804,11 +804,12 @@ impl Store {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// # use std::sync::Arc;
-    /// # use your_crate::{Store, Filter};
-    /// # fn doc_example(store: &Store) -> Result<(), std::io::Error> {
-    /// let filter = Filter::new(); // empty filter -> newest-first, up to default limit
+    /// # use std::path::Path;
+    /// # fn doc_example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let store = crate::db::store::Store::open(Path::new("/tmp/store"))?;
+    /// let filter = crate::nostr::filter::Filter::new(); // empty filter -> newest-first, up to default limit
     /// store.query_authed(&filter, None, |ev_bytes| {
     ///     // handle serialized event bytes
     ///     println!("event {} bytes", ev_bytes.len());
