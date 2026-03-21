@@ -174,6 +174,18 @@ bench_relay() {
   ingest_p99="$(printf '%s\n' "${ingest_out}" |
     awk '/p99:/{gsub(/[^0-9]/,"",$NF); print $NF; exit}')"
 
+  log "--- ${label}: neg-sync (${EVENTS} events, half overlap) ---"
+  local neg_out
+  neg_out="$(fastr-bench neg-sync \
+    --url "${ws_url}" \
+    --filter '{"kinds":[1]}' \
+    --have $((EVENTS / 2)) 2>&1)"
+  log "${neg_out}"
+
+  local neg_wall_ms
+  neg_wall_ms="$(printf '%s\n' "${neg_out}" |
+    awk '/^Wall time:/{gsub(/[^0-9.]/,"",$NF); print $NF; exit}')"
+
   log "--- ${label}: query (${QUERIES} queries, concurrency ${CONCURRENCY}) ---"
   local query_out
   query_out="$(fastr-bench query \
@@ -241,6 +253,7 @@ bench_relay() {
   printf 'IO_WRITE_MB=%s\n' "${io_write_mb}"
   printf 'PEAK_FDS=%s\n' "${peak_fds}"
   printf 'INGEST_ERRORS=%s\n' "${ingest_errors:-0}"
+  printf 'NEG_WALL_MS=%s\n' "${neg_wall_ms:-0}"
 }
 
 # ---------------------------------------------------------------------------
@@ -431,6 +444,8 @@ F_IO="$(field "${FASTR_RESULT}" IO_WRITE_MB)"
 F_FD="$(field "${FASTR_RESULT}" PEAK_FDS)"
 F_ER="$(field "${FASTR_RESULT}" INGEST_ERRORS)"
 
+F_NW="$(field "${FASTR_RESULT}" NEG_WALL_MS)"
+
 S_IT="$(field "${STRFRY_RESULT}" INGEST_THROUGHPUT)"
 S_IP50="$(field "${STRFRY_RESULT}" INGEST_P50)"
 S_IP99="$(field "${STRFRY_RESULT}" INGEST_P99)"
@@ -447,6 +462,7 @@ S_DU="$(field "${STRFRY_RESULT}" DISK_USAGE_MB)"
 S_IO="$(field "${STRFRY_RESULT}" IO_WRITE_MB)"
 S_FD="$(field "${STRFRY_RESULT}" PEAK_FDS)"
 S_ER="$(field "${STRFRY_RESULT}" INGEST_ERRORS)"
+S_NW="$(field "${STRFRY_RESULT}" NEG_WALL_MS)"
 
 # ---------------------------------------------------------------------------
 # Determine winners
@@ -469,6 +485,7 @@ W_DU="$(winner_lower "${F_DU:-0}" "${S_DU:-0}")"
 W_IO="$(winner_lower "${F_IO:-0}" "${S_IO:-0}")"
 W_FD="$(winner_lower "${F_FD:-0}" "${S_FD:-0}")"
 W_ER="$(winner_lower "${F_ER:-0}" "${S_ER:-0}")"
+W_NW="$(winner_lower "${F_NW:-0}" "${S_NW:-0}")"
 
 # ---------------------------------------------------------------------------
 # Build the markdown table
@@ -485,6 +502,7 @@ TABLE="
 | Ingest OK p50 latency (µs)          | ${F_IP50:--}      | ${S_IP50:--}      | ${W_IP50} |
 | Ingest OK p99 latency (µs)          | ${F_IP99:--}      | ${S_IP99:--}      | ${W_IP99} |
 | Ingest errors                       | ${F_ER:-0}        | ${S_ER:-0}        | ${W_ER}  |
+| Neg-sync wall time (ms)             | ${F_NW:--}        | ${S_NW:--}        | ${W_NW}  |
 | REQ query throughput (q/s)          | ${F_QT:--}        | ${S_QT:--}        | ${W_QT}  |
 | REQ->EOSE p50 latency (µs)           | ${F_QP50:--}      | ${S_QP50:--}      | ${W_QP50} |
 | REQ->EOSE p99 latency (µs)           | ${F_QP99:--}      | ${S_QP99:--}      | ${W_QP99} |

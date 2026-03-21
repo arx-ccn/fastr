@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio             = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 # futures-util: SinkExt/StreamExt traits for WebSocket split; re-exported by tungstenite but must be in scope
 futures-util       = { version = "0.3", default-features = false, features = ["sink", "async-await"] }
 serde             = { version = "1", features = ["derive"] }
@@ -32,6 +32,8 @@ sha2              = "0.10"
 arc-swap          = "1"
 # httparse: NIP-11 HTTP header parsing for relay info requests; already a transitive dep of tokio-tungstenite
 httparse          = "1"
+# negentropy: NIP-77 range-based set reconciliation protocol (reference Rust impl by hoytech)
+negentropy        = "0.5.0"
 
 [dev-dependencies]
 criterion = { version = "0.8" }

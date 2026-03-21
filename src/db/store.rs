@@ -901,6 +901,113 @@ impl Store {
         Ok(())
     }
 
+    /// Iterate (created_at, event_id) for events matching `filter`,
+    /// sorted ascending by (created_at, id) — the order negentropy requires.
+    /// Tombstoned, expired, and NIP-17 kind-1059 (when unauthenticated) events
+    /// are excluded. `auth_pk` follows the same semantics as `query_authed`.
+    /// `f` is called for each item in sorted order.
+    pub fn iter_negentropy<F>(&self, filter: &Filter, auth_pk: Option<&[u8; 32]>, mut f: F)
+    where
+        F: FnMut(i64, [u8; 32]),
+    {
+        let idx_slice = self.index.slice();
+        let tags_slice = self.tags.slice();
+
+        // NIP-17: pre-compute set of data_offsets where the p-tag matches auth_pk.
+        let nip17_allowed: Option<HashSet<u64>> = auth_pk
+            .filter(|_| {
+                filter.kinds.is_empty()
+                    || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP)
+            })
+            .map(|pk| tags::matching_offsets(&tags_slice, b'p', pk));
+
+        // Pre-compute tag offset sets via a single pass over tags.s.
+        let tag_sets: Vec<(u8, HashSet<u64>)> = if filter.tags.is_empty() {
+            vec![]
+        } else {
+            let specs: Vec<(u8, Vec<([u8; 32], u8)>)> = filter
+                .tags
+                .iter()
+                .map(|(ch, values)| {
+                    let name = *ch as u8;
+                    let decoded: Vec<([u8; 32], u8)> = values
+                        .iter()
+                        .filter_map(|v| {
+                            if v.len() == 64 && hex::is_hex(v.as_bytes()) {
+                                let mut buf = [0u8; 32];
+                                hex::decode(v.as_bytes(), &mut buf).unwrap();
+                                Some((buf, 32u8))
+                            } else if v.len() <= 32 {
+                                let mut buf = [0u8; 32];
+                                buf[..v.len()].copy_from_slice(v.as_bytes());
+                                Some((buf, v.len() as u8))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    (name, decoded)
+                })
+                .collect();
+            tags::multi_matching_offsets(&tags_slice, &specs)
+                .into_iter()
+                .zip(filter.tags.keys())
+                .map(|(set, ch)| (*ch as u8, set))
+                .collect()
+        };
+
+        let now = unix_now();
+        let tombstones = match self.tombstones.read() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        let mut items: Vec<(i64, [u8; 32])> = Vec::new();
+
+        for (_, entry) in index::iter_entries(&idx_slice) {
+            // NIP-40: skip expired events.
+            if entry.expiry != 0 && entry.expiry <= now {
+                continue;
+            }
+
+            // NIP-09: skip tombstoned events.
+            if tombstones.contains(&entry.id) {
+                continue;
+            }
+
+            // NIP-17: kind-1059 events only served to the p-tag recipient.
+            if entry.kind == crate::nostr::KIND_GIFT_WRAP {
+                match &nip17_allowed {
+                    None => continue,
+                    Some(set) => {
+                        if !set.contains(&entry.offset) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if !index::matches(&entry, filter) {
+                continue;
+            }
+            if !tag_sets.is_empty() {
+                let off = entry.offset;
+                if tag_sets.iter().any(|(_, set)| !set.contains(&off)) {
+                    continue;
+                }
+            }
+
+            items.push((entry.created_at, entry.id));
+        }
+
+        drop(tombstones);
+
+        items.sort_unstable();
+        for (ts, id) in items {
+            f(ts, id);
+        }
+    }
+
     /// Number of tombstoned events.
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.read().map(|t| t.len()).unwrap_or(0)

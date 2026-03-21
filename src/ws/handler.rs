@@ -1,8 +1,9 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
+use negentropy::{Id as NegId, Negentropy, NegentropyStorageVector};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
@@ -15,6 +16,12 @@ use crate::nostr::{classify_kind, has_protected_tag, parse_client_msg, validate_
 use crate::pack::{self, Event, EventId};
 use crate::ws::auth::{verify_auth_event, AuthState};
 use crate::ws::fanout::{Fanout, LiveEvent};
+
+/// Unified subscription entry: either a live fanout subscription or a negentropy session.
+enum Sub {
+    Live,
+    Neg(Box<Negentropy<'static, NegentropyStorageVector>>),
+}
 
 /// Send an OK response to the client.
 async fn send_ok(id: &EventId, accepted: bool, reason: &str, out_tx: &mpsc::Sender<Out>) {
@@ -158,7 +165,7 @@ where
     let auth_challenge_msg = format!(r#"["AUTH","{}"]"#, auth.challenge);
     let _ = out_tx.send(Out::Text(auth_challenge_msg)).await;
 
-    let mut subs: HashSet<String> = HashSet::new();
+    let mut subs: HashMap<String, Sub> = HashMap::new();
 
     // Read loop.
     while let Some(result) = ws_stream.next().await {
@@ -197,12 +204,21 @@ where
                         )
                         .await;
                     }
-                    Ok(ClientMsg::Close { sub_id }) => {
-                        subs.remove(&sub_id);
-                        fanout.unsubscribe(&sub_id, &live_tx).await;
+                    Ok(ClientMsg::Close { sub_id }) | Ok(ClientMsg::NegClose { sub_id }) => {
+                        remove_sub(&sub_id, &mut subs, &fanout, &live_tx).await;
                     }
                     Ok(ClientMsg::Count { sub_id, filters }) => {
                         handle_count(&sub_id, &filters, &store, &out_tx).await;
+                    }
+                    Ok(ClientMsg::NegOpen { sub_id, filter, msg }) => {
+                        // If replacing a Live subscription, unsubscribe from fanout first.
+                        remove_sub(&sub_id, &mut subs, &fanout, &live_tx).await;
+                        handle_neg_open(
+                            sub_id, filter, msg, &store, &config, &auth, &out_tx, &mut subs,
+                        ).await;
+                    }
+                    Ok(ClientMsg::NegMsg { sub_id, msg }) => {
+                        handle_neg_msg(sub_id, msg, &out_tx, &mut subs).await;
                     }
                     Ok(ClientMsg::Auth(ev)) => {
                         let id = ev.id.clone();
@@ -340,10 +356,10 @@ async fn handle_req(
     fanout: &Arc<Fanout>,
     live_tx: &mpsc::Sender<LiveEvent>,
     out_tx: &mpsc::Sender<Out>,
-    subs: &mut HashSet<String>,
+    subs: &mut HashMap<String, Sub>,
     auth: &AuthState,
 ) {
-    if subs.len() >= config.max_subscriptions_per_conn && !subs.contains(&sub_id) {
+    if subs.len() >= config.max_subscriptions_per_conn && !subs.contains_key(&sub_id) {
         let msg = ServerMsg::Notice {
             message: "too many subscriptions",
         }
@@ -395,8 +411,8 @@ async fn handle_req(
     // One channel send for all stored events + EOSE.
     let _ = out_tx.send(Out::Batch(batch)).await;
 
-    // Register / replace subscription in fanout (subscribe handles replacement).
-    subs.insert(sub_id.clone());
+    // If replacing a Neg session, just overwrite; if replacing a Live, fanout.subscribe handles it.
+    subs.insert(sub_id.clone(), Sub::Live);
     fanout.subscribe(sub_id, filters, live_tx.clone()).await;
 }
 
@@ -410,6 +426,108 @@ async fn handle_count(
     let escaped_id = serde_json::to_string(sub_id).unwrap_or_else(|_| "\"\"".to_owned());
     let msg = format!(r#"["COUNT",{},{{"count":{}}}]"#, escaped_id, total);
     let _ = out_tx.send(Out::Text(msg)).await;
+}
+
+/// Remove a subscription (Live or Neg) from the unified map.
+/// If the sub was a live fanout subscription, unsubscribes from fanout.
+async fn remove_sub(
+    sub_id: &str,
+    subs: &mut HashMap<String, Sub>,
+    fanout: &Arc<Fanout>,
+    live_tx: &mpsc::Sender<LiveEvent>,
+) {
+    if let Some(Sub::Live) = subs.remove(sub_id) {
+        fanout.unsubscribe(sub_id, live_tx).await;
+    }
+}
+
+async fn handle_neg_open(
+    sub_id: String,
+    filter: Filter,
+    msg: Vec<u8>,
+    store: &Arc<Store>,
+    config: &Arc<Config>,
+    auth: &AuthState,
+    out_tx: &mpsc::Sender<Out>,
+    subs: &mut HashMap<String, Sub>,
+) {
+    // Check subscription limit (caller already removed any existing sub with this id).
+    if subs.len() >= config.max_subscriptions_per_conn {
+        let notice = ServerMsg::Notice { message: "too many subscriptions" }.to_json();
+        let _ = out_tx.send(Out::Text(notice)).await;
+        return;
+    }
+
+    // Build the negentropy storage.
+    let auth_pk = auth.authenticated.as_ref().map(|pk| &pk.0);
+    let mut storage = NegentropyStorageVector::new();
+
+    store.iter_negentropy(&filter, auth_pk, |ts, id| {
+        // Errors from insert are non-fatal (e.g. out-of-order should not happen since
+        // iter_negentropy returns sorted items).
+        let _ = storage.insert(ts as u64, NegId::from_byte_array(id));
+    });
+
+    if let Err(e) = storage.seal() {
+        let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+        let _ = out_tx.send(Out::Text(err)).await;
+        return;
+    }
+
+    let mut neg = match Negentropy::owned(storage, config.max_message_bytes as u64) {
+        Ok(n) => n,
+        Err(e) => {
+            let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+            let _ = out_tx.send(Out::Text(err)).await;
+            return;
+        }
+    };
+
+    // Reconcile.
+    match neg.reconcile(&msg) {
+        Err(e) => {
+            let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+            let _ = out_tx.send(Out::Text(err)).await;
+        }
+        Ok(reply) => {
+            let resp = ServerMsg::NegMsg { sub_id: &sub_id, msg: &reply }.to_json();
+            let _ = out_tx.send(Out::Text(resp)).await;
+            // Always store the session — the client drives NEG-CLOSE when done.
+            // The server-side reconcile reply is never empty (always contains at
+            // least the protocol-version byte), so there is no first-round
+            // "already done" signal on the server side.
+            subs.insert(sub_id, Sub::Neg(Box::new(neg)));
+        }
+    }
+}
+
+async fn handle_neg_msg(
+    sub_id: String,
+    msg: Vec<u8>,
+    out_tx: &mpsc::Sender<Out>,
+    subs: &mut HashMap<String, Sub>,
+) {
+    let neg = match subs.get_mut(&sub_id) {
+        Some(Sub::Neg(n)) => n,
+        _ => {
+            let err = ServerMsg::NegErr { sub_id: &sub_id, reason: "session not found" }.to_json();
+            let _ = out_tx.send(Out::Text(err)).await;
+            return;
+        }
+    };
+
+    match neg.reconcile(&msg) {
+        Err(e) => {
+            let err = ServerMsg::NegErr { sub_id: &sub_id, reason: &e.to_string() }.to_json();
+            let _ = out_tx.send(Out::Text(err)).await;
+            subs.remove(&sub_id);
+        }
+        Ok(reply) => {
+            let resp = ServerMsg::NegMsg { sub_id: &sub_id, msg: &reply }.to_json();
+            let _ = out_tx.send(Out::Text(resp)).await;
+            // Session stays alive until client sends NEG-CLOSE.
+        }
+    }
 }
 
 // Integration tests
@@ -1123,4 +1241,318 @@ mod tests {
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("EOSE"), "non-recipient should get only EOSE: {resp}");
     }
+
+    // NIP-77 Negentropy tests
+
+    use negentropy::{Id as NegId, Negentropy as Neg, NegentropyStorageVector, Storage as NegStorage};
+
+    /// Helper: build a client-side Negentropy storage and return the hex-encoded initial message.
+    fn neg_initiate(items: &[(u64, [u8; 32])]) -> (NegentropyStorageVector, String) {
+        let mut storage = NegentropyStorageVector::new();
+        for (ts, id) in items {
+            storage.insert(*ts, NegId::from_byte_array(*id)).unwrap();
+        }
+        storage.seal().unwrap();
+        let mut client = Neg::new(NegStorage::Borrowed(&storage), 0).unwrap();
+        let init_msg = client.initiate().unwrap();
+        let hex_msg = crate::nostr::hex_encode_bytes(&init_msg);
+        (storage, hex_msg)
+    }
+
+    /// Run the full client-side negentropy reconciliation loop over WebSocket.
+    /// Returns (have_ids, need_ids) after all rounds complete.
+    async fn neg_reconcile(
+        ws: &mut WsClient,
+        sub_id: &str,
+        storage: &NegentropyStorageVector,
+        initial_reply: Vec<u8>,
+    ) -> (Vec<NegId>, Vec<NegId>) {
+        let mut client = Neg::new(NegStorage::Borrowed(storage), 0).unwrap();
+        let _init = client.initiate().unwrap();
+        let mut have_ids = Vec::new();
+        let mut need_ids = Vec::new();
+        let mut current_reply = initial_reply;
+        loop {
+            match client.reconcile_with_ids(&current_reply, &mut have_ids, &mut need_ids).unwrap() {
+                None => break,
+                Some(next_msg) => {
+                    let hex = crate::nostr::hex_encode_bytes(&next_msg);
+                    let msg = format!(r#"["NEG-MSG","{}","{hex}"]"#, sub_id);
+                    ws.send(TMsg::Text(msg.into())).await.unwrap();
+                    let resp = recv_text(ws).await;
+                    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                    assert_eq!(v[0], "NEG-MSG", "expected NEG-MSG, got: {resp}");
+                    let hex_reply = v[2].as_str().unwrap();
+                    current_reply = vec![0u8; hex_reply.len() / 2];
+                    crate::pack::hex::decode(hex_reply.as_bytes(), &mut current_reply).unwrap();
+                }
+            }
+        }
+        (have_ids, need_ids)
+    }
+
+    /// Send a NEG-OPEN and return the NEG-MSG reply bytes (decoded from hex).
+    async fn neg_open(ws: &mut WsClient, sub_id: &str, filter_json: &str, hex_msg: &str) -> Vec<u8> {
+        let msg = format!(r#"["NEG-OPEN","{}",{},"{hex_msg}"]"#, sub_id, filter_json);
+        ws.send(TMsg::Text(msg.into())).await.unwrap();
+        let resp = recv_text(ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "NEG-MSG", "expected NEG-MSG, got: {resp}");
+        assert_eq!(v[1], sub_id);
+        let hex = v[2].as_str().unwrap();
+        let mut bytes = vec![0u8; hex.len() / 2];
+        crate::pack::hex::decode(hex.as_bytes(), &mut bytes).unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn test_neg_identical_stores() {
+        let (port, store) = spawn_server().await;
+        // Store 3 events on server.
+        let ev1 = make_event(1, 1, 1000, vec![]);
+        let ev2 = make_event(2, 1, 2000, vec![]);
+        let ev3 = make_event(3, 1, 3000, vec![]);
+        store.append(&ev1).unwrap();
+        store.append(&ev2).unwrap();
+        store.append(&ev3).unwrap();
+
+        // Client has the same 3 events.
+        let client_items: Vec<(u64, [u8; 32])> = vec![
+            (1000, ev1.id.0),
+            (2000, ev2.id.0),
+            (3000, ev3.id.0),
+        ];
+        let (client_storage, hex_msg) = neg_initiate(&client_items);
+
+        let mut ws = connect(port).await;
+        let reply = neg_open(&mut ws, "neg1", "{}", &hex_msg).await;
+        let (have_ids, need_ids) = neg_reconcile(&mut ws, "neg1", &client_storage, reply).await;
+
+        // Identical stores: no have_ids, no need_ids.
+        assert!(have_ids.is_empty(), "have_ids should be empty for identical sets");
+        assert!(need_ids.is_empty(), "need_ids should be empty for identical sets");
+    }
+
+    #[tokio::test]
+    async fn test_neg_partial_overlap() {
+        let (port, store) = spawn_server().await;
+        // Server has events [1, 2, 3, 4].
+        let ev1 = make_event(1, 1, 1000, vec![]);
+        let ev2 = make_event(2, 1, 2000, vec![]);
+        let ev3 = make_event(3, 1, 3000, vec![]);
+        let ev4 = make_event(4, 1, 4000, vec![]);
+        store.append(&ev1).unwrap();
+        store.append(&ev2).unwrap();
+        store.append(&ev3).unwrap();
+        store.append(&ev4).unwrap();
+
+        // Client has [2, 4].
+        let client_items: Vec<(u64, [u8; 32])> = vec![
+            (2000, ev2.id.0),
+            (4000, ev4.id.0),
+        ];
+        let (client_storage, hex_msg) = neg_initiate(&client_items);
+
+        let mut ws = connect(port).await;
+        let reply = neg_open(&mut ws, "neg1", r#"{"kinds":[1]}"#, &hex_msg).await;
+        let (_have_ids, need_ids) = neg_reconcile(&mut ws, "neg1", &client_storage, reply).await;
+
+        // Client needs events [1, 3] from server.
+        let need_set: std::collections::HashSet<[u8; 32]> = need_ids.iter().map(|id| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(id.as_bytes());
+            arr
+        }).collect();
+        assert!(need_set.contains(&ev1.id.0), "client should need event 1");
+        assert!(need_set.contains(&ev3.id.0), "client should need event 3");
+        assert!(!need_set.contains(&ev2.id.0), "client should NOT need event 2");
+        assert!(!need_set.contains(&ev4.id.0), "client should NOT need event 4");
+    }
+
+    #[tokio::test]
+    async fn test_neg_close_removes_session() {
+        let (port, store) = spawn_server().await;
+        store.append(&make_event(1, 1, 1000, vec![])).unwrap();
+
+        let client_items: Vec<(u64, [u8; 32])> = vec![];
+        let (_, hex_msg) = neg_initiate(&client_items);
+
+        let mut ws = connect(port).await;
+        let _ = neg_open(&mut ws, "neg1", "{}", &hex_msg).await;
+
+        // Send NEG-CLOSE.
+        ws.send(TMsg::Text(r#"["NEG-CLOSE","neg1"]"#.into())).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        // Now send NEG-MSG — should get NEG-ERR because session is gone.
+        ws.send(TMsg::Text(r#"["NEG-MSG","neg1","00"]"#.into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "NEG-ERR", "expected NEG-ERR after CLOSE: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_close_also_removes_neg_session() {
+        let (port, store) = spawn_server().await;
+        store.append(&make_event(1, 1, 1000, vec![])).unwrap();
+
+        let client_items: Vec<(u64, [u8; 32])> = vec![];
+        let (_, hex_msg) = neg_initiate(&client_items);
+
+        let mut ws = connect(port).await;
+        let _ = neg_open(&mut ws, "neg1", "{}", &hex_msg).await;
+
+        // Send regular CLOSE (NIP-01) — should also remove neg session.
+        ws.send(TMsg::Text(r#"["CLOSE","neg1"]"#.into())).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        // NEG-MSG should now get NEG-ERR.
+        ws.send(TMsg::Text(r#"["NEG-MSG","neg1","00"]"#.into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "NEG-ERR", "expected NEG-ERR after CLOSE: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_neg_duplicate_sub_id_replaces_session() {
+        let (port, store) = spawn_server().await;
+        store.append(&make_event(1, 1, 1000, vec![])).unwrap();
+
+        let client_items: Vec<(u64, [u8; 32])> = vec![];
+        let (_, hex_msg) = neg_initiate(&client_items);
+
+        let mut ws = connect(port).await;
+        // Open first session.
+        let _ = neg_open(&mut ws, "s1", "{}", &hex_msg).await;
+
+        // Open second session with same sub_id — replaces first.
+        let (_, hex_msg2) = neg_initiate(&client_items);
+        let _ = neg_open(&mut ws, "s1", "{}", &hex_msg2).await;
+
+        // The connection should still be alive and working.
+        ws.send(TMsg::Text(r#"["NEG-CLOSE","s1"]"#.into())).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        // Verify session is gone.
+        ws.send(TMsg::Text(r#"["NEG-MSG","s1","00"]"#.into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "NEG-ERR");
+    }
+
+    #[tokio::test]
+    async fn test_neg_empty_server() {
+        // Server has nothing, client has 3 events.
+        let (port, _store) = spawn_server().await;
+
+        let ev1 = make_event(1, 1, 1000, vec![]);
+        let ev2 = make_event(2, 1, 2000, vec![]);
+        let ev3 = make_event(3, 1, 3000, vec![]);
+        let client_items: Vec<(u64, [u8; 32])> = vec![
+            (1000, ev1.id.0),
+            (2000, ev2.id.0),
+            (3000, ev3.id.0),
+        ];
+        let (client_storage, hex_msg) = neg_initiate(&client_items);
+
+        let mut ws = connect(port).await;
+        let reply = neg_open(&mut ws, "neg1", "{}", &hex_msg).await;
+        let (have_ids, need_ids) = neg_reconcile(&mut ws, "neg1", &client_storage, reply).await;
+
+        // Client has all 3, server has none. Client "has" these IDs (server doesn't).
+        assert_eq!(have_ids.len(), 3, "client should have 3 ids server doesn't");
+        assert!(need_ids.is_empty(), "client should need nothing");
+    }
+
+    #[tokio::test]
+    async fn test_neg_tag_filter_produces_correct_set() {
+        let (port, store) = spawn_server().await;
+        let hex64 = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        // Store events: one with the tag, one without.
+        let ev_tagged = make_event(1, 1, 1000, vec![Tag {
+            fields: vec!["e".into(), hex64.into()],
+        }]);
+        let ev_untagged = make_event(2, 1, 2000, vec![]);
+        store.append(&ev_tagged).unwrap();
+        store.append(&ev_untagged).unwrap();
+
+        // Client has neither event.
+        let client_items: Vec<(u64, [u8; 32])> = vec![];
+        let (client_storage, hex_msg) = neg_initiate(&client_items);
+
+        let mut ws = connect(port).await;
+        let filter = format!("{{\"#e\":[\"{}\"]}}", hex64);
+        let reply = neg_open(&mut ws, "neg1", &filter, &hex_msg).await;
+        let (_have_ids, need_ids) = neg_reconcile(&mut ws, "neg1", &client_storage, reply).await;
+
+        // Client should need only the tagged event, not the untagged one.
+        let need_set: std::collections::HashSet<[u8; 32]> = need_ids.iter().map(|id| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(id.as_bytes());
+            arr
+        }).collect();
+        assert_eq!(need_set.len(), 1, "should need exactly 1 event");
+        assert!(need_set.contains(&ev_tagged.id.0), "should need the tagged event");
+        assert!(!need_set.contains(&ev_untagged.id.0), "should not need the untagged event");
+    }
+
+    #[tokio::test]
+    async fn test_neg_sub_id_limit_applies_to_neg_sessions() {
+        // Spin a server with a low subscription cap.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.keep()).unwrap());
+        let config = Arc::new(Config {
+            relay_url: format!("ws://127.0.0.1:{port}"),
+            max_subscriptions_per_conn: 2,
+            ..Config::default()
+        });
+        let fanout = Fanout::new();
+        let srv_store = Arc::clone(&store);
+        let srv_config = Arc::clone(&config);
+        let srv_fanout = Arc::clone(&fanout);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, peer)) = listener.accept().await {
+                    let s = Arc::clone(&srv_store);
+                    let c = Arc::clone(&srv_config);
+                    let f = Arc::clone(&srv_fanout);
+                    tokio::spawn(async move {
+                        let _ = handle_connection(stream, peer, s, c, f).await;
+                    });
+                }
+            }
+        });
+
+        // Store one event so the server set is non-empty, ensuring the first-round
+        // reply is non-empty and a session slot is actually consumed per NEG-OPEN.
+        store.append(&make_event(1, 1, 1000, vec![])).unwrap();
+
+        // Client has nothing — first-round reply will be non-empty, session is stored.
+        let (_, hex_msg) = neg_initiate(&[]);
+
+        let mut ws = connect(port).await;
+
+        // Open slot 1.
+        neg_open(&mut ws, "s1", "{}", &hex_msg).await;
+        // Open slot 2.
+        let (_, hex_msg2) = neg_initiate(&[]);
+        neg_open(&mut ws, "s2", "{}", &hex_msg2).await;
+
+        // Attempt to open a third session — should be rejected with NOTICE.
+        let (_, hex_msg3) = neg_initiate(&[]);
+        let raw = format!(r#"["NEG-OPEN","s3",{{}},"{hex_msg3}"]"#);
+        ws.send(TMsg::Text(raw.into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "NOTICE", "expected NOTICE when limit is reached: {resp}");
+        assert!(
+            v[1].as_str().unwrap_or("").contains("too many"),
+            "NOTICE should mention subscription limit: {resp}",
+        );
+    }
+
+
 }

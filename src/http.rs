@@ -39,7 +39,7 @@ impl RelayInfo {
             description: "A high-performance Nostr relay",
             pubkey: None,
             contact: None,
-            supported_nips: vec![1, 9, 11, 17, 40, 42, 45, 62, 70],
+            supported_nips: vec![1, 9, 11, 17, 40, 42, 45, 62, 70, 77],
             software: "https://github.com/arx-ccn/fastr",
             version: env!("CARGO_PKG_VERSION"),
             limitation: Limitation {
