@@ -29,22 +29,6 @@ enum Sub {
 ///
 /// The message encodes the event `id`, whether it was `accepted`, and an explanatory `reason`,
 /// then serializes to JSON and sends it as `Out::Text` on `out_tx`. Send errors are ignored.
-///
-/// # Examples
-///
-/// ```no_run
-/// use tokio::sync::mpsc;
-/// // create a small channel for outbound messages
-/// let (tx, mut rx) = mpsc::channel(2);
-/// let id = EventId::default();
-/// // fire-and-forget the send
-/// tokio::spawn(async move {
-///     send_ok(&id, true, "accepted", &tx).await;
-/// });
-/// // the receiver should get an Out::Text frame (send failures are ignored by send_ok)
-/// let received = futures::executor::block_on(async { rx.recv().await });
-/// assert!(received.is_some());
-/// ```
 async fn send_ok(id: &EventId, accepted: bool, reason: &str, out_tx: &mpsc::Sender<Out>) {
     let msg = ServerMsg::Ok { id, accepted, reason }.to_json();
     let _ = out_tx.send(Out::Text(msg)).await;
@@ -92,16 +76,18 @@ fn msg_to_json(msg: Out) -> Option<String> {
 /// ```no_run
 /// use std::sync::Arc;
 /// use tokio::net::TcpListener;
+/// use fastr::db::Store;
+/// use fastr::config::Config;
+/// use fastr::ws::Fanout;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let listener = TcpListener::bind("127.0.0.1:9000").await?;
-/// let store = Arc::new(crate::db::store::Store::open(std::path::Path::new("/tmp/store"))?);
-/// let config = Arc::new(crate::config::Config::default());
-/// let fanout = crate::ws::fanout::Fanout::new();
+/// let store = Arc::new(Store::open(std::path::Path::new("/tmp/store"))?);
+/// let config = Arc::new(Config::default());
+/// let fanout = Fanout::new();
 ///
 /// let (stream, peer) = listener.accept().await?;
-/// // Spawn the connection handler; it runs until the client disconnects.
 /// tokio::spawn(async move {
-///     let _ = crate::ws::handler::handle_connection(stream, peer, store, config, fanout).await;
+///     let _ = fastr::ws::handler::handle_connection(stream, peer, store, config, fanout).await;
 /// });
 /// # Ok(()) }
 /// ```
@@ -410,38 +396,6 @@ async fn handle_event(
 /// - `store`, `config`, `fanout`, `live_tx`, `out_tx`, `subs`, `auth`: shared services and per-connection
 ///   state used to query stored events, enforce limits, publish outbound frames, manage subscriptions,
 ///   and apply authenticated-pubkey filtering.
-///
-/// # Examples
-///
-/// ```no_run
-/// # use std::sync::Arc;
-/// # use tokio::sync::mpsc;
-/// # async fn example() {
-/// // placeholder values for illustration only
-/// let sub_id = "s1".to_string();
-/// let filters = vec![]; // build appropriate Filter values
-/// let store = Arc::new(/* Store */ todo!());
-/// let config = Arc::new(/* Config */ todo!());
-/// let fanout = Arc::new(/* Fanout */ todo!());
-/// let (live_tx, _live_rx) = mpsc::channel(16);
-/// let (out_tx, _out_rx) = mpsc::channel(16);
-/// let mut subs = std::collections::HashMap::new();
-/// let auth = /* AuthState */ todo!();
-///
-/// // call the handler (runs asynchronously)
-/// super::handle_req(
-///     sub_id,
-///     filters,
-///     &store,
-///     &config,
-///     &fanout,
-///     &live_tx,
-///     &out_tx,
-///     &mut subs,
-///     &auth,
-/// ).await;
-/// # }
-/// ```
 #[allow(clippy::too_many_arguments)]
 async fn handle_req(
     sub_id: String,
@@ -539,26 +493,6 @@ async fn handle_count(sub_id: &str, filters: &[Filter], store: &Arc<Store>, out_
 /// Remove a subscription by id from the connection's subscription map.
 ///
 /// If the removed subscription was a live fanout subscription, unsubscribes it from `fanout` using `live_tx`.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::sync::Arc;
-/// use std::collections::HashMap;
-/// use tokio::sync::mpsc;
-///
-/// // assume `Sub`, `Fanout`, and `LiveEvent` are available in scope
-/// # async fn example(
-/// #     fanout: Arc<Fanout>,
-/// #     live_tx: mpsc::Sender<LiveEvent>,
-/// # ) {
-/// let mut subs: HashMap<String, Sub> = HashMap::new();
-/// subs.insert("sub1".to_string(), Sub::Live);
-///
-/// // remove the subscription; if it was Live, `fanout.unsubscribe` will be awaited
-/// remove_sub("sub1", &mut subs, &fanout, &live_tx).await;
-/// # }
-/// ```
 async fn remove_sub(
     sub_id: &str,
     subs: &mut HashMap<String, Sub>,
@@ -707,16 +641,6 @@ async fn handle_neg_open(
 /// - `msg`: incoming Negentropy message bytes from the client.
 /// - `out_tx`: outbound channel used to send serialized `ServerMsg` frames to the write task.
 /// - `subs`: mutable map of active subscriptions; a failing reconcile will remove the entry.
-///
-/// # Examples
-///
-/// ```ignore
-/// // Example (illustrative): receive a NEG-MSG for an existing negentropy session.
-/// // `out_tx` and `subs` would be created/managed by the connection handler.
-/// let sub_id = "neg-123".to_string();
-/// let incoming = vec![ /* negentropy payload bytes */ ];
-/// // handle_neg_msg(sub_id, incoming, &out_tx, &mut subs).await;
-/// ```
 async fn handle_neg_msg(sub_id: String, msg: Vec<u8>, out_tx: &mpsc::Sender<Out>, subs: &mut HashMap<String, Sub>) {
     let neg = match subs.get_mut(&sub_id) {
         Some(Sub::Neg(n)) => n,

@@ -817,13 +817,13 @@ impl Store {
     /// # Examples
     ///
     /// ```no_run
-    /// # use std::sync::Arc;
     /// # use std::path::Path;
     /// # fn doc_example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let store = crate::db::store::Store::open(Path::new("/tmp/store"))?;
-    /// let filter = crate::nostr::filter::Filter::new(); // empty filter -> newest-first, up to default limit
+    /// use fastr::db::Store;
+    /// use fastr::nostr::Filter;
+    /// let store = Store::open(Path::new("/tmp/store"))?;
+    /// let filter = Filter { kinds: vec![], authors: vec![], ids: vec![], since: None, until: None, limit: None, tags: std::collections::HashMap::new() };
     /// store.query_authed(&filter, None, |ev_bytes| {
-    ///     // handle serialized event bytes
     ///     println!("event {} bytes", ev_bytes.len());
     ///     Ok(())
     /// })?;
@@ -949,14 +949,6 @@ impl Store {
     /// # Errors
     ///
     /// Returns an `Err` if internal locking fails (e.g., tombstone lock is poisoned).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let mut collected: Vec<(i64, [u8;32])> = Vec::new();
-    /// store.iter_negentropy(&filter, None, |ts, id| collected.push((ts, id)))?;
-    /// // `collected` is sorted ascending by (created_at, id)
-    /// ```
     pub fn iter_negentropy<F>(&self, filter: &Filter, auth_pk: Option<&[u8; 32]>, mut f: F) -> Result<(), Error>
     where
         F: FnMut(i64, [u8; 32]),

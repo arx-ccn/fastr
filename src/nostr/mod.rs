@@ -223,15 +223,6 @@ pub fn event_has_p_tag(ev: &Event, pubkey: &[u8; 32]) -> bool {
 /// The `val` must be a JSON string containing an even-length sequence of lowercase hex
 /// characters; `field` is used to produce contextual error messages when decoding fails.
 /// On success returns the decoded bytes; on failure returns an error string explaining the reason.
-///
-/// # Examples
-///
-/// ```
-/// use serde_json::json;
-/// let v = json!("0a0b");
-/// let bytes = decode_hex_field(&v, "example").unwrap();
-/// assert_eq!(bytes, vec![0x0a, 0x0b]);
-/// ```
 fn decode_hex_field(val: &Value, field: &str) -> Result<Vec<u8>, String> {
     let hex_str = val.as_str().ok_or(format!("invalid: {field} not a string"))?;
     if hex_str.len() % 2 != 0 {
@@ -247,6 +238,7 @@ fn decode_hex_field(val: &Value, field: &str) -> Result<Vec<u8>, String> {
 /// # Examples
 ///
 /// ```
+/// use fastr::nostr::hex_encode_bytes;
 /// let data = [0x01u8, 0xab, 0x0f];
 /// let hex = hex_encode_bytes(&data);
 /// assert_eq!(hex, "01ab0f");
@@ -427,6 +419,7 @@ fn parse_sub_and_filters(arr: &[Value], verb: &str) -> Result<(String, Vec<Filte
 /// # Examples
 ///
 /// ```
+/// use fastr::nostr::{parse_client_msg, ClientMsg};
 /// let raw = r#"["REQ", "sub-1", {"kinds":[1]}]"#;
 /// let msg = parse_client_msg(raw).expect("should parse");
 /// match msg {
@@ -616,13 +609,13 @@ impl ServerMsg<'_> {
     /// # Examples
     ///
     /// ```
-    /// use crate::nostr::{ServerMsg, Event, EventId, Pubkey}; // adjust path as needed
+    /// use fastr::nostr::ServerMsg;
     ///
     /// let notice = ServerMsg::Notice { message: "hello" };
-    /// assert_eq!(notice.to_json(), "[\"NOTICE\",\"hello\"]");
+    /// assert_eq!(notice.to_json(), r#"["NOTICE","hello"]"#);
     ///
     /// let eose = ServerMsg::Eose { sub_id: "sub1" };
-    /// assert_eq!(eose.to_json(), "[\"EOSE\",\"sub1\"]");
+    /// assert_eq!(eose.to_json(), r#"["EOSE","sub1"]"#);
     /// ```
     pub fn to_json(&self) -> String {
         match self {
