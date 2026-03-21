@@ -1005,6 +1005,10 @@ impl Store {
             .tombstones
             .read()
             .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?;
+        let vanished = self
+            .vanished
+            .read()
+            .map_err(|_| std::io::Error::other("vanished lock poisoned"))?;
 
         let mut items: Vec<(i64, [u8; 32])> = Vec::new();
 
@@ -1016,6 +1020,11 @@ impl Store {
 
             // NIP-09: skip tombstoned events.
             if tombstones.contains(&entry.id) {
+                continue;
+            }
+
+            // NIP-62: skip events from vanished pubkeys.
+            if vanished.contains(&entry.pubkey) {
                 continue;
             }
 
@@ -1045,6 +1054,7 @@ impl Store {
         }
 
         drop(tombstones);
+        drop(vanished);
 
         items.sort_unstable();
         for (ts, id) in items {
@@ -1055,14 +1065,11 @@ impl Store {
 
     /// Returns the number of tombstoned events.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// // `store` is a `Store`
-    /// let _num = store.tombstone_count();
-    /// ```
-    pub fn tombstone_count(&self) -> usize {
-        self.tombstones.read().map(|t| t.len()).unwrap_or(0)
+    /// Returns an error if the tombstone lock is poisoned.
+    pub fn tombstone_count(&self) -> Result<usize, Error> {
+        Ok(self.tombstones.read()
+            .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?
+            .len())
     }
 
     /// Run compaction: rewrite data.n, index.o, tags.s, dtags.t
@@ -1319,7 +1326,14 @@ pub fn spawn_compaction_task(store: Arc<Store>, interval_secs: u64) {
         interval.tick().await; // first tick fires immediately, skip it
         loop {
             interval.tick().await;
-            if store.tombstone_count() > 1000 {
+            let count = match store.tombstone_count() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("failed to read tombstone count: {e}");
+                    continue;
+                }
+            };
+            if count > 1000 {
                 match store.compact() {
                     Ok(retained) => {
                         tracing::info!(retained, "background compaction complete");
@@ -2032,7 +2046,7 @@ mod tests {
         store.append(&live).unwrap();
 
         assert_eq!(store.event_count(), 3);
-        assert!(store.tombstone_count() > 0);
+        assert!(store.tombstone_count().unwrap() > 0);
 
         let retained = store.compact().unwrap();
         // kind-5 + live event survive; target is purged
