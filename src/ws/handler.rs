@@ -23,7 +23,26 @@ enum Sub {
     Neg(Box<Negentropy<'static, NegentropyStorageVector>>),
 }
 
-/// Send an OK response to the client.
+/// Send an `OK` server message for a specific event to the outbound channel.
+///
+/// The message encodes the event `id`, whether it was `accepted`, and an explanatory `reason`,
+/// then serializes to JSON and sends it as `Out::Text` on `out_tx`. Send errors are ignored.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tokio::sync::mpsc;
+/// // create a small channel for outbound messages
+/// let (tx, mut rx) = mpsc::channel(2);
+/// let id = EventId::default();
+/// // fire-and-forget the send
+/// tokio::spawn(async move {
+///     send_ok(&id, true, "accepted", &tx).await;
+/// });
+/// // the receiver should get an Out::Text frame (send failures are ignored by send_ok)
+/// let received = futures::executor::block_on(async { rx.recv().await });
+/// assert!(received.is_some());
+/// ```
 async fn send_ok(id: &EventId, accepted: bool, reason: &str, out_tx: &mpsc::Sender<Out>) {
     let msg = ServerMsg::Ok { id, accepted, reason }.to_json();
     let _ = out_tx.send(Out::Text(msg)).await;
@@ -52,7 +71,38 @@ fn msg_to_json(msg: Out) -> Option<String> {
     }
 }
 
-/// Handle one incoming WebSocket connection.
+/// Handle an incoming WebSocket connection for a single relay client session.
+///
+/// This function runs the full lifecycle for a connected client: it upgrades the
+/// provided stream to a WebSocket, spawns background tasks for writing outbound
+/// frames and forwarding live events, sends the NIP-42 AUTH challenge, processes
+/// incoming client messages (EVENT, REQ, CLOSE, COUNT, NIP-42 AUTH, NIP-77 NEG-*),
+/// manages per-connection subscriptions (live and Negentropy sessions), applies
+/// NIP-17 gift-wrap delivery rules for live events, and performs cleanup when
+/// the connection closes.
+///
+/// On normal termination (client closes the socket or read loop ends) it returns
+/// `Ok(())`. Errors returned indicate failures during WebSocket upgrade or other
+/// internal I/O/upgrade errors.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use tokio::net::TcpListener;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let listener = TcpListener::bind("127.0.0.1:9000").await?;
+/// let store = Arc::new(crate::store::Store::default());
+/// let config = Arc::new(crate::config::Config::default());
+/// let fanout = Arc::new(crate::fanout::Fanout::new());
+///
+/// let (stream, peer) = listener.accept().await?;
+/// // Spawn the connection handler; it runs until the client disconnects.
+/// tokio::spawn(async move {
+///     let _ = crate::ws::handler::handle_connection(stream, peer, store, config, fanout).await;
+/// });
+/// # Ok(()) }
+/// ```
 pub async fn handle_connection<S>(
     stream: S,
     peer: SocketAddr,
@@ -347,7 +397,55 @@ async fn handle_event(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Sends stored events matching `filters` to the client (as a single batched outbound message),
+/// then subscribes the connection for live delivery under `sub_id`.
+///
+/// This enforces per-connection and per-request limits, clamps each filter's `limit` to the
+/// configured maximum, and applies the connection's authenticated pubkey (if any) when querying
+/// so kind-1059 ("gift-wrap") visibility follows NIP-17 rules. If subscription limits or filter
+/// count are exceeded, a `NOTICE` is sent and the request is rejected. After sending stored
+/// matches plus a single `EOSE` message in one outbound batch, the function registers
+/// `sub_id -> Sub::Live` (replacing any existing entry) and subscribes the fanout for live events.
+///
+/// # Parameters
+///
+/// - `sub_id`: subscription identifier provided by the client.
+/// - `filters`: list of filters from the client's `REQ`; each filter's `limit` will be clamped.
+/// - `store`, `config`, `fanout`, `live_tx`, `out_tx`, `subs`, `auth`: shared services and per-connection
+///   state used to query stored events, enforce limits, publish outbound frames, manage subscriptions,
+///   and apply authenticated-pubkey filtering.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use tokio::sync::mpsc;
+/// # async fn example() {
+/// // placeholder values for illustration only
+/// let sub_id = "s1".to_string();
+/// let filters = vec![]; // build appropriate Filter values
+/// let store = Arc::new(/* Store */ todo!());
+/// let config = Arc::new(/* Config */ todo!());
+/// let fanout = Arc::new(/* Fanout */ todo!());
+/// let (live_tx, _live_rx) = mpsc::channel(16);
+/// let (out_tx, _out_rx) = mpsc::channel(16);
+/// let mut subs = std::collections::HashMap::new();
+/// let auth = /* AuthState */ todo!();
+///
+/// // call the handler (runs asynchronously)
+/// super::handle_req(
+///     sub_id,
+///     filters,
+///     &store,
+///     &config,
+///     &fanout,
+///     &live_tx,
+///     &out_tx,
+///     &mut subs,
+///     &auth,
+/// ).await;
+/// # }
+/// ```
 async fn handle_req(
     sub_id: String,
     mut filters: Vec<Filter>,
@@ -416,6 +514,24 @@ async fn handle_req(
     fanout.subscribe(sub_id, filters, live_tx.clone()).await;
 }
 
+/// Sends a NIP-45 `COUNT` response containing the sum of counts for the provided filters.
+///
+/// The function computes the total by summing `store.count(filter)` for each filter, formats
+/// a JSON `["COUNT", <sub_id>, {"count": <total>}]` message (with `sub_id` JSON-escaped),
+/// and sends it as `Out::Text` to `out_tx`. Send errors are ignored.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json;
+///
+/// // example inputs
+/// let sub_id = "s1";
+/// let total = 42u64;
+/// let escaped_id = serde_json::to_string(sub_id).unwrap();
+/// let msg = format!(r#"["COUNT",{},{{"count":{}}}]"#, escaped_id, total);
+/// assert_eq!(msg, r#"["COUNT","s1",{"count":42}]"#);
+/// ```
 async fn handle_count(
     sub_id: &str,
     filters: &[Filter],
@@ -428,8 +544,29 @@ async fn handle_count(
     let _ = out_tx.send(Out::Text(msg)).await;
 }
 
-/// Remove a subscription (Live or Neg) from the unified map.
-/// If the sub was a live fanout subscription, unsubscribes from fanout.
+/// Remove a subscription by id from the connection's subscription map.
+///
+/// If the removed subscription was a live fanout subscription, unsubscribes it from `fanout` using `live_tx`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use std::collections::HashMap;
+/// use tokio::sync::mpsc;
+///
+/// // assume `Sub`, `Fanout`, and `LiveEvent` are available in scope
+/// # async fn example(
+/// #     fanout: Arc<Fanout>,
+/// #     live_tx: mpsc::Sender<LiveEvent>,
+/// # ) {
+/// let mut subs: HashMap<String, Sub> = HashMap::new();
+/// subs.insert("sub1".to_string(), Sub::Live);
+///
+/// // remove the subscription; if it was Live, `fanout.unsubscribe` will be awaited
+/// remove_sub("sub1", &mut subs, &fanout, &live_tx).await;
+/// # }
+/// ```
 async fn remove_sub(
     sub_id: &str,
     subs: &mut HashMap<String, Sub>,
@@ -441,6 +578,28 @@ async fn remove_sub(
     }
 }
 
+/// Creates a server-side Negentropy session for `sub_id` from stored server state, runs the first
+/// reconciliation round with the client's initial message, and stores the session on success.
+///
+/// If the connection has reached the maximum subscriptions limit, an error `NOTICE` is sent and the
+/// function returns. On storage/seal/negentropy construction or reconcile errors, a `NEG-ERR` is
+/// sent. On successful reconcile, a `NEG-MSG` reply is sent and the session is inserted into
+/// `subs` as `Sub::Neg` for subsequent rounds driven by `NEG-MSG` from the client.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use tokio::sync::mpsc;
+/// # use std::collections::HashMap;
+/// # async fn example() {
+/// // placeholders for required values:
+/// // let sub_id = "s1".to_string();
+/// // let filter = Filter::default();
+/// // let msg = vec![/* client initial negentropy message bytes */];
+/// // handle_neg_open(sub_id, filter, msg, &store, &config, &auth, &out_tx, &mut subs).await;
+/// # }
+/// ```
 async fn handle_neg_open(
     sub_id: String,
     filter: Filter,
@@ -501,6 +660,30 @@ async fn handle_neg_open(
     }
 }
 
+/// Processes an incoming Negentropy (`NEG-MSG`) payload for a named subscription session.
+///
+/// Looks up a Negentropy session by `sub_id` in `subs`. If no session exists, sends a
+/// `ServerMsg::NegErr { "session not found" }` and returns. Otherwise, attempts to reconcile
+/// the session with `msg`. On reconcile error, sends `ServerMsg::NegErr { reason }` and
+/// removes the session from `subs`. On success, sends `ServerMsg::NegMsg { msg: <reply> }`
+/// and leaves the session active until explicitly closed by the client.
+///
+/// # Parameters
+///
+/// - `sub_id`: subscription identifier associated with the Negentropy session.
+/// - `msg`: incoming Negentropy message bytes from the client.
+/// - `out_tx`: outbound channel used to send serialized `ServerMsg` frames to the write task.
+/// - `subs`: mutable map of active subscriptions; a failing reconcile will remove the entry.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Example (illustrative): receive a NEG-MSG for an existing negentropy session.
+/// // `out_tx` and `subs` would be created/managed by the connection handler.
+/// let sub_id = "neg-123".to_string();
+/// let incoming = vec![ /* negentropy payload bytes */ ];
+/// // handle_neg_msg(sub_id, incoming, &out_tx, &mut subs).await;
+/// ```
 async fn handle_neg_msg(
     sub_id: String,
     msg: Vec<u8>,
@@ -1246,7 +1429,23 @@ mod tests {
 
     use negentropy::{Id as NegId, Negentropy as Neg, NegentropyStorageVector, Storage as NegStorage};
 
-    /// Helper: build a client-side Negentropy storage and return the hex-encoded initial message.
+    /// Builds a sealed Negentropy storage from the given (timestamp, id) items and returns it
+    /// together with the client's initial Negentropy message encoded as hex.
+    ///
+    /// The `items` slice should contain pairs of (timestamp, 32-byte event id). The returned
+    /// `NegentropyStorageVector` is sealed and ready for use by a `Negentropy` session. The
+    /// hex string is the client's initial `NEG-MSG` payload (ready to send to the peer).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let items = vec![(1u64, [0u8; 32]), (2u64, [1u8; 32])];
+    /// let (storage, hex_msg) = crate::ws::handler::neg_initiate(&items);
+    /// // storage is sealed and non-empty; hex_msg is a non-empty hex string
+    /// assert!(!hex_msg.is_empty());
+    /// assert!(storage.len() >= 2);
+    /// ```
+    fn neg_initiate(items: &[(u64, [u8; 32])]) -> (NegentropyStorageVector, String) {
     fn neg_initiate(items: &[(u64, [u8; 32])]) -> (NegentropyStorageVector, String) {
         let mut storage = NegentropyStorageVector::new();
         for (ts, id) in items {
@@ -1259,8 +1458,22 @@ mod tests {
         (storage, hex_msg)
     }
 
-    /// Run the full client-side negentropy reconciliation loop over WebSocket.
-    /// Returns (have_ids, need_ids) after all rounds complete.
+    /// Perform a client-side Negentropy reconciliation loop over a WebSocket.
+    ///
+    /// The function drives a local `Neg` instance by exchanging `NEG-MSG` frames with the remote
+    /// peer until reconciliation completes, then returns the final `(have_ids, need_ids)` vectors
+    /// produced by the local side.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // This example demonstrates the call shape; test helpers for creating `WsClient`,
+    /// // `NegentropyStorageVector` and `initial_reply` are provided by the test harness.
+    /// # async fn run_example(ws: &mut crate::tests::WsClient, storage: &crate::negentropy::NegentropyStorageVector, sub_id: &str, initial_reply: Vec<u8>) {
+    /// let (have, need) = crate::ws::handler::neg_reconcile(ws, sub_id, storage, initial_reply).await;
+    /// // `have` contains IDs the client claims to have; `need` contains IDs the client requests.
+    /// # }
+    /// ```
     async fn neg_reconcile(
         ws: &mut WsClient,
         sub_id: &str,
@@ -1291,7 +1504,33 @@ mod tests {
         (have_ids, need_ids)
     }
 
-    /// Send a NEG-OPEN and return the NEG-MSG reply bytes (decoded from hex).
+    /// Performs a NEG-OPEN handshake over the provided WebSocket client and returns the decoded reply bytes.
+    ///
+    /// Sends a `NEG-OPEN` message using `sub_id`, `filter_json`, and `hex_msg`, then waits for a `NEG-MSG` response
+    /// with the same `sub_id` and decodes its hex payload to raw bytes.
+    ///
+    /// # Parameters
+    ///
+    /// - `ws`: the WebSocket test client to use for sending and receiving messages.
+    /// - `sub_id`: subscription identifier used in the `NEG-OPEN` and expected in the `NEG-MSG` reply.
+    /// - `filter_json`: a JSON string representing the filter argument included in the `NEG-OPEN` frame.
+    /// - `hex_msg`: the initial hex-encoded message payload sent with `NEG-OPEN`.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` containing the bytes decoded from the hex payload of the received `NEG-MSG`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn _example(ws: &mut crate::tests::WsClient) {
+    /// let sub_id = "s1";
+    /// let filter_json = r#"{"kind":[1]}"#;
+    /// let hex_msg = "deadbeef";
+    /// let reply_bytes = crate::ws::handler::neg_open(ws, sub_id, filter_json, hex_msg).await;
+    /// assert!(!reply_bytes.is_empty());
+    /// # }
+    /// ```
     async fn neg_open(ws: &mut WsClient, sub_id: &str, filter_json: &str, hex_msg: &str) -> Vec<u8> {
         let msg = format!(r#"["NEG-OPEN","{}",{},"{hex_msg}"]"#, sub_id, filter_json);
         ws.send(TMsg::Text(msg.into())).await.unwrap();
@@ -1305,6 +1544,21 @@ mod tests {
         bytes
     }
 
+    /// Verifies that a Negentropy session produces no differences when client and server stores contain the same items.
+    ///
+    /// This integration test seeds the server store with three events, constructs a client-side Negentropy
+    /// storage containing the identical (timestamp, id) tuples, initiates a `NEG-OPEN` and completes the
+    /// first reconciliation round, and asserts that both the `have` and `need` result sets are empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Integration-style example (conceptual):
+    /// // - spawn server with pre-seeded store
+    /// // - create client negentropy storage with same items
+    /// // - perform NEG-OPEN and reconcile
+    /// // - assert both have and need sets are empty
+    /// ```
     #[tokio::test]
     async fn test_neg_identical_stores() {
         let (port, store) = spawn_server().await;
@@ -1391,6 +1645,20 @@ mod tests {
         assert_eq!(v[0], "NEG-ERR", "expected NEG-ERR after CLOSE: {resp}");
     }
 
+    /// Verifies that sending a regular `CLOSE` (NIP-01) also removes an active Negentropy session.
+    ///
+    /// After a `NEG-OPEN` creates a negentropy session, a subsequent `CLOSE` for the same
+    /// subscription id must remove that session so that any following `NEG-MSG` for the id
+    /// receives `NEG-ERR`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// // 1. Start test server and seed store.
+    /// // 2. Negotiate a negentropy session with sub id "neg1" via NEG-OPEN.
+    /// // 3. Send a regular CLOSE for "neg1".
+    /// // 4. Sending NEG-MSG for "neg1" now yields NEG-ERR.
+    /// ```
     #[tokio::test]
     async fn test_close_also_removes_neg_session() {
         let (port, store) = spawn_server().await;
@@ -1464,6 +1732,21 @@ mod tests {
         assert!(need_ids.is_empty(), "client should need nothing");
     }
 
+    /// Verifies that a Negentropy `NEG-OPEN` with an `#e` tag filter produces a reconciliation set
+    /// that includes only events matching that tag.
+    ///
+    /// This test seeds the server store with two events (one containing the specified `#e` tag and
+    /// one without), initiates a negentropy session from a client that has neither event, opens the
+    /// session with the tag-filtered request, and asserts that the client's "need" set contains only
+    /// the tagged event.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Conceptual example: open a negentropy session that filters by `#e` tag and expect only
+    /// // tagged events to be required by the client.
+    /// // (See test_neg_tag_filter_produces_correct_set for the full integration test.)
+    /// ```
     #[tokio::test]
     async fn test_neg_tag_filter_produces_correct_set() {
         let (port, store) = spawn_server().await;
@@ -1497,6 +1780,15 @@ mod tests {
         assert!(!need_set.contains(&ev_untagged.id.0), "should not need the untagged event");
     }
 
+    /// Ensures the connection's per-connection subscription limit applies to Negentropy sessions.
+    ///
+    /// Spawns a test server with `max_subscriptions_per_conn = 2`, opens two `NEG-OPEN` sessions that consume the available slots, then attempts a third `NEG-OPEN` and asserts the server responds with a `NOTICE` mentioning the limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Start server with limit 2, open "s1" and "s2" successfully, then expect "s3" to be rejected with a NOTICE.
+    /// ```
     #[tokio::test]
     async fn test_neg_sub_id_limit_applies_to_neg_sessions() {
         // Spin a server with a low subscription cap.

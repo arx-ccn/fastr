@@ -324,6 +324,22 @@ fn read_rss_kb(pid: u32) -> Result<u64> {
     Err(anyhow!("VmRSS not found in {path}"))
 }
 
+/// Measures and reports a process's RSS while publishing a sequence of events to a WebSocket relay.
+///
+/// Connects once to the given WebSocket `url`, sends `n_events` events sequentially (waiting for the relay's
+/// `["OK", ...]` acknowledgement for each), and samples the resident set size (RSS) of the process identified
+/// by `pid` from `/proc/{pid}/status` every 10,000 events. After sending all events it waits briefly, takes a
+/// final RSS sample, and prints initial, final, and peak RSS values and total growth.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example() -> anyhow::Result<()> {
+/// #   // Replace with a real relay URL and a real pid when running.
+///     cmd_rss("ws://localhost:8080", 50_000, 12345).await?;
+///     Ok(())
+/// # }
+/// ```
 async fn cmd_rss(url: &str, n_events: usize, pid: u32) -> Result<()> {
     println!("=== RSS MEASUREMENT ===");
     println!("url={url} events={n_events} pid={pid}");
@@ -396,6 +412,30 @@ async fn cmd_rss(url: &str, n_events: usize, pid: u32) -> Result<()> {
 
 // Negentropy sync benchmark
 
+/// Runs a negentropy synchronization benchmark against a relay over a WebSocket.
+///
+/// Builds an optional client-side negentropy set containing `have_count` deterministic
+/// event IDs, opens a negentropy session (`NEG-OPEN`), exchanges `NEG-MSG`/`NEG-ERR`
+/// messages until reconciliation completes, then closes the session and prints timing
+/// and item-count metrics.
+///
+/// Arguments:
+/// - `url`: WebSocket URL of the relay to connect to.
+/// - `filter_json`: JSON string containing the subscription filter sent with `NEG-OPEN`.
+/// - `have_count`: number of deterministic event IDs to pre-insert into the client set.
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if any network, negentropy, or parsing step fails.
+///
+/// # Examples
+///
+/// ```
+/// # tokio_test::block_on(async {
+/// // Run against a relay (example URL); use `have_count = 0` for an empty client set.
+/// let _ = cmd_neg_sync("ws://127.0.0.1:8080", "{}", 0).await;
+/// # });
+/// ```
 async fn cmd_neg_sync(url: &str, filter_json: &str, have_count: usize) -> Result<()> {
     use negentropy::{Id as NegId, Negentropy, NegentropyStorageVector, Storage as NegStorage};
 
@@ -530,6 +570,20 @@ async fn cmd_neg_sync(url: &str, filter_json: &str, have_count: usize) -> Result
 
 // CLI
 
+/// Finds the value following a flag in a command-line argument slice.
+///
+/// Searches `args` for an element exactly equal to `flag` and, if found,
+/// returns a clone of the next element. Returns `None` if the flag is not
+/// present or if it is the last element with no following value.
+///
+/// # Examples
+///
+/// ```
+/// let args = vec!["--url".to_string(), "ws://localhost".to_string(), "--verbose".to_string()];
+/// assert_eq!(parse_arg(&args, "--url"), Some("ws://localhost".to_string()));
+/// assert_eq!(parse_arg(&args, "--missing"), None);
+/// assert_eq!(parse_arg(&["--only".to_string()], "--only"), None);
+/// ```
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {
     for i in 0..args.len() {
         if args[i] == flag {
@@ -543,6 +597,27 @@ fn require_arg(args: &[String], flag: &str, usage: &str) -> Result<String> {
     parse_arg(args, flag).ok_or_else(|| anyhow!("missing {flag}\n{usage}"))
 }
 
+/// Dispatches CLI subcommands and runs the selected benchmark command.
+///
+/// Supported subcommands:
+/// - `ingest`   : sends a stream of events (`--url <ws-url> --events <N> [--concurrency <C>]`)
+/// - `query`    : issues queries (`--url <ws-url> --queries <N> [--concurrency <C>]`)
+/// - `rss`      : measures relay RSS while ingesting (`--url <ws-url> --events <N> --pid <pid>`)
+/// - `neg-sync` : performs a negentropy sync (`--url <ws-url> --filter <json> [--have <N>]`)
+///
+/// The program parses command-line arguments and delegates to the corresponding `cmd_*` function.
+///
+///// # Examples
+///
+/// ```no_run
+/// // Run the ingest benchmark:
+/// // $ fastr-bench ingest --url ws://localhost:8080 --events 1000 --concurrency 10
+/// ```
+///
+/// # Returns
+///
+/// `Ok(())` on successful execution of the selected subcommand; returns an error if argument parsing
+/// fails or if the chosen command returns an error.
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

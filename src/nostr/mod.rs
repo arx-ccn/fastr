@@ -219,7 +219,20 @@ pub fn event_has_p_tag(ev: &Event, pubkey: &[u8; 32]) -> bool {
     })
 }
 
-/// Decode a JSON string value as a hex-encoded byte vector.
+/// Decodes a JSON string value expected to be hex into a byte vector.
+///
+/// The `val` must be a JSON string containing an even-length sequence of lowercase hex
+/// characters; `field` is used to produce contextual error messages when decoding fails.
+/// On success returns the decoded bytes; on failure returns an error string explaining the reason.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// let v = json!("0a0b");
+/// let bytes = decode_hex_field(&v, "example").unwrap();
+/// assert_eq!(bytes, vec![0x0a, 0x0b]);
+/// ```
 fn decode_hex_field(val: &Value, field: &str) -> Result<Vec<u8>, String> {
     let hex_str = val
         .as_str()
@@ -233,6 +246,15 @@ fn decode_hex_field(val: &Value, field: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Encodes a byte slice as a lowercase hexadecimal string.
+///
+/// # Examples
+///
+/// ```
+/// let data = [0x01u8, 0xab, 0x0f];
+/// let hex = hex_encode_bytes(&data);
+/// assert_eq!(hex, "01ab0f");
+/// ```
 pub fn hex_encode_bytes(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     crate::pack::hex::encode_into(bytes, &mut s);
@@ -411,8 +433,24 @@ fn parse_sub_and_filters(arr: &[Value], verb: &str) -> Result<(String, Vec<Filte
     Ok((sub_id, filters))
 }
 
-/// Parse a raw WebSocket text frame into a ClientMsg.
-/// Returns Err with a NOTICE-ready reason string on parse failure.
+/// Parse a raw WebSocket text frame into a `ClientMsg`.
+///
+/// On success returns the parsed `ClientMsg`. On failure returns `Err` containing a
+/// NOTICE-ready reason string describing the parse error.
+///
+/// # Examples
+///
+/// ```
+/// let raw = r#"["REQ", "sub-1", {"kinds":[1]}]"#;
+/// let msg = parse_client_msg(raw).expect("should parse");
+/// match msg {
+///     ClientMsg::Req { sub_id, filters } => {
+///         assert_eq!(sub_id, "sub-1");
+///         assert!(!filters.is_empty());
+///     }
+///     _ => panic!("expected REQ"),
+/// }
+/// ```
 pub fn parse_client_msg(raw: &str) -> Result<ClientMsg, String> {
     let val: Value = serde_json::from_str(raw).map_err(|_| "invalid: not valid JSON".to_owned())?;
     let arr = val
@@ -599,6 +637,24 @@ pub fn write_event_json(sub_id: &str, event: &Event, buf: &mut String) {
 }
 
 impl ServerMsg<'_> {
+    /// Serialize a `ServerMsg` into a Nostr wire-format JSON string.
+    ///
+    /// The returned string is a single JSON array representing the server message
+    /// (for example `["EVENT", <sub_id>, <event>]`, `["OK", "<id>", true, "reason"]`,
+    /// `["EOSE", "<sub_id>"]`, `["NOTICE", "<message>"]`, `["NEG-MSG", "<sub_id>", "<hex>"]`,
+    /// or `["NEG-ERR", "<sub_id>", "<reason>"]`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::nostr::{ServerMsg, Event, EventId, Pubkey}; // adjust path as needed
+    ///
+    /// let notice = ServerMsg::Notice { message: "hello" };
+    /// assert_eq!(notice.to_json(), "[\"NOTICE\",\"hello\"]");
+    ///
+    /// let eose = ServerMsg::Eose { sub_id: "sub1" };
+    /// assert_eq!(eose.to_json(), "[\"EOSE\",\"sub1\"]");
+    /// ```
     pub fn to_json(&self) -> String {
         match self {
             ServerMsg::Event { sub_id, event } => {

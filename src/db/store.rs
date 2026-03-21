@@ -785,9 +785,38 @@ impl Store {
         self.query_authed(filter, None, cb)
     }
 
-    /// Query stored events with NIP-17 access control.
-    /// If `auth_pubkey` is Some, kind-1059 events are returned only when the p-tag matches.
-    /// If `auth_pubkey` is None, kind-1059 events are silently skipped.
+    /// Query stored events matching `filter`, invoking `cb` with each event's serialized bytes.
+    ///
+    /// Matches are produced newest-first up to `filter.limit` (defaults to 500). Excluded from results are
+    /// events whose NIP-40 expiry has passed, events that are NIP-09 tombstoned, and kind-1059 (gift-wrap)
+    /// events unless `auth_pubkey` is `Some` and the event contains a `p` tag matching that pubkey.
+    /// Tag constraints in `filter.tags` are enforced via the store's tag index.
+    ///
+    /// # Parameters
+    ///
+    /// - `filter`: the query filter to apply.
+    /// - `auth_pubkey`: when `Some`, enables NIP-17 access so kind-1059 events are returned only if a `p` tag matches this pubkey; when `None`, kind-1059 events are skipped.
+    /// - `cb`: called for each matching event with a byte slice of the serialized event; returning an `Err` from `cb` aborts the query and propagates the error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` if internal locking or data corruption is detected, or if `cb` returns an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use your_crate::{Store, Filter};
+    /// # fn doc_example(store: &Store) -> Result<(), std::io::Error> {
+    /// let filter = Filter::new(); // empty filter -> newest-first, up to default limit
+    /// store.query_authed(&filter, None, |ev_bytes| {
+    ///     // handle serialized event bytes
+    ///     println!("event {} bytes", ev_bytes.len());
+    ///     Ok(())
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn query_authed<F>(&self, filter: &Filter, auth_pubkey: Option<&[u8; 32]>, mut cb: F) -> Result<(), Error>
     where
         F: FnMut(&[u8]) -> Result<(), Error>,
@@ -901,11 +930,21 @@ impl Store {
         Ok(())
     }
 
-    /// Iterate (created_at, event_id) for events matching `filter`,
-    /// sorted ascending by (created_at, id) — the order negentropy requires.
-    /// Tombstoned, expired, and NIP-17 kind-1059 (when unauthenticated) events
-    /// are excluded. `auth_pk` follows the same semantics as `query_authed`.
-    /// `f` is called for each item in sorted order.
+    /// Collects and iterates (created_at, event_id) pairs for events matching `filter`,
+    /// emitting them in ascending order by (created_at, id) as required for negentropy.
+    ///
+    /// Excludes events that are tombstoned, expired (per NIP-40), or kind-1059 gift-wrap events
+    /// when `auth_pk` is `None` or does not match the event's `p` tag (NIP-17). `auth_pk` uses
+    /// the same p-tag semantics as `query_authed`. The callback `f` is invoked once per matching
+    /// event with its `created_at` timestamp and event `id`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut collected: Vec<(i64, [u8;32])> = Vec::new();
+    /// store.iter_negentropy(&filter, None, |ts, id| collected.push((ts, id)));
+    /// // `collected` is sorted ascending by (created_at, id)
+    /// ```
     pub fn iter_negentropy<F>(&self, filter: &Filter, auth_pk: Option<&[u8; 32]>, mut f: F)
     where
         F: FnMut(i64, [u8; 32]),
@@ -1008,7 +1047,14 @@ impl Store {
         }
     }
 
-    /// Number of tombstoned events.
+    /// Returns the number of tombstoned events.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // `store` is a `Store`
+    /// let _num = store.tombstone_count();
+    /// ```
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.read().map(|t| t.len()).unwrap_or(0)
     }

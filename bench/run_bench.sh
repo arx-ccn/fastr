@@ -139,7 +139,7 @@ stop_cpu_sampler() {
 # Writes key=value pairs to stdout so the caller can eval them.
 #
 # Usage: bench_relay <label> <ws_url> <pid>
-# ---------------------------------------------------------------------------
+# bench_relay runs ingest, neg-sync, and query benchmarks against a relay process, samples resource metrics (RSS, open fds, disk I/O delta, and CPU cycles via perf), and emits structured KEY=value results to stdout.
 
 bench_relay() {
   local label="$1"
