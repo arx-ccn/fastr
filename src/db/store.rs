@@ -785,9 +785,38 @@ impl Store {
         self.query_authed(filter, None, cb)
     }
 
-    /// Query stored events with NIP-17 access control.
-    /// If `auth_pubkey` is Some, kind-1059 events are returned only when the p-tag matches.
-    /// If `auth_pubkey` is None, kind-1059 events are silently skipped.
+    /// Query stored events matching `filter`, invoking `cb` with each event's serialized bytes.
+    ///
+    /// Matches are produced newest-first up to `filter.limit` (defaults to 500). Excluded from results are
+    /// events whose NIP-40 expiry has passed, events that are NIP-09 tombstoned, and kind-1059 (gift-wrap)
+    /// events unless `auth_pubkey` is `Some` and the event contains a `p` tag matching that pubkey.
+    /// Tag constraints in `filter.tags` are enforced via the store's tag index.
+    ///
+    /// # Parameters
+    ///
+    /// - `filter`: the query filter to apply.
+    /// - `auth_pubkey`: when `Some`, enables NIP-17 access so kind-1059 events are returned only if a `p` tag matches this pubkey; when `None`, kind-1059 events are skipped.
+    /// - `cb`: called for each matching event with a byte slice of the serialized event; returning an `Err` from `cb` aborts the query and propagates the error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` if internal locking or data corruption is detected, or if `cb` returns an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use your_crate::{Store, Filter};
+    /// # fn doc_example(store: &Store) -> Result<(), std::io::Error> {
+    /// let filter = Filter::new(); // empty filter -> newest-first, up to default limit
+    /// store.query_authed(&filter, None, |ev_bytes| {
+    ///     // handle serialized event bytes
+    ///     println!("event {} bytes", ev_bytes.len());
+    ///     Ok(())
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn query_authed<F>(&self, filter: &Filter, auth_pubkey: Option<&[u8; 32]>, mut cb: F) -> Result<(), Error>
     where
         F: FnMut(&[u8]) -> Result<(), Error>,
@@ -901,7 +930,131 @@ impl Store {
         Ok(())
     }
 
-    /// Number of tombstoned events.
+    /// Collects and iterates (created_at, event_id) pairs for events matching `filter`,
+    /// emitting them in ascending order by (created_at, id) as required for negentropy.
+    ///
+    /// Excludes events that are tombstoned, expired (per NIP-40), or kind-1059 gift-wrap events
+    /// when `auth_pk` is `None` or does not match the event's `p` tag (NIP-17). `auth_pk` uses
+    /// the same p-tag semantics as `query_authed`. The callback `f` is invoked once per matching
+    /// event with its `created_at` timestamp and event `id`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut collected: Vec<(i64, [u8;32])> = Vec::new();
+    /// store.iter_negentropy(&filter, None, |ts, id| collected.push((ts, id)));
+    /// // `collected` is sorted ascending by (created_at, id)
+    /// ```
+    pub fn iter_negentropy<F>(&self, filter: &Filter, auth_pk: Option<&[u8; 32]>, mut f: F)
+    where
+        F: FnMut(i64, [u8; 32]),
+    {
+        let idx_slice = self.index.slice();
+        let tags_slice = self.tags.slice();
+
+        // NIP-17: pre-compute set of data_offsets where the p-tag matches auth_pk.
+        let nip17_allowed: Option<HashSet<u64>> = auth_pk
+            .filter(|_| {
+                filter.kinds.is_empty()
+                    || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP)
+            })
+            .map(|pk| tags::matching_offsets(&tags_slice, b'p', pk));
+
+        // Pre-compute tag offset sets via a single pass over tags.s.
+        let tag_sets: Vec<(u8, HashSet<u64>)> = if filter.tags.is_empty() {
+            vec![]
+        } else {
+            let specs: Vec<(u8, Vec<([u8; 32], u8)>)> = filter
+                .tags
+                .iter()
+                .map(|(ch, values)| {
+                    let name = *ch as u8;
+                    let decoded: Vec<([u8; 32], u8)> = values
+                        .iter()
+                        .filter_map(|v| {
+                            if v.len() == 64 && hex::is_hex(v.as_bytes()) {
+                                let mut buf = [0u8; 32];
+                                hex::decode(v.as_bytes(), &mut buf).unwrap();
+                                Some((buf, 32u8))
+                            } else if v.len() <= 32 {
+                                let mut buf = [0u8; 32];
+                                buf[..v.len()].copy_from_slice(v.as_bytes());
+                                Some((buf, v.len() as u8))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    (name, decoded)
+                })
+                .collect();
+            tags::multi_matching_offsets(&tags_slice, &specs)
+                .into_iter()
+                .zip(filter.tags.keys())
+                .map(|(set, ch)| (*ch as u8, set))
+                .collect()
+        };
+
+        let now = unix_now();
+        let tombstones = match self.tombstones.read() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        let mut items: Vec<(i64, [u8; 32])> = Vec::new();
+
+        for (_, entry) in index::iter_entries(&idx_slice) {
+            // NIP-40: skip expired events.
+            if entry.expiry != 0 && entry.expiry <= now {
+                continue;
+            }
+
+            // NIP-09: skip tombstoned events.
+            if tombstones.contains(&entry.id) {
+                continue;
+            }
+
+            // NIP-17: kind-1059 events only served to the p-tag recipient.
+            if entry.kind == crate::nostr::KIND_GIFT_WRAP {
+                match &nip17_allowed {
+                    None => continue,
+                    Some(set) => {
+                        if !set.contains(&entry.offset) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if !index::matches(&entry, filter) {
+                continue;
+            }
+            if !tag_sets.is_empty() {
+                let off = entry.offset;
+                if tag_sets.iter().any(|(_, set)| !set.contains(&off)) {
+                    continue;
+                }
+            }
+
+            items.push((entry.created_at, entry.id));
+        }
+
+        drop(tombstones);
+
+        items.sort_unstable();
+        for (ts, id) in items {
+            f(ts, id);
+        }
+    }
+
+    /// Returns the number of tombstoned events.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // `store` is a `Store`
+    /// let _num = store.tombstone_count();
+    /// ```
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.read().map(|t| t.len()).unwrap_or(0)
     }
