@@ -6,6 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::db::store::unix_now;
+use crate::pack::hex;
 use crate::pack::hex::nibble;
 use crate::pack::{Event, EventId, Pubkey, Sig, Tag};
 
@@ -109,6 +110,24 @@ pub enum ClientMsg {
         sub_id: String,
         filters: Vec<Filter>,
     },
+    /// NIP-77: open a negentropy sync session.
+    /// ["NEG-OPEN", <sub_id>, <filter>, <hex_msg>]
+    NegOpen {
+        sub_id: String,
+        filter: Filter,
+        msg: Vec<u8>,
+    },
+    /// NIP-77: continue a negentropy session.
+    /// ["NEG-MSG", <sub_id>, <hex_msg>]
+    NegMsg {
+        sub_id: String,
+        msg: Vec<u8>,
+    },
+    /// NIP-77: close a negentropy session.
+    /// ["NEG-CLOSE", <sub_id>]
+    NegClose {
+        sub_id: String,
+    },
 }
 
 // --- NIP-01 Server Messages ---
@@ -128,6 +147,16 @@ pub enum ServerMsg<'a> {
     },
     Notice {
         message: &'a str,
+    },
+    /// NIP-77: server negentropy reply.
+    NegMsg {
+        sub_id: &'a str,
+        msg: &'a [u8],
+    },
+    /// NIP-77: server error for a negentropy session.
+    NegErr {
+        sub_id: &'a str,
+        reason: &'a str,
     },
 }
 
@@ -181,7 +210,7 @@ pub fn event_has_p_tag(ev: &Event, pubkey: &[u8; 32]) -> bool {
             && t.fields.get(1).map_or(false, |v| {
                 if v.len() == 64 {
                     let mut decoded = [0u8; 32];
-                    crate::pack::hex::decode(v.as_bytes(), &mut decoded).is_ok()
+                    hex::decode(v.as_bytes(), &mut decoded).is_ok()
                         && decoded == *pubkey
                 } else {
                     false
@@ -190,6 +219,42 @@ pub fn event_has_p_tag(ev: &Event, pubkey: &[u8; 32]) -> bool {
     })
 }
 
+/// Decodes a JSON string value expected to be hex into a byte vector.
+///
+/// The `val` must be a JSON string containing an even-length sequence of lowercase hex
+/// characters; `field` is used to produce contextual error messages when decoding fails.
+/// On success returns the decoded bytes; on failure returns an error string explaining the reason.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// let v = json!("0a0b");
+/// let bytes = decode_hex_field(&v, "example").unwrap();
+/// assert_eq!(bytes, vec![0x0a, 0x0b]);
+/// ```
+fn decode_hex_field(val: &Value, field: &str) -> Result<Vec<u8>, String> {
+    let hex_str = val
+        .as_str()
+        .ok_or(format!("invalid: {field} not a string"))?;
+    if hex_str.len() % 2 != 0 {
+        return Err(format!("invalid: {field} not valid hex"));
+    }
+    let mut out = vec![0u8; hex_str.len() / 2];
+    hex::decode(hex_str.as_bytes(), &mut out)
+        .map_err(|_| format!("invalid: {field} not valid hex"))?;
+    Ok(out)
+}
+
+/// Encodes a byte slice as a lowercase hexadecimal string.
+///
+/// # Examples
+///
+/// ```
+/// let data = [0x01u8, 0xab, 0x0f];
+/// let hex = hex_encode_bytes(&data);
+/// assert_eq!(hex, "01ab0f");
+/// ```
 pub fn hex_encode_bytes(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     crate::pack::hex::encode_into(bytes, &mut s);
@@ -368,8 +433,24 @@ fn parse_sub_and_filters(arr: &[Value], verb: &str) -> Result<(String, Vec<Filte
     Ok((sub_id, filters))
 }
 
-/// Parse a raw WebSocket text frame into a ClientMsg.
-/// Returns Err with a NOTICE-ready reason string on parse failure.
+/// Parse a raw WebSocket text frame into a `ClientMsg`.
+///
+/// On success returns the parsed `ClientMsg`. On failure returns `Err` containing a
+/// NOTICE-ready reason string describing the parse error.
+///
+/// # Examples
+///
+/// ```
+/// let raw = r#"["REQ", "sub-1", {"kinds":[1]}]"#;
+/// let msg = parse_client_msg(raw).expect("should parse");
+/// match msg {
+///     ClientMsg::Req { sub_id, filters } => {
+///         assert_eq!(sub_id, "sub-1");
+///         assert!(!filters.is_empty());
+///     }
+///     _ => panic!("expected REQ"),
+/// }
+/// ```
 pub fn parse_client_msg(raw: &str) -> Result<ClientMsg, String> {
     let val: Value = serde_json::from_str(raw).map_err(|_| "invalid: not valid JSON".to_owned())?;
     let arr = val
@@ -418,6 +499,39 @@ pub fn parse_client_msg(raw: &str) -> Result<ClientMsg, String> {
                 .ok_or("invalid: AUTH payload not an object")?;
             let ev = parse_event_obj(obj)?;
             Ok(ClientMsg::Auth(Box::new(ev)))
+        }
+        "NEG-OPEN" => {
+            if arr.len() < 4 {
+                return Err("invalid: NEG-OPEN requires sub_id, filter, and message".to_owned());
+            }
+            let sub_id = arr[1]
+                .as_str()
+                .ok_or("invalid: NEG-OPEN sub_id not a string")?
+                .to_owned();
+            let filter = parse_filter(&arr[2])?;
+            let msg = decode_hex_field(&arr[3], "NEG-OPEN message")?;
+            Ok(ClientMsg::NegOpen { sub_id, filter, msg })
+        }
+        "NEG-MSG" => {
+            if arr.len() < 3 {
+                return Err("invalid: NEG-MSG requires sub_id and message".to_owned());
+            }
+            let sub_id = arr[1]
+                .as_str()
+                .ok_or("invalid: NEG-MSG sub_id not a string")?
+                .to_owned();
+            let msg = decode_hex_field(&arr[2], "NEG-MSG message")?;
+            Ok(ClientMsg::NegMsg { sub_id, msg })
+        }
+        "NEG-CLOSE" => {
+            if arr.len() < 2 {
+                return Err("invalid: NEG-CLOSE missing sub_id".to_owned());
+            }
+            let sub_id = arr[1]
+                .as_str()
+                .ok_or("invalid: NEG-CLOSE sub_id not a string")?
+                .to_owned();
+            Ok(ClientMsg::NegClose { sub_id })
         }
         _ => Err("unknown message type".to_owned()),
     }
@@ -523,6 +637,24 @@ pub fn write_event_json(sub_id: &str, event: &Event, buf: &mut String) {
 }
 
 impl ServerMsg<'_> {
+    /// Serialize a `ServerMsg` into a Nostr wire-format JSON string.
+    ///
+    /// The returned string is a single JSON array representing the server message
+    /// (for example `["EVENT", <sub_id>, <event>]`, `["OK", "<id>", true, "reason"]`,
+    /// `["EOSE", "<sub_id>"]`, `["NOTICE", "<message>"]`, `["NEG-MSG", "<sub_id>", "<hex>"]`,
+    /// or `["NEG-ERR", "<sub_id>", "<reason>"]`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::nostr::{ServerMsg, Event, EventId, Pubkey}; // adjust path as needed
+    ///
+    /// let notice = ServerMsg::Notice { message: "hello" };
+    /// assert_eq!(notice.to_json(), "[\"NOTICE\",\"hello\"]");
+    ///
+    /// let eose = ServerMsg::Eose { sub_id: "sub1" };
+    /// assert_eq!(eose.to_json(), "[\"EOSE\",\"sub1\"]");
+    /// ```
     pub fn to_json(&self) -> String {
         match self {
             ServerMsg::Event { sub_id, event } => {
@@ -553,6 +685,21 @@ impl ServerMsg<'_> {
                 format!(
                     "[\"NOTICE\",{}]",
                     serde_json::to_string(message).expect("message serialization"),
+                )
+            }
+            ServerMsg::NegMsg { sub_id, msg } => {
+                let hex = hex_encode_bytes(msg);
+                format!(
+                    "[\"NEG-MSG\",{},\"{}\"]",
+                    serde_json::to_string(sub_id).expect("sub_id serialization"),
+                    hex,
+                )
+            }
+            ServerMsg::NegErr { sub_id, reason } => {
+                format!(
+                    "[\"NEG-ERR\",{},{}]",
+                    serde_json::to_string(sub_id).expect("sub_id serialization"),
+                    serde_json::to_string(reason).expect("reason serialization"),
                 )
             }
         }

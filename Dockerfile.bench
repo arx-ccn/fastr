@@ -27,6 +27,11 @@
 # -----------------------------------------------------------------------------
 FROM rust:slim-trixie AS fastr-builder
 
+# native-tls (for wss:// in fastr-bench) requires OpenSSL headers.
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+  pkg-config libssl-dev \
+  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 
 # Cache dependency compilation separately from source.
