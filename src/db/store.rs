@@ -9,12 +9,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use arc_swap::ArcSwap;
 
 use crate::db::index::{self, IndexEntry, INDEX_ENTRY_SIZE, OLD_INDEX_ENTRY_SIZE};
-use crate::db::tags;
-use crate::db::vanish;
+use crate::db::{tags, vanish};
 use crate::error::Error;
 use crate::nostr::{self, Filter, KIND_DELETION};
-use crate::pack::hex;
-use crate::pack::{self, Event};
+use crate::pack::{self, hex, Event};
 
 // Raw syscall declarations - avoids the `libc` dependency.
 // Each is wrapped in a safe abstraction before use.

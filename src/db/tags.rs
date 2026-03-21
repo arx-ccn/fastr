@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 
 use crate::db::store::TagSpec;
-use crate::pack::hex;
-use crate::pack::Event;
+use crate::pack::{hex, Event};
 
 /// 49-byte tag index record. Accessed via to_bytes/from_bytes.
 ///

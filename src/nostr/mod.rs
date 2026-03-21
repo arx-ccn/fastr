@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use secp256k1::{schnorr::Signature, Secp256k1, XOnlyPublicKey};
+use secp256k1::schnorr::Signature;
+use secp256k1::{Secp256k1, XOnlyPublicKey};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::db::store::unix_now;
-use crate::pack::hex;
 use crate::pack::hex::nibble;
-use crate::pack::{Event, EventId, Pubkey, Sig, Tag};
+use crate::pack::{hex, Event, EventId, Pubkey, Sig, Tag};
 
 // --- Well-known event kinds ---
 /// NIP-09: Event deletion request.
