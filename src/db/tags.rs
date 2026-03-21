@@ -130,7 +130,11 @@ pub fn multi_matching_offsets(tags_mmap: &[u8], specs: &[TagSpec]) -> Vec<HashSe
                 continue;
             }
             for (val, len) in values {
-                if e.value_len == *len && e.tag_value[..*len as usize] == val[..*len as usize] {
+                let n = *len as usize;
+                if n > e.tag_value.len() || n > val.len() {
+                    continue;
+                }
+                if e.value_len == *len && e.tag_value[..n] == val[..n] {
                     results[j].insert(e.data_offset);
                     break;
                 }
