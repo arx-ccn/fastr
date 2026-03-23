@@ -20,11 +20,7 @@ pub fn load(path: &Path) -> Result<HashSet<[u8; 32]>, Error> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
 
-    if buf.is_empty() {
-        return Ok(set);
-    }
-
-    // Migrate headerless files.
+    // Migrate headerless files (including empty legacy files).
     let data = if buf.len() >= HEADER_SIZE && buf[..HEADER_SIZE] == FILE_HEADER {
         &buf[HEADER_SIZE..]
     } else {
@@ -51,9 +47,8 @@ pub fn load(path: &Path) -> Result<HashSet<[u8; 32]>, Error> {
 /// Open or create the vanished file for appending, writing the header if new.
 pub fn open_append(path: &Path) -> Result<File, Error> {
     use std::fs::OpenOptions;
-    let exists = path.exists();
     let file = OpenOptions::new().create(true).append(true).open(path)?;
-    if !exists || file.metadata()?.len() == 0 {
+    if file.metadata()?.len() == 0 {
         (&file).write_all(&FILE_HEADER)?;
     }
     Ok(file)
@@ -76,6 +71,9 @@ mod tests {
         File::create(&path).unwrap();
         let set = load(&path).unwrap();
         assert!(set.is_empty());
+        // Empty legacy file should now have the header.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw, FILE_HEADER);
     }
 
     #[test]
