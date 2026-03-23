@@ -116,7 +116,7 @@ mod tests {
         let path = dir.path().join("vanished.r");
         // Write a pubkey without header (old format).
         let pk = [0xDD; 32];
-        std::fs::write(&path, &pk).unwrap();
+        std::fs::write(&path, pk).unwrap();
         let set = load(&path).unwrap();
         assert_eq!(set.len(), 1);
         assert!(set.contains(&pk));
