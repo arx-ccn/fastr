@@ -14,6 +14,11 @@ use crate::error::Error;
 use crate::nostr::{self, Filter, KIND_DELETION};
 use crate::pack::{self, hex, Event};
 
+/// 4-byte file header: 3 magic bytes + 1 version byte.
+/// All fastr data files must start with this header.
+pub(crate) const FILE_HEADER: [u8; 4] = [0xBA, 0x53, 0xED, 0x01];
+pub(crate) const HEADER_SIZE: usize = FILE_HEADER.len();
+
 // Raw syscall declarations - avoids the `libc` dependency.
 // Each is wrapped in a safe abstraction before use.
 extern "C" {
@@ -112,25 +117,36 @@ struct MappedFile {
 }
 
 impl MappedFile {
-    /// Create a new MappedFile. If `file_len > 0`, creates the initial oversized mapping.
-    unsafe fn new(fd: i32, file_len: u64) -> Result<Self, Error> {
-        let map = if file_len > 0 {
+    /// Create a new MappedFile. `logical_len` is the data size excluding the
+    /// 4-byte file header. If `logical_len > 0`, creates the initial oversized mapping.
+    unsafe fn new(fd: i32, logical_len: u64) -> Result<Self, Error> {
+        let map = if logical_len > 0 {
             Some(Arc::new(unsafe { Mmap::map(fd, VIRTUAL_MAP_SIZE)? }))
         } else {
             None
         };
         Ok(MappedFile {
             map: ArcSwap::new(Arc::new(map)),
-            len: AtomicU64::new(file_len),
+            len: AtomicU64::new(logical_len),
         })
     }
 
-    /// Snapshot the valid portion of the mapping into a SliceGuard.
+    /// Snapshot the valid data portion of the mapping into a SliceGuard.
+    /// The returned slice starts after the 4-byte file header.
     fn slice(&self) -> SliceGuard {
         let len = self.len.load(Ordering::Acquire) as usize;
         let mmap = self.map.load_full();
+        if len == 0 {
+            return SliceGuard {
+                _mmap: mmap,
+                ptr: std::ptr::null(),
+                len: 0,
+            };
+        }
         let ptr = match mmap.as_ref() {
-            Some(m) => m.ptr,
+            // Safety: the file has at least HEADER_SIZE + len bytes;
+            // advancing past the header lands in valid mapped memory.
+            Some(m) => unsafe { m.ptr.add(HEADER_SIZE) },
             None => std::ptr::null(),
         };
         SliceGuard { _mmap: mmap, ptr, len }
@@ -144,16 +160,18 @@ impl MappedFile {
         self.len.store(len, Ordering::Release);
     }
 
-    /// Ensure the mapping covers at least `needed` bytes. No-op if already covered.
+    /// Ensure the mapping covers at least `needed` logical bytes (plus the header).
+    /// No-op if already covered.
     /// # Safety: caller must hold the writer mutex.
     unsafe fn ensure_mapped(&self, fd: i32, needed: u64) -> Result<(), Error> {
+        let needed_total = needed + HEADER_SIZE as u64;
         let current = self.map.load();
         if let Some(ref existing) = **current {
-            if (needed as usize) <= existing.len {
+            if (needed_total as usize) <= existing.len {
                 return Ok(());
             }
         }
-        let size = VIRTUAL_MAP_SIZE.max((needed as usize).next_power_of_two());
+        let size = VIRTUAL_MAP_SIZE.max((needed_total as usize).next_power_of_two());
         let new_mmap = unsafe { Mmap::map(fd, size)? };
         self.map.store(Arc::new(Some(Arc::new(new_mmap))));
         Ok(())
@@ -237,16 +255,69 @@ pub struct Store {
     dir: PathBuf,
 }
 
-/// Open or create `path` for append-writes, returning the file and its current length.
+/// Prepend the 4-byte file header to an existing headerless file.
+/// Writes header + original content to a .tmp file, then renames atomically.
+fn migrate_file_header(path: &std::path::PathBuf) -> Result<(), Error> {
+    use std::io::Read;
+    let mut old = File::open(path)?;
+    let mut content = Vec::new();
+    old.read_to_end(&mut content)?;
+    drop(old);
+
+    let tmp = path.with_extension("mig");
+    let mut out = File::create(&tmp)?;
+    out.write_all(&FILE_HEADER)?;
+    out.write_all(&content)?;
+    out.flush()?;
+    drop(out);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Open or create `path` for append-writes, returning the file and its logical
+/// data offset (excludes the 4-byte header). Migrates headerless files on first open.
 fn open_rw(path: &std::path::PathBuf) -> Result<WriterFile, Error> {
-    let file = OpenOptions::new()
+    // Ensure file exists.
+    let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .truncate(false) // append-only; never truncate existing data
+        .truncate(false)
         .open(path)?;
-    let offset = file.metadata()?.len();
-    Ok(WriterFile { file, offset })
+    let file_len = file.metadata()?.len();
+
+    if file_len == 0 {
+        // Brand-new file: write header, logical offset starts at 0.
+        file.write_all(&FILE_HEADER)?;
+        Ok(WriterFile { file, offset: 0 })
+    } else {
+        // Check for magic header.
+        use std::io::Read;
+        let mut magic = [0u8; HEADER_SIZE];
+        (&file).read_exact(&mut magic)?;
+
+        if magic == FILE_HEADER {
+            // Already has header. Seek to end for future appends.
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::End(0))?;
+            Ok(WriterFile {
+                file,
+                offset: file_len - HEADER_SIZE as u64,
+            })
+        } else {
+            // Old file without header — migrate.
+            drop(file);
+            migrate_file_header(path)?;
+            let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+            use std::io::Seek;
+            let new_len = file.metadata()?.len();
+            file.seek(std::io::SeekFrom::End(0))?;
+            Ok(WriterFile {
+                file,
+                offset: new_len - HEADER_SIZE as u64,
+            })
+        }
+    }
 }
 
 /// Current unix timestamp in seconds.
@@ -383,10 +454,7 @@ impl Store {
 
         // NIP-62: load vanished pubkeys from persistent file.
         let vanished_set = vanish::load(&dir.join("vanished.r"))?;
-        let vanish_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("vanished.r"))?;
+        let vanish_file = vanish::open_append(&dir.join("vanished.r"))?;
 
         let store = Store {
             data,
@@ -1169,6 +1237,13 @@ impl Store {
         let mut new_tags = File::create(&tmp_tags_path)?;
         let mut new_dtags = File::create(&tmp_dtags_path)?;
 
+        // Write file headers to all temp files.
+        new_data.write_all(&FILE_HEADER)?;
+        new_index.write_all(&FILE_HEADER)?;
+        new_tags.write_all(&FILE_HEADER)?;
+        new_dtags.write_all(&FILE_HEADER)?;
+
+        // Logical offsets (excluding header).
         let mut new_data_offset: u64 = 0;
         let mut new_index_offset: u64 = 0;
         let mut new_tags_offset: u64 = 0;
