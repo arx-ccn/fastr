@@ -222,6 +222,8 @@ pub(crate) type LiveEntry = (i64, [u8; 32], u64);
 pub(crate) type AddressableKey = ([u8; 32], u16, [u8; 32]);
 /// (kind, pubkey, d_hash) → event_id lookup used during a-tag deletion processing.
 type AddrCoord = (u16, [u8; 32], [u8; 32]);
+/// target_id → set of requester pubkeys awaiting deferred ownership verification.
+type PendingTombstones = HashMap<[u8; 32], HashSet<[u8; 32]>>;
 
 /// Tag filter spec: tag_letter prefix byte + list of (value_hash, prefix_len) pairs.
 pub(crate) type TagSpec = (u8, Vec<([u8; 32], u8)>);
@@ -245,7 +247,7 @@ pub struct Store {
     /// when the target event eventually arrives. Multiple kind-5 events from different pubkeys
     /// can reference the same target; using a set prevents one overwriting another.
     /// Bounded to MAX_PENDING_TOMBSTONES entries with FIFO eviction.
-    pending_tombstones: RwLock<HashMap<[u8; 32], HashSet<[u8; 32]>>>,
+    pending_tombstones: RwLock<PendingTombstones>,
     /// FIFO insertion order for pending_tombstones eviction.
     pending_tombstones_order: RwLock<VecDeque<[u8; 32]>>,
     /// In-memory map for replaceable event dedup: (pubkey, kind) -> LiveEntry
@@ -366,10 +368,17 @@ fn blob_bounds(idx: &[u8], i: usize, total: usize, data_len: usize, offset: u64)
 /// Scan all stored kind-5 events and populate the tombstone set.
 /// Called once at `Store::open` and after compaction. Builds temporary lookup
 /// maps for O(1) target resolution (both e-tag and a-tag deletions).
-fn load_tombstones(index: &[u8], data: &[u8], dtags: &[u8]) -> HashSet<[u8; 32]> {
+/// Returns (confirmed_tombstones, pending_tombstones).
+/// Pending tombstones are kind-5 e-tag references whose targets are not in the index,
+/// preserved across restarts so they can be resolved when the target eventually arrives.
+/// Note: preemptive a-tag deletions are NOT tracked as pending — if the addressable event
+/// hasn't arrived before restart, the deletion is lost. This is an accepted asymmetry
+/// with e-tag handling; a-tag coordinates are less likely to arrive out-of-order.
+fn load_tombstones(index: &[u8], data: &[u8], dtags: &[u8]) -> (HashSet<[u8; 32]>, PendingTombstones) {
     use crate::db::dtags::{DtagEntry, DTAG_ENTRY_SIZE};
 
     let mut set = HashSet::new();
+    let mut pending: PendingTombstones = HashMap::new();
     let total = index.len() / INDEX_ENTRY_SIZE;
 
     // Build id → (pubkey, kind) lookup map in a single O(N) pass.
@@ -411,19 +420,22 @@ fn load_tombstones(index: &[u8], data: &[u8], dtags: &[u8]) -> HashSet<[u8; 32]>
             None => continue,
         };
         if let Ok(ev) = crate::pack::deserialize_trusted(&data[start..end]) {
-            process_deletion_e_tags_fast(&ev, &id_info, &mut set);
+            process_deletion_e_tags_fast(&ev, &id_info, &mut set, &mut pending);
             process_deletion_a_tags_fast(&ev, &addr_map, &mut set);
         }
     }
-    set
+    (set, pending)
 }
 
 /// Fast path for e-tag deletion processing using a pre-built id lookup map.
 /// Used at startup and after compaction for O(1) target resolution.
+/// Unresolved targets (not in index) are recorded in `pending` so they can be
+/// resolved when the target event eventually arrives after a restart.
 fn process_deletion_e_tags_fast(
     k5: &crate::pack::Event,
     id_info: &HashMap<[u8; 32], ([u8; 32], u16)>,
     set: &mut HashSet<[u8; 32]>,
+    pending: &mut PendingTombstones,
 ) {
     for tag in &k5.tags {
         if tag.fields.first().map(String::as_str) != Some("e") {
@@ -438,14 +450,16 @@ fn process_deletion_e_tags_fast(
             continue;
         }
         if let Some(&(target_pubkey, target_kind)) = id_info.get(&id_bytes) {
-            if target_kind == 5 {
+            if target_kind == KIND_DELETION {
                 continue; // NIP-09: cannot delete deletion requests.
             }
             if target_pubkey == k5.pubkey.0 {
                 set.insert(id_bytes);
             }
+        } else {
+            // Target not in index — record as pending for deferred resolution.
+            pending.entry(id_bytes).or_default().insert(k5.pubkey.0);
         }
-        // Target not in index (compacted away or never existed) — skip.
     }
 }
 
@@ -500,11 +514,16 @@ fn parse_a_tag_value(value: &str) -> Option<(u16, [u8; 32], &str)> {
 /// Never tombstones kind-5 events themselves.
 /// If the target is not yet in the index, records a pending tombstone keyed by
 /// requester pubkey in `pending` for deferred validation when the target arrives.
+///
+/// Note: this scans the index linearly per e-tag (O(N) per tag). The startup path
+/// uses `process_deletion_e_tags_fast` with a pre-built HashMap for O(1) lookups.
+/// This function is only called from the write-locked append path, so the linear
+/// scan is bounded by the write mutex and acceptable at current scale.
 fn process_deletion_into(
     k5: &crate::pack::Event,
     index: &[u8],
     set: &mut HashSet<[u8; 32]>,
-    pending: &mut HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    pending: &mut PendingTombstones,
     pending_order: &mut VecDeque<[u8; 32]>,
     max_pending: usize,
 ) {
@@ -525,7 +544,7 @@ fn process_deletion_into(
         for (_, entry) in index::iter_entries(index) {
             if entry.id == id_bytes {
                 found = true;
-                if entry.kind == 5 {
+                if entry.kind == KIND_DELETION {
                     // NIP-09: cannot delete deletion requests.
                     break;
                 }
@@ -585,8 +604,8 @@ impl Store {
         let tags = unsafe { MappedFile::new(tags_wf.file.as_raw_fd(), tags_wf.offset)? };
         let dtags = unsafe { MappedFile::new(dtags_wf.file.as_raw_fd(), dtags_wf.offset)? };
 
-        // NIP-09: rebuild tombstone set from all stored kind-5 events.
-        let tombstones = load_tombstones(&index.slice(), &data.slice(), &dtags.slice());
+        // NIP-09: rebuild tombstone set and pending map from all stored kind-5 events.
+        let (tombstones, pending_ts) = load_tombstones(&index.slice(), &data.slice(), &dtags.slice());
 
         // NIP-62: load vanished pubkeys from persistent file.
         let vanished_set = vanish::load(&dir.join("vanished.r"))?;
@@ -604,8 +623,8 @@ impl Store {
                 dtags: dtags_wf,
             }),
             tombstones: RwLock::new(tombstones),
-            pending_tombstones: RwLock::new(HashMap::new()),
-            pending_tombstones_order: RwLock::new(VecDeque::new()),
+            pending_tombstones_order: RwLock::new(pending_ts.keys().copied().collect()),
+            pending_tombstones: RwLock::new(pending_ts),
             replaceable_live: RwLock::new(HashMap::new()),
             addressable_live: RwLock::new(HashMap::new()),
             vanished: RwLock::new(vanished_set),
@@ -1046,7 +1065,11 @@ impl Store {
                 // Note: we don't remove from pending_order here — the VecDeque may contain
                 // stale entries for resolved/evicted keys, which is harmless. The eviction
                 // loop in process_deletion_into handles stale entries by checking pending.len().
-                if ev.kind != 5 && requesters.contains(&ev.pubkey.0) {
+                // Tradeoff: the VecDeque's worst-case depth equals the total number of pending
+                // entries ever created (not the current cap), but stale slots are drained during
+                // future eviction passes and the memory is bounded by MAX_PENDING_TOMBSTONES
+                // live entries at any time.
+                if ev.kind != KIND_DELETION && requesters.contains(&ev.pubkey.0) {
                     set.insert(ev.id.0);
                 }
                 // No matching pubkey or kind-5 target: pending entry is dropped silently.
@@ -1578,10 +1601,24 @@ impl Store {
         let idx = self.index.slice();
         let data = self.data.slice();
         let dtags_s = self.dtags.slice();
-        let new_tombstones = load_tombstones(&idx, &data, &dtags_s);
+        let (new_tombstones, new_pending) = load_tombstones(&idx, &data, &dtags_s);
         {
             let mut ts = self.tombstones.write().unwrap();
             ts.extend(new_tombstones);
+        }
+        {
+            let mut pt = self.pending_tombstones.write().unwrap();
+            // Extend rather than replace: pending entries from pre-compaction
+            // may reference targets that were never stored (not compacted away).
+            for (id, pubs) in new_pending {
+                pt.entry(id).or_default().extend(pubs);
+            }
+            let mut po = self.pending_tombstones_order.write().unwrap();
+            for id in pt.keys() {
+                if !po.contains(id) {
+                    po.push_back(*id);
+                }
+            }
         }
         {
             let mut rep = self.replaceable_live.write().unwrap();
@@ -2109,6 +2146,43 @@ mod tests {
         // target's id should not appear (kind-5 rebuilt from disk).
         let target_check = make_event(1, 1, 1_000, vec![]);
         assert!(!ids.contains(&target_check.id.0), "tombstone must survive restart");
+    }
+
+    #[test]
+    fn test_nip09_pending_tombstone_survives_restart() {
+        // A kind-5 arrives before its target, then the relay restarts.
+        // When the target arrives after restart, it must still be tombstoned.
+        let dir = tempfile::tempdir().unwrap();
+
+        let target = make_event(1, 1, 1_000, vec![]);
+
+        // First session: ingest kind-5 only (target not yet stored).
+        {
+            let store = Store::open(dir.path()).unwrap();
+            let k5 = make_kind5_event(1, &target.id.0);
+            store.append(&k5).unwrap();
+            // Pending tombstone should exist in memory.
+            let pending = store.pending_tombstones.read().unwrap();
+            assert!(pending.contains_key(&target.id.0), "pending must exist before restart");
+        }
+
+        // Second session: pending tombstone must be rebuilt from the kind-5 on disk.
+        {
+            let store = Store::open(dir.path()).unwrap();
+            let pending = store.pending_tombstones.read().unwrap();
+            assert!(
+                pending.contains_key(&target.id.0),
+                "pending tombstone must survive restart"
+            );
+            drop(pending);
+
+            // Now ingest the target — it must be tombstoned.
+            store.append(&target).unwrap();
+            assert!(
+                store.is_tombstoned(&target.id.0),
+                "target must be tombstoned after deferred resolution post-restart"
+            );
+        }
     }
 
     // Replaceable event (Task 4) tests
