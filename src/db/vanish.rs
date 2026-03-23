@@ -28,12 +28,15 @@ pub fn load(path: &Path) -> Result<HashSet<[u8; 32]>, Error> {
     let data = if buf.len() >= HEADER_SIZE && buf[..HEADER_SIZE] == FILE_HEADER {
         &buf[HEADER_SIZE..]
     } else {
-        // Old file without header — migrate in place.
+        // Old file without header — atomic migrate via temp+rename.
         drop(file);
-        let mut tmp = Vec::with_capacity(HEADER_SIZE + buf.len());
-        tmp.extend_from_slice(&FILE_HEADER);
-        tmp.extend_from_slice(&buf);
-        std::fs::write(path, &tmp)?;
+        let tmp_path = path.with_extension("mig");
+        let mut out = File::create(&tmp_path)?;
+        out.write_all(&FILE_HEADER)?;
+        out.write_all(&buf)?;
+        out.flush()?;
+        drop(out);
+        std::fs::rename(&tmp_path, path)?;
         &buf[..]
     };
 
