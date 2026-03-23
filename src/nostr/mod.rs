@@ -45,6 +45,16 @@ pub fn is_addressable_kind(kind: u16) -> bool {
     matches!(kind, 30000..=39999)
 }
 
+/// Compute the SHA-256 hash of a d-tag value, used as the dedup key for addressable events.
+pub fn d_tag_hash(d_value: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(d_value.as_bytes());
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
 /// Classify an event kind for handler dispatch.
 /// `tags` is needed to extract the d-tag for addressable events.
 pub fn classify_kind(kind: u16, tags: &[Tag]) -> KindClass {
@@ -59,15 +69,9 @@ pub fn classify_kind(kind: u16, tags: &[Tag]) -> KindClass {
                 .find(|t| t.fields.len() >= 2 && t.fields[0] == "d")
                 .map(|t| t.fields[1].as_str())
                 .unwrap_or("");
-            let d_hash = {
-                let mut hasher = Sha256::new();
-                hasher.update(d_val.as_bytes());
-                let result = hasher.finalize();
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&result);
-                out
-            };
-            KindClass::Addressable { d_hash }
+            KindClass::Addressable {
+                d_hash: d_tag_hash(d_val),
+            }
         }
         _ => KindClass::Regular,
     }

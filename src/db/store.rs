@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -29,6 +29,12 @@ extern "C" {
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 0x01;
 const MAP_FAILED: *mut u8 = usize::MAX as *mut u8;
+
+/// Maximum number of entries in the pending_tombstones map.
+/// 5 MB budget / ~64 bytes per entry (32-byte key + HashSet overhead) ≈ 81920.
+/// Prevents unbounded memory growth from spam kind-5 events referencing
+/// non-existent targets. Oldest entries evicted first (FIFO).
+const MAX_PENDING_TOMBSTONES: usize = 81_920;
 
 /// Default virtual mapping size per file (1 GB). Only page-table entries are
 /// allocated; RSS grows only as the file grows. Remapped (doubled) if the
@@ -214,6 +220,8 @@ pub(crate) type LiveEntry = (i64, [u8; 32], u64);
 
 /// Addressable event dedup key: (pubkey, kind, d_hash).
 pub(crate) type AddressableKey = ([u8; 32], u16, [u8; 32]);
+/// (kind, pubkey, d_hash) → event_id lookup used during a-tag deletion processing.
+type AddrCoord = (u16, [u8; 32], [u8; 32]);
 
 /// Tag filter spec: tag_letter prefix byte + list of (value_hash, prefix_len) pairs.
 pub(crate) type TagSpec = (u8, Vec<([u8; 32], u8)>);
@@ -233,9 +241,13 @@ pub struct Store {
     /// `std::sync::RwLock` (not tokio's) - critical section is always short (HashSet lookup).
     tombstones: RwLock<HashSet<[u8; 32]>>,
     /// NIP-09 pending tombstones: event IDs referenced by a kind-5 that arrived before the
-    /// target event. Maps target_id -> requester_pubkey so ownership can be verified when the
-    /// target event eventually arrives. Entries are resolved (and removed) in `append()`.
-    pending_tombstones: RwLock<HashMap<[u8; 32], [u8; 32]>>,
+    /// target event. Maps target_id -> set of requester pubkeys so ownership can be verified
+    /// when the target event eventually arrives. Multiple kind-5 events from different pubkeys
+    /// can reference the same target; using a set prevents one overwriting another.
+    /// Bounded to MAX_PENDING_TOMBSTONES entries with FIFO eviction.
+    pending_tombstones: RwLock<HashMap<[u8; 32], HashSet<[u8; 32]>>>,
+    /// FIFO insertion order for pending_tombstones eviction.
+    pending_tombstones_order: RwLock<VecDeque<[u8; 32]>>,
     /// In-memory map for replaceable event dedup: (pubkey, kind) -> LiveEntry
     replaceable_live: RwLock<HashMap<([u8; 32], u16), LiveEntry>>,
     /// In-memory map for addressable event dedup: (pubkey, kind, d_hash) -> LiveEntry
@@ -253,6 +265,8 @@ pub struct Store {
     known_ids: RwLock<HashSet<[u8; 32]>>,
     /// Store directory path - needed for compaction to build temp files.
     dir: PathBuf,
+    /// Max pending tombstones before FIFO eviction kicks in.
+    max_pending_tombstones: usize,
 }
 
 /// Prepend the 4-byte file header to an existing headerless file.
@@ -350,27 +364,135 @@ fn blob_bounds(idx: &[u8], i: usize, total: usize, data_len: usize, offset: u64)
 // NIP-09 tombstone helpers
 
 /// Scan all stored kind-5 events and populate the tombstone set.
-/// Called once at `Store::open`. At startup the full index is available, so the
-/// pending map will always remain empty (all targets can be looked up immediately).
-fn load_tombstones(index: &[u8], data: &[u8]) -> HashSet<[u8; 32]> {
+/// Called once at `Store::open` and after compaction. Builds temporary lookup
+/// maps for O(1) target resolution (both e-tag and a-tag deletions).
+fn load_tombstones(index: &[u8], data: &[u8], dtags: &[u8]) -> HashSet<[u8; 32]> {
+    use crate::db::dtags::{DtagEntry, DTAG_ENTRY_SIZE};
+
     let mut set = HashSet::new();
-    let mut pending = HashMap::new();
     let total = index.len() / INDEX_ENTRY_SIZE;
+
+    // Build id → (pubkey, kind) lookup map in a single O(N) pass.
+    let mut id_info: HashMap<[u8; 32], ([u8; 32], u16)> = HashMap::with_capacity(total);
+    // Build offset → id map for resolving dtag entries back to event IDs.
+    let mut offset_to_id: HashMap<u64, [u8; 32]> = HashMap::with_capacity(total);
+    let mut kind5_indices: Vec<usize> = Vec::new();
     for (i, entry) in index::iter_entries(index) {
-        if entry.kind != KIND_DELETION {
-            continue;
+        id_info.insert(entry.id, (entry.pubkey, entry.kind));
+        offset_to_id.insert(entry.offset, entry.id);
+        if entry.kind == KIND_DELETION {
+            kind5_indices.push(i);
         }
+    }
+
+    // Build (kind, pubkey, d_hash) → event_id map from dtag index for a-tag lookups.
+    let mut addr_map: HashMap<AddrCoord, [u8; 32]> = HashMap::new();
+    let dtags_total = dtags.len() / DTAG_ENTRY_SIZE;
+    for i in 0..dtags_total {
+        let off = i * DTAG_ENTRY_SIZE;
+        if let Ok(b) = <&[u8; DTAG_ENTRY_SIZE]>::try_from(&dtags[off..off + DTAG_ENTRY_SIZE]) {
+            let de = DtagEntry::from_bytes(b);
+            if let Some(&id) = offset_to_id.get(&de.data_offset) {
+                // Last entry wins (latest appended = most recent for this coordinate).
+                addr_map.insert((de.kind, de.pubkey, de.d_hash), id);
+            }
+        }
+    }
+
+    // Process each kind-5 event using O(1) lookups for both e-tags and a-tags.
+    for &i in &kind5_indices {
+        let b: &[u8; INDEX_ENTRY_SIZE] = match index[i * INDEX_ENTRY_SIZE..(i + 1) * INDEX_ENTRY_SIZE].try_into() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let entry = IndexEntry::from_bytes(b);
         let (start, end) = match blob_bounds(index, i, total, data.len(), entry.offset) {
             Some(b) => b,
             None => continue,
         };
         if let Ok(ev) = crate::pack::deserialize_trusted(&data[start..end]) {
-            process_deletion_into(&ev, index, &mut set, &mut pending);
+            process_deletion_e_tags_fast(&ev, &id_info, &mut set);
+            process_deletion_a_tags_fast(&ev, &addr_map, &mut set);
         }
     }
-    // `pending` should be empty here since all events are on disk.
-    // If any remain (corrupt/missing blobs), drop them — we cannot verify ownership.
     set
+}
+
+/// Fast path for e-tag deletion processing using a pre-built id lookup map.
+/// Used at startup and after compaction for O(1) target resolution.
+fn process_deletion_e_tags_fast(
+    k5: &crate::pack::Event,
+    id_info: &HashMap<[u8; 32], ([u8; 32], u16)>,
+    set: &mut HashSet<[u8; 32]>,
+) {
+    for tag in &k5.tags {
+        if tag.fields.first().map(String::as_str) != Some("e") {
+            continue;
+        }
+        let id_hex = match tag.fields.get(1) {
+            Some(s) if s.len() == 64 => s,
+            _ => continue,
+        };
+        let mut id_bytes = [0u8; 32];
+        if crate::pack::hex::decode(id_hex.as_bytes(), &mut id_bytes).is_err() {
+            continue;
+        }
+        if let Some(&(target_pubkey, target_kind)) = id_info.get(&id_bytes) {
+            if target_kind == 5 {
+                continue; // NIP-09: cannot delete deletion requests.
+            }
+            if target_pubkey == k5.pubkey.0 {
+                set.insert(id_bytes);
+            }
+        }
+        // Target not in index (compacted away or never existed) — skip.
+    }
+}
+
+/// Fast path for a-tag deletion processing using a pre-built addr lookup map.
+/// Used at startup and after compaction. Finds addressable events by coordinate
+/// and tombstones them if the kind-5 pubkey matches.
+fn process_deletion_a_tags_fast(
+    k5: &crate::pack::Event,
+    addr_map: &HashMap<AddrCoord, [u8; 32]>,
+    set: &mut HashSet<[u8; 32]>,
+) {
+    for tag in &k5.tags {
+        if tag.fields.first().map(String::as_str) != Some("a") {
+            continue;
+        }
+        let value = match tag.fields.get(1) {
+            Some(s) => s.as_str(),
+            None => continue,
+        };
+        let (kind, pubkey, d_value) = match parse_a_tag_value(value) {
+            Some(v) => v,
+            None => continue,
+        };
+        // NIP-09: the kind-5's pubkey must match the a-tag's pubkey.
+        if pubkey != k5.pubkey.0 {
+            continue;
+        }
+        let d_hash = nostr::d_tag_hash(d_value);
+        if let Some(&event_id) = addr_map.get(&(kind, pubkey, d_hash)) {
+            set.insert(event_id);
+        }
+    }
+}
+
+/// Parse an NIP-09 `a`-tag value into (kind, pubkey_bytes, d_value).
+/// Format: `<kind>:<pubkey-hex>:<d-value>` where kind is decimal, pubkey is 64-char hex.
+fn parse_a_tag_value(value: &str) -> Option<(u16, [u8; 32], &str)> {
+    let mut parts = value.splitn(3, ':');
+    let kind: u16 = parts.next()?.parse().ok()?;
+    let pubkey_hex = parts.next()?;
+    let d_value = parts.next().unwrap_or("");
+    if pubkey_hex.len() != 64 {
+        return None;
+    }
+    let mut pubkey = [0u8; 32];
+    crate::pack::hex::decode(pubkey_hex.as_bytes(), &mut pubkey).ok()?;
+    Some((kind, pubkey, d_value))
 }
 
 /// Extract event IDs from a kind-5 event's #e tags and add owned ids to `set`.
@@ -382,7 +504,9 @@ fn process_deletion_into(
     k5: &crate::pack::Event,
     index: &[u8],
     set: &mut HashSet<[u8; 32]>,
-    pending: &mut HashMap<[u8; 32], [u8; 32]>,
+    pending: &mut HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    pending_order: &mut VecDeque<[u8; 32]>,
+    max_pending: usize,
 ) {
     for tag in &k5.tags {
         if tag.fields.first().map(String::as_str) != Some("e") {
@@ -416,7 +540,19 @@ fn process_deletion_into(
             // Target not yet stored. Record a pending tombstone so we can verify
             // ownership when the target event arrives. Do NOT tombstone blindly here —
             // a different-pubkey event sharing this ID must not be suppressed.
-            pending.insert(id_bytes, k5.pubkey.0);
+            let is_new = !pending.contains_key(&id_bytes);
+            pending.entry(id_bytes).or_default().insert(k5.pubkey.0);
+            if is_new {
+                pending_order.push_back(id_bytes);
+                // Evict oldest entries when over the cap.
+                while pending.len() > max_pending {
+                    if let Some(oldest) = pending_order.pop_front() {
+                        pending.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -450,7 +586,7 @@ impl Store {
         let dtags = unsafe { MappedFile::new(dtags_wf.file.as_raw_fd(), dtags_wf.offset)? };
 
         // NIP-09: rebuild tombstone set from all stored kind-5 events.
-        let tombstones = load_tombstones(&index.slice(), &data.slice());
+        let tombstones = load_tombstones(&index.slice(), &data.slice(), &dtags.slice());
 
         // NIP-62: load vanished pubkeys from persistent file.
         let vanished_set = vanish::load(&dir.join("vanished.r"))?;
@@ -469,6 +605,7 @@ impl Store {
             }),
             tombstones: RwLock::new(tombstones),
             pending_tombstones: RwLock::new(HashMap::new()),
+            pending_tombstones_order: RwLock::new(VecDeque::new()),
             replaceable_live: RwLock::new(HashMap::new()),
             addressable_live: RwLock::new(HashMap::new()),
             vanished: RwLock::new(vanished_set),
@@ -477,6 +614,7 @@ impl Store {
             author_counts: RwLock::new(HashMap::new()),
             known_ids: RwLock::new(HashSet::new()),
             dir: dir.to_path_buf(),
+            max_pending_tombstones: MAX_PENDING_TOMBSTONES,
         };
         store.boot_rebuild();
         Ok(store)
@@ -830,6 +968,41 @@ impl Store {
             }
         }
 
+        // NIP-09 a-tag resolution: pre-collect addressable event IDs to tombstone
+        // BEFORE acquiring the tombstone lock. This avoids lock ordering issues
+        // (tombstone_addressable acquires addressable_live → tombstones, so we
+        // must not hold tombstones while reading addressable_live).
+        // Safe: we hold the writer mutex, so no concurrent appends can modify addressable_live.
+        let a_tag_tombstone_ids: Vec<[u8; 32]> = if ev.kind == KIND_DELETION {
+            let mut ids = Vec::new();
+            if let Ok(addr_live) = self.addressable_live.read() {
+                for tag in &ev.tags {
+                    if tag.fields.first().map(String::as_str) != Some("a") {
+                        continue;
+                    }
+                    let value = match tag.fields.get(1) {
+                        Some(s) => s.as_str(),
+                        None => continue,
+                    };
+                    let (kind, pubkey, d_value) = match parse_a_tag_value(value) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    // NIP-09: kind-5 pubkey must match the a-tag's pubkey.
+                    if pubkey != ev.pubkey.0 {
+                        continue;
+                    }
+                    let d_hash = nostr::d_tag_hash(d_value);
+                    if let Some(&(_, event_id, _)) = addr_live.get(&(pubkey, kind, d_hash)) {
+                        ids.push(event_id);
+                    }
+                }
+            }
+            ids
+        } else {
+            Vec::new()
+        };
+
         // NIP-09: update tombstone set BEFORE publishing lengths to readers.
         // This closes the race where a concurrent query could see the kind-5
         // event in the index before its targets are tombstoned.
@@ -842,22 +1015,41 @@ impl Store {
                 .pending_tombstones
                 .write()
                 .map_err(|_| std::io::Error::other("pending_tombstones lock poisoned"))?;
+            let mut pending_order = self
+                .pending_tombstones_order
+                .write()
+                .map_err(|_| std::io::Error::other("pending_tombstones_order lock poisoned"))?;
 
             if ev.kind == KIND_DELETION {
                 // Use the pre-publication index: targets of this deletion are already
                 // in the index from earlier appends. The kind-5 event itself is not
                 // yet visible to readers (lengths not published), which is fine since
                 // process_deletion_into looks up target events, not the deletion event.
-                process_deletion_into(ev, &self.index.slice(), &mut set, &mut pending);
+                process_deletion_into(
+                    ev,
+                    &self.index.slice(),
+                    &mut set,
+                    &mut pending,
+                    &mut pending_order,
+                    self.max_pending_tombstones,
+                );
+
+                // Apply a-tag tombstones (pre-collected above to avoid lock ordering).
+                for id in &a_tag_tombstone_ids {
+                    set.insert(*id);
+                }
             }
 
             // Resolve any pending tombstones that were waiting for this event.
-            // Only tombstone if the pending requester's pubkey matches this event's pubkey.
-            if let Some(requester_pubkey) = pending.remove(&ev.id.0) {
-                if ev.kind != 5 && ev.pubkey.0 == requester_pubkey {
+            // Only tombstone if any pending requester's pubkey matches this event's pubkey.
+            if let Some(requesters) = pending.remove(&ev.id.0) {
+                // Note: we don't remove from pending_order here — the VecDeque may contain
+                // stale entries for resolved/evicted keys, which is harmless. The eviction
+                // loop in process_deletion_into handles stale entries by checking pending.len().
+                if ev.kind != 5 && requesters.contains(&ev.pubkey.0) {
                     set.insert(ev.id.0);
                 }
-                // pubkey mismatch or kind-5 target: pending entry is dropped silently.
+                // No matching pubkey or kind-5 target: pending entry is dropped silently.
             }
         }
 
@@ -1378,14 +1570,18 @@ impl Store {
         drop(w);
 
         // Phase 4: Rebuild in-memory maps from compacted state.
-        // Build new tombstones first, then swap atomically to avoid a window
-        // where concurrent readers see an empty tombstone set.
+        // Build new tombstones from the compacted data, then EXTEND (not replace) the
+        // existing set. Compaction removes tombstoned events from the data files, so
+        // load_tombstones can't find them as targets anymore — their IDs would be lost.
+        // Since kind-5 events are never tombstoned themselves, old entries represent
+        // verified deletions that must persist to prevent re-ingestion.
         let idx = self.index.slice();
         let data = self.data.slice();
-        let new_tombstones = load_tombstones(&idx, &data);
+        let dtags_s = self.dtags.slice();
+        let new_tombstones = load_tombstones(&idx, &data, &dtags_s);
         {
             let mut ts = self.tombstones.write().unwrap();
-            *ts = new_tombstones;
+            ts.extend(new_tombstones);
         }
         {
             let mut rep = self.replaceable_live.write().unwrap();
@@ -2488,5 +2684,237 @@ mod tests {
             }],
         );
         assert!(store.append(&ev3).is_err());
+    }
+
+    // --- Multi-claimant pending tombstone tests ---
+
+    #[test]
+    fn test_nip09_multi_claimant_preemptive_tombstone() {
+        // If both pubkey A (legitimate owner) and pubkey B (attacker) send kind-5
+        // events for the same target before the target arrives, the legitimate
+        // owner's deletion must still work. Previously the single-value HashMap
+        // would let B's entry overwrite A's, losing the legitimate deletion.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // Target authored by sk=1 (pubkey A)
+        let target = make_event(1, 1, 1_000, vec![]);
+
+        // Legitimate kind-5 from sk=1 (pubkey A) — arrives before target
+        let k5_legit = make_kind5_event(1, &target.id.0);
+        store.append(&k5_legit).unwrap();
+
+        // Attacker kind-5 from sk=2 (pubkey B) — also arrives before target
+        let k5_attack = make_kind5_event(2, &target.id.0);
+        store.append(&k5_attack).unwrap();
+
+        // Target arrives — must be tombstoned (pubkey A's kind-5 matches).
+        store.append(&target).unwrap();
+        assert!(
+            store.is_tombstoned(&target.id.0),
+            "legitimate deletion must succeed even when attacker also claimed same target"
+        );
+    }
+
+    // --- Tombstone persistence across compaction tests ---
+
+    #[test]
+    fn test_tombstone_survives_compaction() {
+        // After compaction removes tombstoned events from data files,
+        // load_tombstones can't find them as targets. The tombstone must
+        // still persist to prevent re-ingestion.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let target = make_event(1, 1, 1_000, vec![]);
+        store.append(&target).unwrap();
+
+        let k5 = make_kind5_event(1, &target.id.0);
+        store.append(&k5).unwrap();
+
+        assert!(
+            store.is_tombstoned(&target.id.0),
+            "target must be tombstoned before compaction"
+        );
+
+        // Compact — this removes the target's data from the files.
+        store.compact().unwrap();
+
+        // Tombstone must still be active.
+        assert!(
+            store.is_tombstoned(&target.id.0),
+            "tombstone must survive compaction even though target data was removed"
+        );
+    }
+
+    // --- NIP-09 a-tag deletion tests ---
+
+    /// Build a kind-5 event that references an addressable event by `a`-tag coordinate.
+    fn make_kind5_a_tag_event(sk_scalar: u8, kind: u16, pubkey: &[u8; 32], d_value: &str) -> Event {
+        let pubkey_hex = crate::nostr::hex_encode_bytes(pubkey);
+        let a_value = format!("{kind}:{pubkey_hex}:{d_value}");
+        make_event(
+            sk_scalar,
+            5,
+            1_700_000_001,
+            vec![Tag {
+                fields: vec!["a".to_owned(), a_value],
+            }],
+        )
+    }
+
+    #[test]
+    fn test_nip09_a_tag_deletion_removes_addressable_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // Store an addressable event (kind 30001 with d-tag "test")
+        let target = make_event(
+            1,
+            30001,
+            1_000,
+            vec![Tag {
+                fields: vec!["d".into(), "test".into()],
+            }],
+        );
+        store.append(&target).unwrap();
+
+        // Same author deletes by a-tag coordinate
+        let k5 = make_kind5_a_tag_event(1, 30001, &target.pubkey.0, "test");
+        store.append(&k5).unwrap();
+
+        // Target must be tombstoned
+        assert!(
+            store.is_tombstoned(&target.id.0),
+            "a-tag deletion must tombstone the matching addressable event"
+        );
+
+        // Target must not appear in queries
+        let mut ids: Vec<[u8; 32]> = Vec::new();
+        store
+            .query(&empty_filter(), |bytes| {
+                let ev = deserialize_trusted(bytes)?;
+                ids.push(ev.id.0);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !ids.contains(&target.id.0),
+            "a-tag deleted event must not appear in queries"
+        );
+    }
+
+    #[test]
+    fn test_nip09_a_tag_cross_pubkey_deletion_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // Store an addressable event from sk=1
+        let target = make_event(
+            1,
+            30001,
+            1_000,
+            vec![Tag {
+                fields: vec!["d".into(), "test".into()],
+            }],
+        );
+        store.append(&target).unwrap();
+
+        // Different author (sk=2) tries to delete by a-tag — must fail
+        let k5 = make_kind5_a_tag_event(2, 30001, &target.pubkey.0, "test");
+        store.append(&k5).unwrap();
+
+        assert!(
+            !store.is_tombstoned(&target.id.0),
+            "cross-pubkey a-tag deletion must not tombstone event"
+        );
+    }
+
+    #[test]
+    fn test_nip09_a_tag_deletion_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let target_id;
+        {
+            let store = Store::open(dir.path()).unwrap();
+
+            let target = make_event(
+                1,
+                30001,
+                1_000,
+                vec![Tag {
+                    fields: vec!["d".into(), "persist".into()],
+                }],
+            );
+            target_id = target.id.0;
+            store.append(&target).unwrap();
+
+            let k5 = make_kind5_a_tag_event(1, 30001, &target.pubkey.0, "persist");
+            store.append(&k5).unwrap();
+        }
+
+        // Reopen — tombstone must be rebuilt from disk
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.is_tombstoned(&target_id), "a-tag tombstone must survive restart");
+    }
+
+    // --- Pending tombstone FIFO eviction tests ---
+
+    #[test]
+    fn test_pending_tombstones_fifo_eviction() {
+        // Use a small cap so the test runs fast while still verifying FIFO logic.
+        let test_cap: usize = 100;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.max_pending_tombstones = test_cap;
+
+        // Fill pending_tombstones past the cap.
+        // Each kind-5 references a unique fake target ID.
+        let overflow = 10;
+        let total = test_cap + overflow;
+        for i in 0..total {
+            let mut fake_id = [0u8; 32];
+            fake_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let fake_hex = crate::nostr::hex_encode_bytes(&fake_id);
+            // Use different sk_scalars to avoid duplicate event IDs.
+            // sk_scalar cycles through 1..=255 (0 is invalid for secp256k1).
+            let sk = ((i % 255) + 1) as u8;
+            let ev = make_event(
+                sk,
+                5,
+                1_700_000_000 + i as i64,
+                vec![Tag {
+                    fields: vec!["e".to_owned(), fake_hex],
+                }],
+            );
+            store.append(&ev).unwrap();
+        }
+
+        // Check the pending map size is capped.
+        let pending = store.pending_tombstones.read().unwrap();
+        assert!(
+            pending.len() <= test_cap,
+            "pending_tombstones must not exceed cap: got {} > {}",
+            pending.len(),
+            test_cap,
+        );
+
+        // The oldest entries (indices 0..overflow) should have been evicted.
+        for i in 0..overflow {
+            let mut evicted_id = [0u8; 32];
+            evicted_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(
+                !pending.contains_key(&evicted_id),
+                "oldest pending tombstone (index {i}) must be evicted"
+            );
+        }
+
+        // The newest entry should still be present.
+        let mut newest_id = [0u8; 32];
+        newest_id[..8].copy_from_slice(&((total - 1) as u64).to_le_bytes());
+        assert!(
+            pending.contains_key(&newest_id),
+            "newest pending tombstone must be retained"
+        );
     }
 }
