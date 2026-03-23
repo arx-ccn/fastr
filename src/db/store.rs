@@ -214,6 +214,10 @@ pub struct Store {
     /// NIP-09 tombstone set: event IDs that have been deleted by a kind-5 request.
     /// `std::sync::RwLock` (not tokio's) - critical section is always short (HashSet lookup).
     tombstones: RwLock<HashSet<[u8; 32]>>,
+    /// NIP-09 pending tombstones: event IDs referenced by a kind-5 that arrived before the
+    /// target event. Maps target_id -> requester_pubkey so ownership can be verified when the
+    /// target event eventually arrives. Entries are resolved (and removed) in `append()`.
+    pending_tombstones: RwLock<HashMap<[u8; 32], [u8; 32]>>,
     /// In-memory map for replaceable event dedup: (pubkey, kind) -> LiveEntry
     replaceable_live: RwLock<HashMap<([u8; 32], u16), LiveEntry>>,
     /// In-memory map for addressable event dedup: (pubkey, kind, d_hash) -> LiveEntry
@@ -275,9 +279,11 @@ fn blob_bounds(idx: &[u8], i: usize, total: usize, data_len: usize, offset: u64)
 // NIP-09 tombstone helpers
 
 /// Scan all stored kind-5 events and populate the tombstone set.
-/// Called once at `Store::open`.
+/// Called once at `Store::open`. At startup the full index is available, so the
+/// pending map will always remain empty (all targets can be looked up immediately).
 fn load_tombstones(index: &[u8], data: &[u8]) -> HashSet<[u8; 32]> {
     let mut set = HashSet::new();
+    let mut pending = HashMap::new();
     let total = index.len() / INDEX_ENTRY_SIZE;
     for (i, entry) in index::iter_entries(index) {
         if entry.kind != KIND_DELETION {
@@ -288,17 +294,25 @@ fn load_tombstones(index: &[u8], data: &[u8]) -> HashSet<[u8; 32]> {
             None => continue,
         };
         if let Ok(ev) = crate::pack::deserialize_trusted(&data[start..end]) {
-            process_deletion_into(&ev, index, &mut set);
+            process_deletion_into(&ev, index, &mut set, &mut pending);
         }
     }
+    // `pending` should be empty here since all events are on disk.
+    // If any remain (corrupt/missing blobs), drop them — we cannot verify ownership.
     set
 }
 
 /// Extract event IDs from a kind-5 event's #e tags and add owned ids to `set`.
-/// Only adds IDs where the deletion request's pubkey matches the target event's pubkey
-/// (or the target is not found - preemptive tombstone).
+/// Only adds IDs where the deletion request's pubkey matches the target event's pubkey.
 /// Never tombstones kind-5 events themselves.
-fn process_deletion_into(k5: &crate::pack::Event, index: &[u8], set: &mut HashSet<[u8; 32]>) {
+/// If the target is not yet in the index, records a pending tombstone keyed by
+/// requester pubkey in `pending` for deferred validation when the target arrives.
+fn process_deletion_into(
+    k5: &crate::pack::Event,
+    index: &[u8],
+    set: &mut HashSet<[u8; 32]>,
+    pending: &mut HashMap<[u8; 32], [u8; 32]>,
+) {
     for tag in &k5.tags {
         if tag.fields.first().map(String::as_str) != Some("e") {
             continue;
@@ -328,8 +342,10 @@ fn process_deletion_into(k5: &crate::pack::Event, index: &[u8], set: &mut HashSe
             }
         }
         if !found {
-            // Target not yet stored - preemptive tombstone.
-            set.insert(id_bytes);
+            // Target not yet stored. Record a pending tombstone so we can verify
+            // ownership when the target event arrives. Do NOT tombstone blindly here —
+            // a different-pubkey event sharing this ID must not be suppressed.
+            pending.insert(id_bytes, k5.pubkey.0);
         }
     }
 }
@@ -384,6 +400,7 @@ impl Store {
                 dtags: dtags_wf,
             }),
             tombstones: RwLock::new(tombstones),
+            pending_tombstones: RwLock::new(HashMap::new()),
             replaceable_live: RwLock::new(HashMap::new()),
             addressable_live: RwLock::new(HashMap::new()),
             vanished: RwLock::new(vanished_set),
@@ -748,16 +765,32 @@ impl Store {
         // NIP-09: update tombstone set BEFORE publishing lengths to readers.
         // This closes the race where a concurrent query could see the kind-5
         // event in the index before its targets are tombstoned.
-        if ev.kind == KIND_DELETION {
+        {
             let mut set = self
                 .tombstones
                 .write()
                 .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?;
-            // Use the pre-publication index: targets of this deletion are already
-            // in the index from earlier appends. The kind-5 event itself is not
-            // yet visible to readers (lengths not published), which is fine since
-            // process_deletion_into looks up target events, not the deletion event.
-            process_deletion_into(ev, &self.index.slice(), &mut set);
+            let mut pending = self
+                .pending_tombstones
+                .write()
+                .map_err(|_| std::io::Error::other("pending_tombstones lock poisoned"))?;
+
+            if ev.kind == KIND_DELETION {
+                // Use the pre-publication index: targets of this deletion are already
+                // in the index from earlier appends. The kind-5 event itself is not
+                // yet visible to readers (lengths not published), which is fine since
+                // process_deletion_into looks up target events, not the deletion event.
+                process_deletion_into(ev, &self.index.slice(), &mut set, &mut pending);
+            }
+
+            // Resolve any pending tombstones that were waiting for this event.
+            // Only tombstone if the pending requester's pubkey matches this event's pubkey.
+            if let Some(requester_pubkey) = pending.remove(&ev.id.0) {
+                if ev.kind != 5 && ev.pubkey.0 == requester_pubkey {
+                    set.insert(ev.id.0);
+                }
+                // pubkey mismatch or kind-5 target: pending entry is dropped silently.
+            }
         }
 
         // Register this event ID for future dedup checks.
@@ -1701,26 +1734,82 @@ mod tests {
     }
 
     #[test]
-    fn test_nip09_preemptive_tombstone() {
+    fn test_nip09_preemptive_tombstone_resolved_on_same_pubkey_arrival() {
+        // A kind-5 that arrives before its target must tombstone the target when
+        // the target event finally arrives — but only if the pubkeys match.
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
 
-        // Delete an event that doesn't exist yet.
-        let future_id = [0xBB; 32];
-        let ref_hex = crate::nostr::hex_encode_bytes(&future_id);
-        let k5 = make_event(
-            1,
-            5,
-            1_700_000_001,
-            vec![Tag {
-                fields: vec!["e".to_owned(), ref_hex],
-            }],
-        );
+        // Build the target event (sk=1) so we know its real id.
+        let target = make_event(1, 1, 1_000, vec![]);
+
+        // Send the kind-5 (same author, sk=1) BEFORE the target event exists.
+        let k5 = make_kind5_event(1, &target.id.0);
         store.append(&k5).unwrap();
 
-        // Now "ingest" a matching event - but we can't actually ingest it with that id
-        // because real id/sig validation would fail. Just verify the tombstone is set.
-        assert!(store.is_tombstoned(&future_id), "preemptive tombstone must be set");
+        // Tombstone must NOT be active yet — target hasn't arrived, pubkey unverified.
+        assert!(
+            !store.is_tombstoned(&target.id.0),
+            "tombstone must not fire before target arrives"
+        );
+
+        // Now ingest the matching target event.
+        store.append(&target).unwrap();
+
+        // Now the tombstone must be resolved (same pubkey confirmed).
+        assert!(
+            store.is_tombstoned(&target.id.0),
+            "tombstone must activate once matching-pubkey target arrives"
+        );
+
+        // And the target must not appear in queries.
+        let mut ids: Vec<[u8; 32]> = Vec::new();
+        store
+            .query(&empty_filter(), |bytes| {
+                let ev = deserialize_trusted(bytes)?;
+                ids.push(ev.id.0);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!ids.contains(&target.id.0), "deleted event must not appear in queries");
+    }
+
+    #[test]
+    fn test_nip09_preemptive_tombstone_cross_pubkey_rejected() {
+        // A kind-5 from pubkey A must NOT tombstone a target event from pubkey B,
+        // even if the kind-5 arrived first (before the target was stored).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // Target event authored by sk=2 (pubkey B).
+        let target = make_event(2, 1, 1_000, vec![]);
+
+        // kind-5 from sk=1 (pubkey A) referencing target's id — arrives FIRST.
+        let k5 = make_kind5_event(1, &target.id.0);
+        store.append(&k5).unwrap();
+
+        // Ingest the actual target event (pubkey B).
+        store.append(&target).unwrap();
+
+        // Tombstone must NOT be set — pubkey A cannot delete pubkey B's event.
+        assert!(
+            !store.is_tombstoned(&target.id.0),
+            "cross-pubkey preemptive tombstone must not suppress target"
+        );
+
+        // Target must still appear in queries.
+        let mut ids: Vec<[u8; 32]> = Vec::new();
+        store
+            .query(&empty_filter(), |bytes| {
+                let ev = deserialize_trusted(bytes)?;
+                ids.push(ev.id.0);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            ids.contains(&target.id.0),
+            "event must remain visible after cross-pubkey preemptive delete attempt"
+        );
     }
 
     #[test]
