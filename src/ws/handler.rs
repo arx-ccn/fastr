@@ -13,7 +13,8 @@ use crate::config::Config;
 use crate::db::Store;
 use crate::error::Error;
 use crate::nostr::{
-    classify_kind, has_protected_tag, parse_client_msg, validate_event, ClientMsg, Filter, KindClass, ServerMsg,
+    classify_kind, has_protected_tag, parse_client_msg, validate_event, validate_sub_id, ClientMsg, Filter,
+    KindClass, ServerMsg,
 };
 use crate::pack::{self, Event, EventId};
 use crate::ws::auth::{verify_auth_event, AuthState};
@@ -235,6 +236,11 @@ where
                         handle_event(*ev, &store, &fanout, &out_tx, &auth).await;
                     }
                     Ok(ClientMsg::Req { sub_id, filters }) => {
+                        if let Err(reason) = validate_sub_id(&sub_id, config.max_subid_length) {
+                            let notice = ServerMsg::Notice { message: &reason }.to_json();
+                            let _ = out_tx.send(Out::Text(notice)).await;
+                            continue;
+                        }
                         handle_req(
                             sub_id, filters, &store, &config, &fanout, &live_tx, &out_tx, &mut subs, &auth,
                         )
@@ -244,9 +250,19 @@ where
                         remove_sub(&sub_id, &mut subs, &fanout, &live_tx).await;
                     }
                     Ok(ClientMsg::Count { sub_id, filters }) => {
+                        if let Err(reason) = validate_sub_id(&sub_id, config.max_subid_length) {
+                            let notice = ServerMsg::Notice { message: &reason }.to_json();
+                            let _ = out_tx.send(Out::Text(notice)).await;
+                            continue;
+                        }
                         handle_count(&sub_id, &filters, &store, &out_tx).await;
                     }
                     Ok(ClientMsg::NegOpen { sub_id, filter, msg }) => {
+                        if let Err(reason) = validate_sub_id(&sub_id, config.max_subid_length) {
+                            let notice = ServerMsg::Notice { message: &reason }.to_json();
+                            let _ = out_tx.send(Out::Text(notice)).await;
+                            continue;
+                        }
                         // If replacing a Live subscription, unsubscribe from fanout first.
                         remove_sub(&sub_id, &mut subs, &fanout, &live_tx).await;
                         handle_neg_open(sub_id, filter, msg, &store, &config, &auth, &out_tx, &mut subs).await;
@@ -409,7 +425,8 @@ async fn handle_req(
     auth: &AuthState,
 ) {
     if subs.len() >= config.max_subscriptions_per_conn && !subs.contains_key(&sub_id) {
-        let msg = ServerMsg::Notice {
+        let msg = ServerMsg::Closed {
+            sub_id: &sub_id,
             message: "too many subscriptions",
         }
         .to_json();
@@ -417,7 +434,8 @@ async fn handle_req(
         return;
     }
     if filters.len() > config.max_filters_per_req {
-        let msg = ServerMsg::Notice {
+        let msg = ServerMsg::Closed {
+            sub_id: &sub_id,
             message: "too many filters",
         }
         .to_json();
@@ -425,10 +443,14 @@ async fn handle_req(
         return;
     }
 
-    // Clamp filter limits.
+    // Clamp filter limits: cap explicit values that exceed max_limit,
+    // and default missing limits to max_limit so the configured ceiling
+    // is always enforced (see issue #17).
     for f in &mut filters {
-        if f.limit.map(|l| l > config.max_limit).unwrap_or(false) {
-            f.limit = Some(config.max_limit);
+        match f.limit {
+            Some(l) if l > config.max_limit => f.limit = Some(config.max_limit),
+            None => f.limit = Some(config.max_limit),
+            _ => {}
         }
     }
 
@@ -1819,6 +1841,68 @@ mod tests {
         assert!(
             v[1].as_str().unwrap_or("").contains("too many"),
             "NOTICE should mention subscription limit: {resp}",
+        );
+    }
+
+    /// Verifies that omitting the `limit` field in a REQ filter respects `max_limit` config.
+    ///
+    /// Stores more events than max_limit allows, sends a REQ without a `limit` field,
+    /// and asserts that the number of returned events does not exceed max_limit.
+    /// Regression test for issue #17.
+    #[tokio::test]
+    async fn test_omitted_limit_respects_max_limit() {
+        // Spawn a server with a low max_limit so we can test the cap.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.keep()).unwrap());
+        let config = Arc::new(Config {
+            relay_url: format!("ws://127.0.0.1:{port}"),
+            max_limit: 5,
+            ..Config::default()
+        });
+        let fanout = Fanout::new();
+        let srv_store = Arc::clone(&store);
+        let srv_config = Arc::clone(&config);
+        let srv_fanout = Arc::clone(&fanout);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, peer)) = listener.accept().await {
+                    let s = Arc::clone(&srv_store);
+                    let c = Arc::clone(&srv_config);
+                    let f = Arc::clone(&srv_fanout);
+                    tokio::spawn(async move {
+                        let _ = handle_connection(stream, peer, s, c, f).await;
+                    });
+                }
+            }
+        });
+
+        // Store 10 events, more than the max_limit of 5.
+        for i in 1u8..=10 {
+            store.append(&make_event(i, 1, i as i64 * 1000, vec![])).unwrap();
+        }
+
+        let mut ws = connect(port).await;
+        // REQ with no limit field -- should be clamped to max_limit (5).
+        ws.send(TMsg::Text(r#"["REQ","s1",{"kinds":[1]}]"#.into()))
+            .await
+            .unwrap();
+
+        let mut event_count = 0;
+        loop {
+            let resp = recv_text(&mut ws).await;
+            let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            match v[0].as_str().unwrap() {
+                "EVENT" => event_count += 1,
+                "EOSE" => break,
+                other => panic!("unexpected message type: {other}"),
+            }
+        }
+
+        assert_eq!(
+            event_count, 5,
+            "omitting limit should return at most max_limit events, got {event_count}"
         );
     }
 }

@@ -106,21 +106,11 @@ pub fn matches(entry: &IndexEntry, filter: &Filter) -> bool {
     if !filter.kinds.is_empty() && !filter.kinds.contains(&entry.kind) {
         return false;
     }
-    if !filter.authors.is_empty() && !filter.authors.iter().any(|pk| pk.0 == entry.pubkey) {
+    if !filter.authors.is_empty() && !filter.authors.iter().any(|pk| pk.matches(&entry.pubkey)) {
         return false;
     }
-    if !filter.ids.is_empty() {
-        // NIP-01: ids entries are prefix matches - shorter hex = fewer bytes to compare.
-        let found = filter.ids.iter().any(|id| {
-            // id.0 is always 32 bytes but the filter may have decoded a shorter prefix.
-            // Since parse_filter always decodes full 32-byte ids, we do exact match here.
-            // Prefix support: treat leading zeros as the mask length via value_len stored
-            // in the Filter. For now ids are decoded as full 32-byte - exact match only.
-            id.0 == entry.id
-        });
-        if !found {
-            return false;
-        }
+    if !filter.ids.is_empty() && !filter.ids.iter().any(|id| id.matches(&entry.id)) {
+        return false;
     }
     true
 }
@@ -128,8 +118,7 @@ pub fn matches(entry: &IndexEntry, filter: &Filter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nostr::Filter;
-    use crate::pack::{EventId, Pubkey};
+    use crate::nostr::{Filter, HexPrefix};
 
     fn entry(kind: u16, created_at: i64, id: [u8; 32], pubkey: [u8; 32]) -> IndexEntry {
         IndexEntry::new(0, created_at, 0, kind, id, pubkey)
@@ -196,9 +185,9 @@ mod tests {
         let pk = [0xAA; 32];
         let e = entry(1, 0, [0u8; 32], pk);
         let mut f = empty_filter();
-        f.authors = vec![Pubkey(pk)];
+        f.authors = vec![HexPrefix { bytes: pk, len: 32 }];
         assert!(matches(&e, &f));
-        f.authors = vec![Pubkey([0xBB; 32])];
+        f.authors = vec![HexPrefix { bytes: [0xBB; 32], len: 32 }];
         assert!(!matches(&e, &f));
     }
 
@@ -207,9 +196,42 @@ mod tests {
         let id = [0x11; 32];
         let e = entry(1, 0, id, [0u8; 32]);
         let mut f = empty_filter();
-        f.ids = vec![EventId(id)];
+        f.ids = vec![HexPrefix { bytes: id, len: 32 }];
         assert!(matches(&e, &f));
-        f.ids = vec![EventId([0x22; 32])];
+        f.ids = vec![HexPrefix { bytes: [0x22; 32], len: 32 }];
+        assert!(!matches(&e, &f));
+    }
+
+    #[test]
+    fn test_matches_ids_prefix() {
+        let id = [0xab; 32];
+        let e = entry(1, 0, id, [0u8; 32]);
+        let mut f = empty_filter();
+        // 1-byte prefix 0xab should match
+        let mut prefix_bytes = [0u8; 32];
+        prefix_bytes[0] = 0xab;
+        f.ids = vec![HexPrefix { bytes: prefix_bytes, len: 1 }];
+        assert!(matches(&e, &f));
+        // 1-byte prefix 0xac should not match
+        prefix_bytes[0] = 0xac;
+        f.ids = vec![HexPrefix { bytes: prefix_bytes, len: 1 }];
+        assert!(!matches(&e, &f));
+    }
+
+    #[test]
+    fn test_matches_authors_prefix() {
+        let pk = [0xcd; 32];
+        let e = entry(1, 0, [0u8; 32], pk);
+        let mut f = empty_filter();
+        // 2-byte prefix
+        let mut prefix_bytes = [0u8; 32];
+        prefix_bytes[0] = 0xcd;
+        prefix_bytes[1] = 0xcd;
+        f.authors = vec![HexPrefix { bytes: prefix_bytes, len: 2 }];
+        assert!(matches(&e, &f));
+        // Wrong second byte
+        prefix_bytes[1] = 0xce;
+        f.authors = vec![HexPrefix { bytes: prefix_bytes, len: 2 }];
         assert!(!matches(&e, &f));
     }
 }
