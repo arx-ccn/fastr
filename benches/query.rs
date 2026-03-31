@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use fastr::db::Store;
-use fastr::nostr::{canonical_json, Filter};
+use fastr::nostr::{canonical_json, Filter, HexPrefix};
 use fastr::pack::{Event, EventId, Pubkey, Sig, Tag};
 
 // Event generation - use a small set of private keys to create variety.
@@ -136,10 +136,9 @@ fn kind_filter(kinds: &[u16]) -> Filter {
 }
 
 fn author_filter(pk: &[u8; 32]) -> Filter {
-    use fastr::pack::Pubkey;
     Filter {
         ids: vec![],
-        authors: vec![Pubkey(*pk)],
+        authors: vec![HexPrefix { bytes: *pk, len: 32 }],
         kinds: vec![],
         since: None,
         until: None,

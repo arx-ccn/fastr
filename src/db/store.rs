@@ -224,6 +224,13 @@ pub(crate) type AddressableKey = ([u8; 32], u16, [u8; 32]);
 /// Tag filter spec: tag_letter prefix byte + list of (value_hash, prefix_len) pairs.
 pub(crate) type TagSpec = (u8, Vec<([u8; 32], u8)>);
 
+/// Tombstone map value type.
+/// `None` = confirmed tombstone (pubkey verified or non-NIP-09 origin).
+/// `Some(set)` = preemptive tombstone (target not yet seen; set holds candidate deletion pubkeys).
+type TombstoneValue = Option<HashSet<[u8; 32]>>;
+/// Full tombstone map type alias, used to satisfy clippy's `type_complexity` lint.
+type TombstoneMap = HashMap<[u8; 32], TombstoneValue>;
+
 // Store - the public storage handle.
 //
 // Each of the four files has a MappedFile (ArcSwap mmap + AtomicU64 length) for
@@ -237,9 +244,11 @@ pub struct Store {
     writer: Mutex<StoreWriter>,
     /// NIP-09 tombstone map: event IDs that have been deleted by a kind-5 request.
     /// `None` = confirmed tombstone (pubkey verified or non-NIP-09 origin like vanish/replaceable).
-    /// `Some(pubkey)` = preemptive tombstone (target not yet seen; needs pubkey verification on arrival).
+    /// `Some(set)` = preemptive tombstone (target not yet seen; set holds all candidate deletion
+    ///   pubkeys from kind-5 events that arrived before the target). Multiple kind-5 events may
+    ///   reference the same not-yet-seen event ID, so all candidates are preserved.
     /// `std::sync::RwLock` (not tokio's) - critical section is always short (HashMap lookup).
-    tombstones: RwLock<HashMap<[u8; 32], Option<[u8; 32]>>>,
+    tombstones: RwLock<TombstoneMap>,
     /// In-memory map for replaceable event dedup: (pubkey, kind) -> LiveEntry
     replaceable_live: RwLock<HashMap<([u8; 32], u16), LiveEntry>>,
     /// In-memory map for addressable event dedup: (pubkey, kind, d_hash) -> LiveEntry
@@ -359,7 +368,7 @@ fn blob_bounds(idx: &[u8], i: usize, total: usize, data_len: usize, offset: u64)
 /// Builds a temporary HashMap of id->(kind, pubkey) for O(1) e-tag lookups,
 /// avoiding O(N*M) linear scan per deletion tag. Also passes dtags for
 /// a-tag (addressable event) deletion resolution.
-fn load_tombstones(index: &[u8], data: &[u8], dtags: &[u8]) -> HashMap<[u8; 32], Option<[u8; 32]>> {
+fn load_tombstones(index: &[u8], data: &[u8], dtags: &[u8]) -> TombstoneMap {
     let mut map = HashMap::new();
     let total = index.len() / INDEX_ENTRY_SIZE;
 
@@ -392,12 +401,8 @@ fn load_tombstones(index: &[u8], data: &[u8], dtags: &[u8]) -> HashMap<[u8; 32],
 /// Confirmed tombstones are stored as `None` (pubkey verified). Preemptive
 /// tombstones are stored as `Some(deletion_pubkey)` (pending verification).
 /// `max_preemptive` caps preemptive entries to bound memory growth.
-fn process_e_tag_deletion_core<F>(
-    k5: &crate::pack::Event,
-    mut lookup: F,
-    map: &mut HashMap<[u8; 32], Option<[u8; 32]>>,
-    max_preemptive: usize,
-) where
+fn process_e_tag_deletion_core<F>(k5: &crate::pack::Event, mut lookup: F, map: &mut TombstoneMap, max_preemptive: usize)
+where
     F: FnMut(&[u8; 32]) -> Option<(u16, [u8; 32])>,
 {
     for tag in &k5.tags {
@@ -424,11 +429,27 @@ fn process_e_tag_deletion_core<F>(
                 // pubkey mismatch - skip silently.
             }
             None => {
-                // Target not yet stored - preemptive tombstone with deletion pubkey.
-                // Cap preemptive tombstones to prevent unbounded memory growth.
-                let pending_count = map.values().filter(|v| v.is_some()).count();
-                if pending_count < max_preemptive {
-                    map.insert(id_bytes, Some(k5.pubkey.0));
+                // Target not yet stored - add this deletion pubkey to the preemptive
+                // candidate set. Multiple kind-5 events may reference the same future ID,
+                // so all candidate pubkeys are preserved (insert/extend, never replace).
+                // Cap total preemptive entries to prevent unbounded memory growth.
+                match map.get_mut(&id_bytes) {
+                    Some(Some(set)) => {
+                        // Entry already exists as pending - just add the candidate.
+                        set.insert(k5.pubkey.0);
+                    }
+                    Some(None) => {
+                        // Already confirmed - nothing to do.
+                    }
+                    None => {
+                        // New preemptive entry: only create if under the cap.
+                        let pending_count = map.values().filter(|v| v.is_some()).count();
+                        if pending_count < max_preemptive {
+                            let mut set = HashSet::new();
+                            set.insert(k5.pubkey.0);
+                            map.insert(id_bytes, Some(set));
+                        }
+                    }
                 }
             }
         }
@@ -442,7 +463,7 @@ fn process_deletion_with_map(
     id_map: &HashMap<[u8; 32], (u16, [u8; 32])>,
     index: &[u8],
     dtags: &[u8],
-    map: &mut HashMap<[u8; 32], Option<[u8; 32]>>,
+    map: &mut TombstoneMap,
 ) {
     // O(1) e-tag resolution via HashMap.
     process_e_tag_deletion_core(k5, |id| id_map.get(id).copied(), map, MAX_PREEMPTIVE_TOMBSTONES);
@@ -459,12 +480,7 @@ fn process_deletion_with_map(
 /// `e` tags, then resolves them in a single O(M) pass over the index instead
 /// of O(N*M) where N = number of e-tags and M = index size. Also handles
 /// `a`-tag deletion via dtags index scanning.
-fn process_deletion_into(
-    k5: &crate::pack::Event,
-    index: &[u8],
-    dtags: &[u8],
-    map: &mut HashMap<[u8; 32], Option<[u8; 32]>>,
-) {
+fn process_deletion_into(k5: &crate::pack::Event, index: &[u8], dtags: &[u8], map: &mut TombstoneMap) {
     // First pass: collect all target IDs from the event's e-tags.
     let mut targets: HashSet<[u8; 32]> = HashSet::new();
     for tag in &k5.tags {
@@ -483,8 +499,7 @@ fn process_deletion_into(
 
     if !targets.is_empty() {
         // Single pass over the index: resolve only the IDs we care about.
-        let mut resolved: HashMap<[u8; 32], (u16, [u8; 32])> =
-            HashMap::with_capacity(targets.len());
+        let mut resolved: HashMap<[u8; 32], (u16, [u8; 32])> = HashMap::with_capacity(targets.len());
         for (_, entry) in index::iter_entries(index) {
             if targets.contains(&entry.id) {
                 resolved.insert(entry.id, (entry.kind, entry.pubkey));
@@ -513,7 +528,7 @@ fn process_a_tag_deletion(
     tag: &crate::pack::Tag,
     index: &[u8],
     dtags: &[u8],
-    map: &mut HashMap<[u8; 32], Option<[u8; 32]>>,
+    map: &mut TombstoneMap,
 ) {
     use crate::db::dtags::{DtagEntry, DTAG_ENTRY_SIZE};
     use sha2::{Digest, Sha256};
@@ -569,8 +584,7 @@ fn process_a_tag_deletion(
     let mut matching_offsets = Vec::new();
     for i in 0..dtags_total {
         let off = i * DTAG_ENTRY_SIZE;
-        let dt_bytes: &[u8; DTAG_ENTRY_SIZE] =
-            dtags[off..off + DTAG_ENTRY_SIZE].try_into().unwrap();
+        let dt_bytes: &[u8; DTAG_ENTRY_SIZE] = dtags[off..off + DTAG_ENTRY_SIZE].try_into().unwrap();
         let dt = DtagEntry::from_bytes(dt_bytes);
         if dt.kind == kind && dt.pubkey == coord_pubkey && dt.d_hash == d_hash {
             matching_offsets.push(dt.data_offset);
@@ -685,23 +699,26 @@ impl Store {
                 let Ok(counts) = self.author_counts.read() else {
                     return 0;
                 };
-                filter
-                    .authors
-                    .iter()
-                    .map(|a| {
-                        if a.len == 32 {
-                            // Exact pubkey - direct lookup
-                            counts.get(&a.bytes).copied().unwrap_or(0)
-                        } else {
-                            // Prefix match - must scan all authors (rare case)
-                            counts
-                                .iter()
-                                .filter(|(k, _)| a.matches(k))
-                                .map(|(_, &v)| v)
-                                .sum()
+                // Collect the union of all matching author keys first, then sum
+                // once per unique key. This prevents double-counting when filter
+                // prefixes overlap (e.g. ["ab", "abcd"] both match "abcd...").
+                let mut matching_keys: HashSet<[u8; 32]> = HashSet::new();
+                for a in &filter.authors {
+                    if a.len == 32 {
+                        // Exact pubkey - O(1) check.
+                        if counts.contains_key(&a.bytes) {
+                            matching_keys.insert(a.bytes);
                         }
-                    })
-                    .sum()
+                    } else {
+                        // Prefix match - must scan all authors (rare case).
+                        for k in counts.keys() {
+                            if a.matches(k) {
+                                matching_keys.insert(*k);
+                            }
+                        }
+                    }
+                }
+                matching_keys.iter().map(|k| counts.get(k).copied().unwrap_or(0)).sum()
             }
             _ => 0, // combined or empty - unsupported
         }
@@ -1034,12 +1051,12 @@ impl Store {
                 .tombstones
                 .write()
                 .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?;
-            if let Some(Some(deletion_pubkey)) = ts.get(&ev.id.0).copied() {
-                if deletion_pubkey == ev.pubkey.0 {
-                    // Pubkey matches: promote to confirmed tombstone.
+            if let Some(Some(candidates)) = ts.get(&ev.id.0) {
+                if candidates.contains(&ev.pubkey.0) {
+                    // At least one candidate pubkey matches: promote to confirmed tombstone.
                     ts.insert(ev.id.0, None);
                 } else {
-                    // Pubkey mismatch: discard the invalid preemptive tombstone.
+                    // No candidate matches this event's author: discard the preemptive entry.
                     ts.remove(&ev.id.0);
                 }
             }
@@ -1344,7 +1361,11 @@ impl Store {
         Ok(())
     }
 
-    /// Returns the number of tombstoned events.
+    /// Returns the number of confirmed tombstoned events (entries with value `None`).
+    ///
+    /// Pending (preemptive) tombstones where the deletion pubkey has not yet been
+    /// verified are excluded. Compaction should only trigger on confirmed tombstones
+    /// to avoid spurious compaction runs driven by preemptive-only entries.
     ///
     /// Returns an error if the tombstone lock is poisoned.
     pub fn tombstone_count(&self) -> Result<usize, Error> {
@@ -1352,7 +1373,23 @@ impl Store {
             .tombstones
             .read()
             .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?
-            .len())
+            .values()
+            .filter(|v| v.is_none())
+            .count())
+    }
+
+    /// Returns the number of pending (preemptive) tombstone entries — kind-5 events
+    /// that referenced a target event not yet seen. Exposed for metrics/diagnostics.
+    ///
+    /// Returns an error if the tombstone lock is poisoned.
+    pub fn pending_tombstone_count(&self) -> Result<usize, Error> {
+        Ok(self
+            .tombstones
+            .read()
+            .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?
+            .values()
+            .filter(|v| v.is_some())
+            .count())
     }
 
     /// Run compaction: rewrite data.n, index.o, tags.s, dtags.t
@@ -2039,7 +2076,9 @@ mod tests {
         // by inserting a preemptive tombstone directly.
         {
             let mut ts = store.tombstones.write().unwrap();
-            ts.insert(target.id.0, Some(target.pubkey.0)); // Same pubkey = will match
+            let mut set = HashSet::new();
+            set.insert(target.pubkey.0); // Same pubkey = will match
+            ts.insert(target.id.0, Some(set));
         }
 
         // Now append the target. append() should verify pubkey and promote.
@@ -2064,7 +2103,9 @@ mod tests {
             let mut ts = store.tombstones.write().unwrap();
             let mut wrong_pubkey = [0u8; 32];
             wrong_pubkey[0] = 0xFF; // Different from target's pubkey
-            ts.insert(target.id.0, Some(wrong_pubkey));
+            let mut set = HashSet::new();
+            set.insert(wrong_pubkey);
+            ts.insert(target.id.0, Some(set));
         }
 
         // Append target. Pubkey mismatch should discard the tombstone.
@@ -2079,6 +2120,49 @@ mod tests {
         assert!(
             !ts.contains_key(&target.id.0),
             "mismatched tombstone must be removed entirely"
+        );
+    }
+
+    #[test]
+    fn test_nip09_preemptive_multi_candidate_preserved() {
+        // Two different kind-5 events from two different pubkeys both reference
+        // the same not-yet-stored event. The preemptive set must hold both
+        // candidates; the event is confirmed only when the matching author arrives.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // The target event that hasn't arrived yet.
+        let future_target = make_event(1, 1, 1_000, vec![]);
+
+        // Two kind-5 events from two different authors targeting the same ID.
+        // One from the correct author (sk=1) and one from a stranger (sk=2).
+        let k5_correct = make_kind5_event(1, &future_target.id.0);
+        let k5_wrong = make_kind5_event(2, &future_target.id.0);
+        store.append(&k5_correct).unwrap();
+        store.append(&k5_wrong).unwrap();
+
+        // Neither pubkey has been verified yet - tombstone is still preemptive.
+        assert!(!store.is_tombstoned(&future_target.id.0), "preemptive: not confirmed");
+
+        // Both candidates must be in the set.
+        {
+            let ts = store.tombstones.read().unwrap();
+            match ts.get(&future_target.id.0) {
+                Some(Some(set)) => {
+                    assert_eq!(set.len(), 2, "both candidate pubkeys must be preserved");
+                    assert!(set.contains(&k5_correct.pubkey.0));
+                    assert!(set.contains(&k5_wrong.pubkey.0));
+                }
+                other => panic!("expected pending set, got {:?}", other.map(|v| v.is_some())),
+            }
+        }
+
+        // Now the target arrives from the correct author (sk=1).
+        // The tombstone must be promoted to confirmed.
+        store.append(&future_target).unwrap();
+        assert!(
+            store.is_tombstoned(&future_target.id.0),
+            "tombstone must be confirmed when matching author arrives"
         );
     }
 
@@ -2131,9 +2215,15 @@ mod tests {
             5,
             4_000,
             vec![
-                Tag { fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t1.id.0)] },
-                Tag { fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t2.id.0)] },
-                Tag { fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t3.id.0)] },
+                Tag {
+                    fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t1.id.0)],
+                },
+                Tag {
+                    fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t2.id.0)],
+                },
+                Tag {
+                    fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t3.id.0)],
+                },
             ],
         );
         store.append(&k5).unwrap();
@@ -2171,8 +2261,12 @@ mod tests {
                 5,
                 3_000,
                 vec![
-                    Tag { fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t1.id.0)] },
-                    Tag { fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t2.id.0)] },
+                    Tag {
+                        fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t1.id.0)],
+                    },
+                    Tag {
+                        fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&t2.id.0)],
+                    },
                 ],
             );
             store.append(&k5).unwrap();
@@ -2204,8 +2298,12 @@ mod tests {
             5,
             3_000,
             vec![
-                Tag { fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&own.id.0)] },
-                Tag { fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&other.id.0)] },
+                Tag {
+                    fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&own.id.0)],
+                },
+                Tag {
+                    fields: vec!["e".to_owned(), crate::nostr::hex_encode_bytes(&other.id.0)],
+                },
             ],
         );
         store.append(&k5).unwrap();
@@ -2853,10 +2951,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(
-            !ids.contains(&target.id.0),
-            "a-tag deleted event must not appear"
-        );
+        assert!(!ids.contains(&target.id.0), "a-tag deleted event must not appear");
         assert!(ids.contains(&k5.id.0), "kind-5 itself must appear");
     }
 
@@ -2945,10 +3040,7 @@ mod tests {
 
         // Second session: tombstone must be rebuilt from disk.
         let store = Store::open(dir.path()).unwrap();
-        assert!(
-            store.is_tombstoned(&target_id),
-            "a-tag tombstone must survive restart"
-        );
+        assert!(store.is_tombstoned(&target_id), "a-tag tombstone must survive restart");
     }
 
     #[test]
@@ -3012,12 +3104,18 @@ mod tests {
             store.append(&k5).unwrap();
         }
 
-        let count = store.tombstone_count().unwrap();
-        // All 200 should be preemptive tombstones (none exist in index).
-        assert_eq!(count, batch, "all preemptive tombstones should be stored under the cap");
+        // All 200 are preemptive (targets never arrived) - confirmed count must be 0.
+        let confirmed = store.tombstone_count().unwrap();
+        assert_eq!(confirmed, 0, "no confirmed tombstones when all targets are unseen");
+        // pending_tombstone_count should reflect the 200 preemptive entries.
+        let pending = store.pending_tombstone_count().unwrap();
+        assert_eq!(
+            pending, batch,
+            "all preemptive tombstones should be stored under the cap"
+        );
         assert!(
-            count <= MAX_PREEMPTIVE_TOMBSTONES,
-            "tombstone count {count} must not exceed cap {MAX_PREEMPTIVE_TOMBSTONES}"
+            pending <= MAX_PREEMPTIVE_TOMBSTONES,
+            "pending tombstone count {pending} must not exceed cap {MAX_PREEMPTIVE_TOMBSTONES}"
         );
     }
 
@@ -3025,7 +3123,7 @@ mod tests {
     fn test_preemptive_tombstone_cap_stops_growth() {
         // Verify the cap stops growth using process_e_tag_deletion_core with a small cap.
         let max = 5;
-        let mut map: HashMap<[u8; 32], Option<[u8; 32]>> = HashMap::new();
+        let mut map: TombstoneMap = HashMap::new();
 
         // First batch: fill to cap.
         let tags1: Vec<Tag> = (0..max as u8)
@@ -3059,7 +3157,7 @@ mod tests {
     fn test_preemptive_tombstone_cap_allows_confirmed() {
         // Confirmed tombstones (target exists, pubkey matches) bypass the cap.
         let max = 2;
-        let mut map: HashMap<[u8; 32], Option<[u8; 32]>> = HashMap::new();
+        let mut map: TombstoneMap = HashMap::new();
 
         // Fill to cap with preemptive tombstones.
         let tags: Vec<Tag> = (0..2u8)

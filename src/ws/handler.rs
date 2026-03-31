@@ -13,8 +13,8 @@ use crate::config::Config;
 use crate::db::Store;
 use crate::error::Error;
 use crate::nostr::{
-    classify_kind, has_protected_tag, parse_client_msg, validate_event, validate_sub_id, ClientMsg, Filter,
-    KindClass, ServerMsg,
+    classify_kind, has_protected_tag, parse_client_msg, validate_event, validate_sub_id, ClientMsg, Filter, KindClass,
+    ServerMsg,
 };
 use crate::pack::{self, Event, EventId};
 use crate::ws::auth::{verify_auth_event, AuthState};
@@ -247,6 +247,11 @@ where
                         .await;
                     }
                     Ok(ClientMsg::Close { sub_id }) | Ok(ClientMsg::NegClose { sub_id }) => {
+                        if let Err(reason) = validate_sub_id(&sub_id, config.max_subid_length) {
+                            let notice = ServerMsg::Notice { message: &reason }.to_json();
+                            let _ = out_tx.send(Out::Text(notice)).await;
+                            continue;
+                        }
                         remove_sub(&sub_id, &mut subs, &fanout, &live_tx).await;
                     }
                     Ok(ClientMsg::Count { sub_id, filters }) => {
