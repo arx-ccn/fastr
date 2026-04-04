@@ -1479,6 +1479,12 @@ impl Store {
         let tags_slice = self.tags.slice();
         let dtags_slice = self.dtags.slice();
 
+        // Record snapshot offsets so we can detect events appended during compaction.
+        let snap_data_len = data_slice.len() as u64;
+        let snap_index_len = idx_slice.len() as u64;
+        let snap_tags_len = tags_slice.len() as u64;
+        let snap_dtags_len = dtags_slice.len() as u64;
+
         let total = idx_slice.len() / INDEX_ENTRY_SIZE;
         if total == 0 {
             return Ok(0);
@@ -1623,11 +1629,101 @@ impl Store {
         drop(new_tags);
         drop(new_dtags);
 
-        // Phase 3: Lock writer, rename temps over originals, swap mmaps.
+        // Phase 3: Lock writer, copy any post-snapshot delta, rename temps over originals, swap mmaps.
         let mut w = self
             .writer
             .lock()
             .map_err(|_| std::io::Error::other("writer lock poisoned"))?;
+
+        // Re-read current state under the writer lock. Events appended between
+        // phase 1 snapshot and now are in the range [snap_*_len .. w.*.offset].
+        // We must copy these delta bytes into the compacted files before renaming,
+        // adjusting data_offset fields in index/tag/dtag entries so they point at
+        // the correct positions within the new compacted data file.
+        if w.data.offset > snap_data_len {
+            let cur_data = self.data.slice();
+            let cur_idx = self.index.slice();
+            let cur_tags = self.tags.slice();
+            let cur_dtags = self.dtags.slice();
+
+            // The offset shift: old data_offset values in the delta are relative
+            // to the old file. In the compacted file, those blobs will start at
+            // new_data_offset instead of snap_data_len.
+            let data_shift = new_data_offset as i64 - snap_data_len as i64;
+
+            // Append delta data blobs.
+            let delta_data = &cur_data[snap_data_len as usize..w.data.offset as usize];
+            let mut new_data = OpenOptions::new().append(true).open(&tmp_data_path)?;
+            new_data.write_all(delta_data)?;
+            new_data.flush()?;
+            new_data_offset += delta_data.len() as u64;
+
+            // Append delta index entries with adjusted data_offset.
+            let delta_idx = &cur_idx[snap_index_len as usize..w.index.offset as usize];
+            let delta_idx_count = delta_idx.len() / INDEX_ENTRY_SIZE;
+            let mut new_index = OpenOptions::new().append(true).open(&tmp_index_path)?;
+            for j in 0..delta_idx_count {
+                let b: &[u8; INDEX_ENTRY_SIZE] = delta_idx[j * INDEX_ENTRY_SIZE..(j + 1) * INDEX_ENTRY_SIZE]
+                    .try_into()
+                    .unwrap();
+                let entry = IndexEntry::from_bytes(b);
+                let adjusted = IndexEntry::new(
+                    (entry.offset as i64 + data_shift) as u64,
+                    entry.created_at,
+                    entry.expiry,
+                    entry.kind,
+                    entry.id,
+                    entry.pubkey,
+                );
+                new_index.write_all(&adjusted.to_bytes())?;
+                new_index_offset += INDEX_ENTRY_SIZE as u64;
+            }
+            new_index.flush()?;
+
+            // Append delta tag entries with adjusted data_offset.
+            if w.tags.offset > snap_tags_len {
+                let delta_tags = &cur_tags[snap_tags_len as usize..w.tags.offset as usize];
+                let delta_tags_count = delta_tags.len() / tags::TAG_ENTRY_SIZE;
+                let mut new_tags = OpenOptions::new().append(true).open(&tmp_tags_path)?;
+                for j in 0..delta_tags_count {
+                    let b: &[u8; tags::TAG_ENTRY_SIZE] = delta_tags[j * tags::TAG_ENTRY_SIZE..(j + 1) * tags::TAG_ENTRY_SIZE]
+                        .try_into()
+                        .unwrap();
+                    let te = tags::TagEntry::from_bytes(b);
+                    let new_te = tags::TagEntry {
+                        data_offset: (te.data_offset as i64 + data_shift) as u64,
+                        tag_name: te.tag_name,
+                        tag_value: te.tag_value,
+                        value_len: te.value_len,
+                    };
+                    new_tags.write_all(&new_te.to_bytes())?;
+                    new_tags_offset += tags::TAG_ENTRY_SIZE as u64;
+                }
+                new_tags.flush()?;
+            }
+
+            // Append delta dtag entries with adjusted data_offset.
+            if w.dtags.offset > snap_dtags_len {
+                let delta_dtags = &cur_dtags[snap_dtags_len as usize..w.dtags.offset as usize];
+                let delta_dtags_count = delta_dtags.len() / DTAG_ENTRY_SIZE;
+                let mut new_dtags = OpenOptions::new().append(true).open(&tmp_dtags_path)?;
+                for j in 0..delta_dtags_count {
+                    let b: &[u8; DTAG_ENTRY_SIZE] = delta_dtags[j * DTAG_ENTRY_SIZE..(j + 1) * DTAG_ENTRY_SIZE]
+                        .try_into()
+                        .unwrap();
+                    let de = DtagEntry::from_bytes(b);
+                    let new_de = DtagEntry {
+                        data_offset: (de.data_offset as i64 + data_shift) as u64,
+                        kind: de.kind,
+                        pubkey: de.pubkey,
+                        d_hash: de.d_hash,
+                    };
+                    new_dtags.write_all(&new_de.to_bytes())?;
+                    new_dtags_offset += DTAG_ENTRY_SIZE as u64;
+                }
+                new_dtags.flush()?;
+            }
+        }
 
         // Rename temp files over originals.
         std::fs::rename(&tmp_data_path, self.dir.join("data.n"))?;
@@ -3264,5 +3360,65 @@ mod tests {
             matches!(tracker.map.get(&confirmed_id), Some(None)),
             "confirmed tombstone must have None value"
         );
+    }
+
+    #[test]
+    fn test_compact_preserves_events_appended_during_compaction() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+
+        // Seed enough events + a tombstone so compaction has work to do.
+        let target = make_event(1, 1, 100, vec![]);
+        store.append(&target).unwrap();
+        let k5 = make_kind5_event(1, &target.id.0);
+        store.append(&k5).unwrap();
+        // Add many live events to make phase 2 take non-trivial time.
+        for i in 0..200u16 {
+            let ev = make_event(2, i + 10, 1000 + i as i64, vec![]);
+            store.append(&ev).unwrap();
+        }
+
+        // Barrier so the append thread starts at the same time as compaction.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let store2 = Arc::clone(&store);
+        let barrier2 = Arc::clone(&barrier);
+        let handle = std::thread::spawn(move || {
+            barrier2.wait();
+            // Append events while compaction is running.
+            let mut appended = Vec::new();
+            for i in 0..50u16 {
+                let ev = make_event(3, i + 500, 5000 + i as i64, vec![]);
+                // Some appends may race with the lock; that's fine.
+                if store2.append(&ev).is_ok() {
+                    appended.push(ev.id.0);
+                }
+            }
+            appended
+        });
+
+        barrier.wait();
+        store.compact().unwrap();
+
+        let appended_ids = handle.join().unwrap();
+
+        // Every event that was successfully appended must be queryable.
+        let mut found_ids = std::collections::HashSet::new();
+        store
+            .query(&empty_filter(), |bytes| {
+                let ev = deserialize_trusted(bytes).unwrap();
+                found_ids.insert(ev.id.0);
+                Ok(())
+            })
+            .unwrap();
+
+        for id in &appended_ids {
+            assert!(
+                found_ids.contains(id),
+                "event appended during compaction must survive"
+            );
+        }
     }
 }
