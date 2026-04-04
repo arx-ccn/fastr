@@ -83,8 +83,7 @@ pub fn has_protected_tag(tags: &[Tag]) -> bool {
 /// A hex prefix for NIP-01 filter matching on `ids` and `authors`.
 /// Stores up to 32 bytes with an explicit length so that short hex prefixes
 /// (e.g. "aabb") match any value that starts with those bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HexPrefix {
     /// Decoded bytes, zero-padded to 32.
     pub bytes: [u8; 32],
@@ -99,7 +98,6 @@ impl HexPrefix {
         value[..self.len] == self.bytes[..self.len]
     }
 }
-
 
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
