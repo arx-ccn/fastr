@@ -1,0 +1,57 @@
+{
+  "timestamp": "2026-04-04T09:29:50Z",
+  "commit": "000da3e",
+  "benchmarks": {
+    "deserialize_trusted": {
+      "median_ns": 251.53147137704616
+    },
+    "hex_decode_64": {
+      "median_ns": 32.35951086609153
+    },
+    "hex_encode_32": {
+      "median_ns": 21.42236666009837
+    },
+    "parse_client_msg": {
+      "median_ns": 1374.1170875992038
+    },
+    "query_by_author/10000": {
+      "median_ns": 344244.09829059825
+    },
+    "query_by_author/100000": {
+      "median_ns": 354658.5868347339
+    },
+    "query_by_kind/10000": {
+      "median_ns": 396320.2219954649
+    },
+    "query_by_kind/100000": {
+      "median_ns": 4111657.846153846
+    },
+    "query_by_tag_e/10000": {
+      "median_ns": 360681.03205128206
+    },
+    "query_by_tag_e/100000": {
+      "median_ns": 823714.307728647
+    },
+    "serialize": {
+      "median_ns": 207.22664684905482
+    },
+    "serialize_fast": {
+      "median_ns": 92.3969259904002
+    },
+    "transcode_vs_deser/deser+json/10000": {
+      "median_ns": 394120.31944444444
+    },
+    "transcode_vs_deser/deser+json/100000": {
+      "median_ns": 4206698.653846154
+    },
+    "transcode_vs_deser/transcode/10000": {
+      "median_ns": 400544.7247863248
+    },
+    "transcode_vs_deser/transcode/100000": {
+      "median_ns": 4203900.375
+    },
+    "validate_event": {
+      "median_ns": 44406.08360769665
+    }
+  }
+}
