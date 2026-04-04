@@ -1686,7 +1686,8 @@ impl Store {
                 let delta_tags_count = delta_tags.len() / tags::TAG_ENTRY_SIZE;
                 let mut new_tags = OpenOptions::new().append(true).open(&tmp_tags_path)?;
                 for j in 0..delta_tags_count {
-                    let b: &[u8; tags::TAG_ENTRY_SIZE] = delta_tags[j * tags::TAG_ENTRY_SIZE..(j + 1) * tags::TAG_ENTRY_SIZE]
+                    let b: &[u8; tags::TAG_ENTRY_SIZE] = delta_tags
+                        [j * tags::TAG_ENTRY_SIZE..(j + 1) * tags::TAG_ENTRY_SIZE]
                         .try_into()
                         .unwrap();
                     let te = tags::TagEntry::from_bytes(b);
@@ -3415,10 +3416,7 @@ mod tests {
             .unwrap();
 
         for id in &appended_ids {
-            assert!(
-                found_ids.contains(id),
-                "event appended during compaction must survive"
-            );
+            assert!(found_ids.contains(id), "event appended during compaction must survive");
         }
     }
 }
