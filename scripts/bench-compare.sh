@@ -80,7 +80,17 @@ format_ns() {
 calc_pct_change() {
     local baseline="$1"
     local current="$2"
-    awk -v b="$baseline" -v c="$current" 'BEGIN { printf "%.2f\n", (c - b) / b * 100 }'
+    if awk -v b="$baseline" 'BEGIN { exit !(b == 0) }'; then
+        if awk -v c="$current" 'BEGIN { exit !(c == 0) }'; then
+            printf "0.00\n"
+        elif awk -v c="$current" 'BEGIN { exit !(c > 0) }'; then
+            printf '%s\n' "inf"
+        else
+            printf '%s\n' "-inf"
+        fi
+    else
+        awk -v b="$baseline" -v c="$current" 'BEGIN { printf "%.2f\n", (c - b) / b * 100 }'
+    fi
 }
 
 # Compare a float against a threshold. Returns 0 (true) if val > threshold.
@@ -128,7 +138,7 @@ do_parse() {
 
     while IFS= read -r estimates_file; do
         # Strip leading criterion_dir/ and trailing /new/estimates.json
-        local rel_path="${estimates_file#${criterion_dir}/}"
+        local rel_path="${estimates_file#"$criterion_dir"/}"
         local bench_name="${rel_path%/new/estimates.json}"
 
         # Skip the top-level report directory if present
