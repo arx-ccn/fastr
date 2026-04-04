@@ -1,7 +1,21 @@
 use std::collections::HashSet;
 
+use sha2::{Digest, Sha256};
+
 use crate::db::store::TagSpec;
 use crate::pack::{hex, Event};
+
+/// Sentinel value_len indicating that tag_value holds a SHA-256 hash
+/// of the original (long) value, rather than the raw bytes.
+pub const VALUE_LEN_HASHED: u8 = 0xFF;
+
+/// SHA-256 hash a string value into 32 bytes (for tag values > 32 bytes that aren't 64-char hex).
+pub fn hash_value(value: &str) -> [u8; 32] {
+    let hash = Sha256::digest(value.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hash);
+    out
+}
 
 /// 49-byte tag index record. Accessed via to_bytes/from_bytes.
 ///
@@ -81,7 +95,7 @@ pub fn index_tags(ev: &Event, data_offset: u64, buf: &mut Vec<u8>) {
             tv[..vb.len()].copy_from_slice(vb);
             (tv, vb.len() as u8)
         } else {
-            continue; // not indexable
+            (hash_value(value), VALUE_LEN_HASHED)
         };
 
         let entry = TagEntry {
@@ -130,11 +144,16 @@ pub fn multi_matching_offsets(tags_mmap: &[u8], specs: &[TagSpec]) -> Vec<HashSe
                 continue;
             }
             for (val, len) in values {
-                let n = *len as usize;
-                if n > e.tag_value.len() || n > val.len() {
+                if e.value_len != *len {
                     continue;
                 }
-                if e.value_len == *len && e.tag_value[..n] == val[..n] {
+                // For hashed values (sentinel 0xFF), compare the full 32-byte hash.
+                // For raw values, compare only the used portion.
+                let cmp_len = if *len == VALUE_LEN_HASHED { 32 } else { *len as usize };
+                if cmp_len > e.tag_value.len() || cmp_len > val.len() {
+                    continue;
+                }
+                if e.tag_value[..cmp_len] == val[..cmp_len] {
                     results[j].insert(e.data_offset);
                     break;
                 }
@@ -241,5 +260,112 @@ mod tests {
         index_tags(&ev, 42, &mut buf);
         let offsets = matching_offsets(&buf, b'e', &[0u8; 32]);
         assert!(offsets.is_empty());
+    }
+
+    // --- Tests for long tag values (issue #19) ---
+
+    /// NIP-33 addressable event coordinate: `<kind>:<pubkey-hex>:<d-tag>`
+    const LONG_A_TAG: &str = "30023:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef:my-article-slug";
+
+    /// Relay URL longer than 32 bytes
+    const LONG_R_TAG: &str = "wss://relay.example.com/nostr/v1/ws";
+
+    #[test]
+    fn test_index_long_tag_value_is_hashed() {
+        assert!(LONG_A_TAG.len() > 32, "test value must exceed 32 bytes");
+        let ev = ev_with_tags(vec![Tag {
+            fields: vec!["a".into(), LONG_A_TAG.into()],
+        }]);
+        let mut buf = Vec::new();
+        index_tags(&ev, 200, &mut buf);
+        assert_eq!(buf.len(), TAG_ENTRY_SIZE, "long value must be indexed, not skipped");
+        let entry = TagEntry::from_bytes(buf[..TAG_ENTRY_SIZE].try_into().unwrap());
+        assert_eq!(entry.tag_name, b'a');
+        assert_eq!(entry.value_len, VALUE_LEN_HASHED);
+        assert_eq!(entry.data_offset, 200);
+        assert_eq!(entry.tag_value, hash_value(LONG_A_TAG));
+    }
+
+    #[test]
+    fn test_index_long_relay_url_is_hashed() {
+        assert!(LONG_R_TAG.len() > 32);
+        let ev = ev_with_tags(vec![Tag {
+            fields: vec!["r".into(), LONG_R_TAG.into()],
+        }]);
+        let mut buf = Vec::new();
+        index_tags(&ev, 300, &mut buf);
+        assert_eq!(buf.len(), TAG_ENTRY_SIZE);
+        let entry = TagEntry::from_bytes(buf[..TAG_ENTRY_SIZE].try_into().unwrap());
+        assert_eq!(entry.tag_name, b'r');
+        assert_eq!(entry.value_len, VALUE_LEN_HASHED);
+    }
+
+    #[test]
+    fn test_multi_matching_long_a_tag() {
+        let ev = ev_with_tags(vec![Tag {
+            fields: vec!["a".into(), LONG_A_TAG.into()],
+        }]);
+        let mut buf = Vec::new();
+        index_tags(&ev, 500, &mut buf);
+
+        // Build a TagSpec the same way store.rs does for long values.
+        let specs: Vec<TagSpec> = vec![(b'a', vec![(hash_value(LONG_A_TAG), VALUE_LEN_HASHED)])];
+        let results = multi_matching_offsets(&buf, &specs);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains(&500), "long #a tag must match via hashed lookup");
+    }
+
+    #[test]
+    fn test_multi_matching_long_r_tag() {
+        let ev = ev_with_tags(vec![Tag {
+            fields: vec!["r".into(), LONG_R_TAG.into()],
+        }]);
+        let mut buf = Vec::new();
+        index_tags(&ev, 600, &mut buf);
+
+        let specs: Vec<TagSpec> = vec![(b'r', vec![(hash_value(LONG_R_TAG), VALUE_LEN_HASHED)])];
+        let results = multi_matching_offsets(&buf, &specs);
+        assert!(results[0].contains(&600));
+    }
+
+    #[test]
+    fn test_multi_matching_long_tag_no_false_positive() {
+        let ev = ev_with_tags(vec![Tag {
+            fields: vec!["a".into(), LONG_A_TAG.into()],
+        }]);
+        let mut buf = Vec::new();
+        index_tags(&ev, 700, &mut buf);
+
+        // Query with a different long value -- must not match.
+        let other = "30023:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:other";
+        let specs: Vec<TagSpec> = vec![(b'a', vec![(hash_value(other), VALUE_LEN_HASHED)])];
+        let results = multi_matching_offsets(&buf, &specs);
+        assert!(results[0].is_empty(), "different long values must not collide");
+    }
+
+    #[test]
+    fn test_mixed_short_and_long_tags() {
+        let ev = ev_with_tags(vec![
+            Tag {
+                fields: vec!["t".into(), "rust".into()],
+            },
+            Tag {
+                fields: vec!["a".into(), LONG_A_TAG.into()],
+            },
+        ]);
+        let mut buf = Vec::new();
+        index_tags(&ev, 800, &mut buf);
+        assert_eq!(buf.len(), TAG_ENTRY_SIZE * 2, "both tags must be indexed");
+
+        // Query for the short tag.
+        let mut short_val = [0u8; 32];
+        short_val[..4].copy_from_slice(b"rust");
+        let specs: Vec<TagSpec> = vec![
+            (b't', vec![(short_val, 4u8)]),
+            (b'a', vec![(hash_value(LONG_A_TAG), VALUE_LEN_HASHED)]),
+        ];
+        let results = multi_matching_offsets(&buf, &specs);
+        assert!(results[0].contains(&800), "short #t tag must match");
+        assert!(results[1].contains(&800), "long #a tag must match");
     }
 }

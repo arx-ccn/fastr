@@ -80,10 +80,29 @@ pub fn has_protected_tag(tags: &[Tag]) -> bool {
 
 // --- NIP-01 Filter ---
 
+/// A hex prefix for NIP-01 filter matching on `ids` and `authors`.
+/// Stores up to 32 bytes with an explicit length so that short hex prefixes
+/// (e.g. "aabb") match any value that starts with those bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HexPrefix {
+    /// Decoded bytes, zero-padded to 32.
+    pub bytes: [u8; 32],
+    /// Number of significant bytes (0..=32). A full-length id/pubkey has len 32.
+    pub len: usize,
+}
+
+impl HexPrefix {
+    /// Check whether `value` starts with this prefix.
+    #[inline]
+    pub fn matches(&self, value: &[u8; 32]) -> bool {
+        value[..self.len] == self.bytes[..self.len]
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
-    pub ids: Vec<EventId>,
-    pub authors: Vec<Pubkey>,
+    pub ids: Vec<HexPrefix>,
+    pub authors: Vec<HexPrefix>,
     pub kinds: Vec<u16>,
     pub since: Option<i64>,
     pub until: Option<i64>,
@@ -149,6 +168,11 @@ pub enum ServerMsg<'a> {
     Notice {
         message: &'a str,
     },
+    /// NIP-01: subscription closed by server.
+    Closed {
+        sub_id: &'a str,
+        message: &'a str,
+    },
     /// NIP-77: server negentropy reply.
     NegMsg {
         sub_id: &'a str,
@@ -187,6 +211,31 @@ fn decode_hex_exact<const N: usize>(s: &str, field: &str) -> Result<[u8; N], Str
     Ok(out)
 }
 
+/// Decode a hex prefix of even length (up to 64 hex chars / 32 bytes) for NIP-01 filter matching.
+/// Shorter prefixes are zero-padded; the significant byte count is returned in `HexPrefix.len`.
+fn decode_hex_prefix(s: &str, field: &str) -> Result<HexPrefix, String> {
+    if s.is_empty() {
+        return Err(format!("invalid: {} empty string", field));
+    }
+    if s.len() > 64 {
+        return Err(format!("invalid: {} too long", field));
+    }
+    if !s.len().is_multiple_of(2) {
+        return Err(format!("invalid: {} odd-length hex prefix", field));
+    }
+    if !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(format!("invalid: {} not lowercase hex", field));
+    }
+    let byte_len = s.len() / 2;
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = nibble(chunk[0]);
+        let lo = nibble(chunk[1]);
+        bytes[i] = (hi << 4) | lo;
+    }
+    Ok(HexPrefix { bytes, len: byte_len })
+}
+
 /// Extract NIP-40 expiration timestamp from an event's tags.
 /// Returns the expiry unix timestamp, or `None` if not present or unparseable.
 pub fn event_expiry(ev: &Event) -> Option<i64> {
@@ -216,6 +265,22 @@ pub fn event_has_p_tag(ev: &Event, pubkey: &[u8; 32]) -> bool {
                 }
             })
     })
+}
+
+/// Validate a subscription ID per NIP-01: must be non-empty and at most `max_len` characters.
+///
+/// Returns `Ok(())` if valid, or `Err` with a human-readable reason string suitable for NOTICE.
+pub fn validate_sub_id(sub_id: &str, max_len: usize) -> Result<(), String> {
+    if sub_id.is_empty() {
+        return Err("invalid: subscription ID must not be empty".to_owned());
+    }
+    if sub_id.len() > max_len {
+        return Err(format!(
+            "invalid: subscription ID too long (max {} characters)",
+            max_len
+        ));
+    }
+    Ok(())
 }
 
 /// Decodes a JSON string value expected to be hex into a byte vector.
@@ -326,8 +391,8 @@ fn parse_event_obj(obj: &serde_json::Map<String, Value>) -> Result<Event, String
 fn parse_filter(val: &Value) -> Result<Filter, String> {
     let obj = val.as_object().ok_or("invalid: filter not an object")?;
 
-    let mut ids: Vec<EventId> = Vec::new();
-    let mut authors: Vec<Pubkey> = Vec::new();
+    let mut ids: Vec<HexPrefix> = Vec::new();
+    let mut authors: Vec<HexPrefix> = Vec::new();
     let mut kinds: Vec<u16> = Vec::new();
     let mut since: Option<i64> = None;
     let mut until: Option<i64> = None;
@@ -340,16 +405,14 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
                 let arr = value.as_array().ok_or("invalid: ids not an array")?;
                 for v in arr {
                     let s = v.as_str().ok_or("invalid: id in ids not a string")?;
-                    let bytes = decode_hex_exact::<32>(s, "ids entry")?;
-                    ids.push(EventId(bytes));
+                    ids.push(decode_hex_prefix(s, "ids entry")?);
                 }
             }
             "authors" => {
                 let arr = value.as_array().ok_or("invalid: authors not an array")?;
                 for v in arr {
                     let s = v.as_str().ok_or("invalid: pubkey in authors not a string")?;
-                    let bytes = decode_hex_exact::<32>(s, "authors entry")?;
-                    authors.push(Pubkey(bytes));
+                    authors.push(decode_hex_prefix(s, "authors entry")?);
                 }
             }
             "kinds" => {
@@ -603,8 +666,8 @@ impl ServerMsg<'_> {
     ///
     /// The returned string is a single JSON array representing the server message
     /// (for example `["EVENT", <sub_id>, <event>]`, `["OK", "<id>", true, "reason"]`,
-    /// `["EOSE", "<sub_id>"]`, `["NOTICE", "<message>"]`, `["NEG-MSG", "<sub_id>", "<hex>"]`,
-    /// or `["NEG-ERR", "<sub_id>", "<reason>"]`).
+    /// `["EOSE", "<sub_id>"]`, `["NOTICE", "<message>"]`, `["CLOSED", "<sub_id>", "<message>"]`,
+    /// `["NEG-MSG", "<sub_id>", "<hex>"]`, or `["NEG-ERR", "<sub_id>", "<reason>"]`).
     ///
     /// # Examples
     ///
@@ -645,6 +708,13 @@ impl ServerMsg<'_> {
                     serde_json::to_string(message).expect("message serialization"),
                 )
             }
+            ServerMsg::Closed { sub_id, message } => {
+                format!(
+                    "[\"CLOSED\",{},{}]",
+                    serde_json::to_string(sub_id).expect("sub_id serialization"),
+                    serde_json::to_string(message).expect("message serialization"),
+                )
+            }
             ServerMsg::NegMsg { sub_id, msg } => {
                 let hex = hex_encode_bytes(msg);
                 format!(
@@ -673,10 +743,10 @@ pub fn filter_matches(filters: &[Filter], ev: &Event) -> bool {
 }
 
 fn single_filter_matches(f: &Filter, ev: &Event) -> bool {
-    if !f.ids.is_empty() && !f.ids.iter().any(|id| id.0 == ev.id.0) {
+    if !f.ids.is_empty() && !f.ids.iter().any(|id| id.matches(&ev.id.0)) {
         return false;
     }
-    if !f.authors.is_empty() && !f.authors.iter().any(|pk| pk.0 == ev.pubkey.0) {
+    if !f.authors.is_empty() && !f.authors.iter().any(|pk| pk.matches(&ev.pubkey.0)) {
         return false;
     }
     if !f.kinds.is_empty() && !f.kinds.contains(&ev.kind) {
@@ -1061,6 +1131,26 @@ mod tests {
     }
 
     #[test]
+    fn test_server_closed() {
+        let s = ServerMsg::Closed {
+            sub_id: "sub1",
+            message: "auth-required: need auth",
+        }
+        .to_json();
+        assert_eq!(s, "[\"CLOSED\",\"sub1\",\"auth-required: need auth\"]");
+    }
+
+    #[test]
+    fn test_server_closed_empty_message() {
+        let s = ServerMsg::Closed {
+            sub_id: "x",
+            message: "",
+        }
+        .to_json();
+        assert_eq!(s, "[\"CLOSED\",\"x\",\"\"]");
+    }
+
+    #[test]
     fn test_server_event_fields_present() {
         let ev = make_golden_event();
         let s = ServerMsg::Event {
@@ -1163,5 +1253,204 @@ mod tests {
             }
             other => panic!("expected Count, got {:?}", other),
         }
+    }
+
+    // validate_sub_id tests
+
+    #[test]
+    fn test_validate_sub_id_valid() {
+        assert!(validate_sub_id("abc", 64).is_ok());
+        assert!(validate_sub_id("a", 64).is_ok());
+        assert!(validate_sub_id("x".repeat(64).as_str(), 64).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sub_id_empty() {
+        let err = validate_sub_id("", 64).unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_sub_id_too_long() {
+        let long = "x".repeat(65);
+        let err = validate_sub_id(&long, 64).unwrap_err();
+        assert!(err.contains("too long"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_sub_id_exact_max() {
+        // Exactly at the limit should be accepted.
+        let exact = "a".repeat(64);
+        assert!(validate_sub_id(&exact, 64).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sub_id_one_over_max() {
+        let over = "a".repeat(65);
+        assert!(validate_sub_id(&over, 64).is_err());
+    }
+
+    #[test]
+    fn test_validate_sub_id_custom_max() {
+        // With a custom max of 10, 11 chars should fail.
+        assert!(validate_sub_id("abcdefghij", 10).is_ok());
+        assert!(validate_sub_id("abcdefghijk", 10).is_err());
+    }
+
+    // --- NIP-01 prefix matching tests ---
+
+    #[test]
+    fn test_parse_filter_ids_short_prefix() {
+        // 4 hex chars = 2 bytes prefix
+        let msg = r#"["REQ","s1",{"ids":["aabb"]}]"#;
+        match parse_client_msg(msg).unwrap() {
+            ClientMsg::Req { filters, .. } => {
+                assert_eq!(filters[0].ids.len(), 1);
+                assert_eq!(filters[0].ids[0].len, 2);
+                assert_eq!(filters[0].ids[0].bytes[0], 0xaa);
+                assert_eq!(filters[0].ids[0].bytes[1], 0xbb);
+            }
+            other => panic!("expected Req, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_ids_full_length() {
+        let hex64 = "aa".repeat(32);
+        let msg = format!(r#"["REQ","s1",{{"ids":["{}"]}}]"#, hex64);
+        match parse_client_msg(&msg).unwrap() {
+            ClientMsg::Req { filters, .. } => {
+                assert_eq!(filters[0].ids[0].len, 32);
+                assert_eq!(filters[0].ids[0].bytes, [0xaa; 32]);
+            }
+            other => panic!("expected Req, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_authors_short_prefix() {
+        let msg = r#"["REQ","s1",{"authors":["ab"]}]"#;
+        match parse_client_msg(msg).unwrap() {
+            ClientMsg::Req { filters, .. } => {
+                assert_eq!(filters[0].authors.len(), 1);
+                assert_eq!(filters[0].authors[0].len, 1);
+                assert_eq!(filters[0].authors[0].bytes[0], 0xab);
+            }
+            other => panic!("expected Req, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_ids_odd_length_rejected() {
+        let msg = r#"["REQ","s1",{"ids":["aab"]}]"#;
+        assert!(parse_client_msg(msg).is_err());
+    }
+
+    #[test]
+    fn test_parse_filter_ids_empty_string_rejected() {
+        let msg = r#"["REQ","s1",{"ids":[""]}]"#;
+        assert!(parse_client_msg(msg).is_err());
+    }
+
+    #[test]
+    fn test_parse_filter_ids_uppercase_rejected() {
+        let msg = r#"["REQ","s1",{"ids":["AABB"]}]"#;
+        assert!(parse_client_msg(msg).is_err());
+    }
+
+    #[test]
+    fn test_hex_prefix_matches_exact() {
+        let prefix = HexPrefix {
+            bytes: [0xaa; 32],
+            len: 32,
+        };
+        assert!(prefix.matches(&[0xaa; 32]));
+        assert!(!prefix.matches(&[0xbb; 32]));
+    }
+
+    #[test]
+    fn test_hex_prefix_matches_short_prefix() {
+        // 2-byte prefix: 0xaa 0xbb
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xaa;
+        bytes[1] = 0xbb;
+        let prefix = HexPrefix { bytes, len: 2 };
+
+        // Event whose ID starts with aabb...
+        let mut target = [0xff; 32];
+        target[0] = 0xaa;
+        target[1] = 0xbb;
+        assert!(prefix.matches(&target));
+
+        // Different prefix - should not match
+        target[1] = 0xcc;
+        assert!(!prefix.matches(&target));
+    }
+
+    #[test]
+    fn test_hex_prefix_matches_single_byte() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xab;
+        let prefix = HexPrefix { bytes, len: 1 };
+
+        let mut target = [0u8; 32];
+        target[0] = 0xab;
+        assert!(prefix.matches(&target));
+
+        target[0] = 0xac;
+        assert!(!prefix.matches(&target));
+    }
+
+    #[test]
+    fn test_live_filter_matches_id_prefix() {
+        let ev = make_golden_event();
+        // Use the first 4 bytes of the golden event's ID as a prefix
+        let mut prefix_bytes = [0u8; 32];
+        prefix_bytes[..4].copy_from_slice(&ev.id.0[..4]);
+        let prefix = HexPrefix {
+            bytes: prefix_bytes,
+            len: 4,
+        };
+
+        let f = Filter {
+            ids: vec![prefix],
+            ..Filter::default()
+        };
+        assert!(filter_matches(&[f], &ev));
+    }
+
+    #[test]
+    fn test_live_filter_matches_author_prefix() {
+        let ev = make_golden_event();
+        let mut prefix_bytes = [0u8; 32];
+        prefix_bytes[..2].copy_from_slice(&ev.pubkey.0[..2]);
+        let prefix = HexPrefix {
+            bytes: prefix_bytes,
+            len: 2,
+        };
+
+        let f = Filter {
+            authors: vec![prefix],
+            ..Filter::default()
+        };
+        assert!(filter_matches(&[f], &ev));
+    }
+
+    #[test]
+    fn test_live_filter_prefix_no_match() {
+        let ev = make_golden_event();
+        // Use a prefix that definitely does not match
+        let mut prefix_bytes = [0u8; 32];
+        prefix_bytes[0] = ev.id.0[0].wrapping_add(1); // guaranteed different
+        let prefix = HexPrefix {
+            bytes: prefix_bytes,
+            len: 1,
+        };
+
+        let f = Filter {
+            ids: vec![prefix],
+            ..Filter::default()
+        };
+        assert!(!filter_matches(&[f], &ev));
     }
 }

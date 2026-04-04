@@ -37,7 +37,7 @@ impl RelayInfo {
     /// The returned `RelayInfo` uses fixed identity fields (`name`, `description`,
     /// `software`, `version`, and supported NIPs) and populates capability fields
     /// from `config` (`max_message_length`, `max_subscriptions`, `max_limit`).
-    /// Other limitation fields use fixed defaults (e.g., `max_subid_length = 256`,
+    /// Other limitation fields use fixed defaults (e.g., `max_subid_length` from config,
     /// `created_at_upper_limit = CREATED_AT_WINDOW`, `auth_required = false`).
     ///
     /// # Examples
@@ -63,7 +63,7 @@ impl RelayInfo {
                 max_message_length: config.max_message_bytes,
                 max_subscriptions: config.max_subscriptions_per_conn,
                 max_limit: config.max_limit,
-                max_subid_length: 256,
+                max_subid_length: config.max_subid_length,
                 max_event_tags: 2000,
                 max_content_length: 8192,
                 created_at_upper_limit: CREATED_AT_WINDOW,

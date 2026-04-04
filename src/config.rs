@@ -15,6 +15,8 @@ pub struct Config {
     pub max_limit: usize,
     /// Maximum incoming WebSocket message size in bytes. Default: 128 KiB
     pub max_message_bytes: usize,
+    /// Maximum subscription ID length in characters (NIP-01: max 64). Default: 64
+    pub max_subid_length: usize,
     /// Directory where the store files live. Default: "./data"
     pub data_dir: std::path::PathBuf,
     /// Relay WebSocket URL used for NIP-42 AUTH verification. Default: derived from listen_addr.
@@ -41,6 +43,7 @@ impl Default for Config {
             max_filters_per_req: env_parse("FASTR_MAX_FILTERS", 10),
             max_limit: env_parse("FASTR_MAX_LIMIT", 500),
             max_message_bytes: env_parse("FASTR_MAX_MESSAGE_BYTES", 128 * 1024),
+            max_subid_length: env_parse("FASTR_MAX_SUBID_LENGTH", 64).clamp(1, 64),
             data_dir: std::env::var("FASTR_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::path::PathBuf::from("./data")),
@@ -66,6 +69,25 @@ mod tests {
         assert!(cfg.max_connections > 0);
         assert!(cfg.max_limit > 0);
         assert!(cfg.max_message_bytes > 0);
+    }
+
+    #[test]
+    fn test_max_subid_length_clamped_to_range() {
+        // Values outside 1..=64 must be clamped.
+        unsafe { std::env::set_var("FASTR_MAX_SUBID_LENGTH", "0") };
+        let cfg = Config::default();
+        assert_eq!(cfg.max_subid_length, 1, "0 must clamp to 1");
+        unsafe { std::env::remove_var("FASTR_MAX_SUBID_LENGTH") };
+
+        unsafe { std::env::set_var("FASTR_MAX_SUBID_LENGTH", "200") };
+        let cfg = Config::default();
+        assert_eq!(cfg.max_subid_length, 64, "200 must clamp to 64");
+        unsafe { std::env::remove_var("FASTR_MAX_SUBID_LENGTH") };
+
+        unsafe { std::env::set_var("FASTR_MAX_SUBID_LENGTH", "32") };
+        let cfg = Config::default();
+        assert_eq!(cfg.max_subid_length, 32, "32 must be accepted as-is");
+        unsafe { std::env::remove_var("FASTR_MAX_SUBID_LENGTH") };
     }
 
     #[test]
