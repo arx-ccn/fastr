@@ -7,6 +7,7 @@ on:
 
 permissions:
   pull-requests: write
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -55,8 +56,9 @@ jobs:
       - run: cargo build --release
 
   # ── benchmarks ─────────────────────────────────────────────────────────
-  # Runs Criterion benchmarks and posts a summary as a PR comment.
-  # On master pushes, stores baseline results for future comparisons.
+  # Runs Criterion benchmarks, compares against stored baselines, and
+  # posts a comparison table as a PR comment.  On master pushes, stores
+  # results + flamegraphs to the ci-results branch.
   bench:
     name: Bench
     runs-on: ubuntu-latest
@@ -68,28 +70,194 @@ jobs:
         with:
           shared-key: bench
 
+      # ── fetch baseline from ci-results branch ──────────────────────────
+      - name: Fetch baseline
+        id: baseline
+        run: |
+          if git fetch origin ci-results 2>/dev/null && \
+             git show origin/ci-results:results/latest.json > baseline.json 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No baseline found on ci-results branch (first run?)"
+          fi
+
+      # ── run benchmarks ─────────────────────────────────────────────────
       - name: Run benchmarks
         run: cargo bench --all-targets 2>&1 | tee bench-output.txt
 
+      # ── parse results into JSON ────────────────────────────────────────
       - name: Parse benchmark results
-        id: bench
-        run: |
-          {
-            echo 'summary<<EOF'
-            echo '### Benchmark results'
-            echo ''
-            echo '```'
-            grep -E '^\w.*time:' bench-output.txt || echo '(no benchmark timings found)'
-            echo '```'
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+        run: scripts/bench-compare.sh --parse --output current.json
 
+      # ── compare against baseline (PR only) ─────────────────────────────
+      - name: Compare with baseline
+        id: compare
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ "${{ steps.baseline.outputs.exists }}" = "true" ]; then
+            set +e
+            scripts/bench-compare.sh --compare \
+              --baseline baseline.json \
+              --current current.json > comparison.md
+            exit_code=$?
+            set -e
+
+            {
+              echo 'summary<<EOF'
+              cat comparison.md
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+
+            if [ "$exit_code" -eq 1 ]; then
+              echo "regression=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "regression=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            {
+              echo 'summary<<EOF'
+              echo '### Benchmark Results (no baseline)'
+              echo ''
+              echo 'No previous baseline found. Showing raw results.'
+              echo ''
+              echo '```'
+              grep -E '^\w.*time:' bench-output.txt || echo '(no benchmark timings found)'
+              echo '```'
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+            echo "regression=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── post PR comment ────────────────────────────────────────────────
       - name: Comment on PR
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: bench
-          message: ${{ steps.bench.outputs.summary }}
+          message: ${{ steps.compare.outputs.summary }}
+
+      # ── fail on regression ─────────────────────────────────────────────
+      - name: Fail on regression
+        if: github.event_name == 'pull_request' && steps.compare.outputs.regression == 'true'
+        run: |
+          echo "::error::Benchmark regression detected (>10% slower). See PR comment for details."
+          exit 1
+
+      # ── store results to ci-results branch (master only) ───────────────
+      - name: Store results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch or create ci-results branch
+          if git fetch origin ci-results 2>/dev/null; then
+            git worktree add /tmp/ci-results origin/ci-results -b ci-results
+          else
+            git worktree add --detach /tmp/ci-results
+            cd /tmp/ci-results
+            git checkout --orphan ci-results
+            git rm -rf . 2>/dev/null || true
+            mkdir -p results flamegraphs
+            git commit --allow-empty -m "Initialize ci-results branch"
+            cd -
+          fi
+
+          # Copy results
+          mkdir -p /tmp/ci-results/results
+          cp current.json "/tmp/ci-results/results/latest.json"
+          cp current.json "/tmp/ci-results/results/${TIMESTAMP}.json"
+
+          # Append to history
+          scripts/bench-compare.sh --markdown --current current.json \
+            >> /tmp/ci-results/results/HISTORY.md
+
+          # Commit and push with retry for race conditions
+          cd /tmp/ci-results
+          git add results/
+          git commit -m "bench: store results for ${TIMESTAMP}" || true
+
+          for attempt in 1 2 3; do
+            if git push origin ci-results 2>/dev/null; then
+              echo "::notice::Results pushed to ci-results branch (attempt ${attempt})"
+              break
+            fi
+            echo "::warning::Push failed (attempt ${attempt}/3), rebasing and retrying..."
+            git fetch origin ci-results
+            git rebase origin/ci-results
+          done
+          cd -
+
+          # Clean up worktree
+          git worktree remove /tmp/ci-results --force 2>/dev/null || true
+
+      # ── flamegraphs (master only) ──────────────────────────────────────
+      - name: Install flamegraph tools
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          cargo install flamegraph
+
+          # Try to install perf — exact kernel tools may not exist in CI
+          sudo apt-get update -qq
+          sudo apt-get install -y linux-tools-common linux-tools-generic \
+            "linux-tools-$(uname -r)" 2>/dev/null || \
+            echo "::warning::Could not install kernel-specific perf tools; flamegraphs may be skipped"
+
+          # Allow perf access
+          sudo sysctl -w kernel.perf_event_paranoid=1 || true
+
+      - name: Generate flamegraphs
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        continue-on-error: true
+        run: |
+          TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p "flamegraphs-out"
+
+          for suite in pack validate query; do
+            echo "::group::Flamegraph: ${suite}"
+            if cargo flamegraph --bench "${suite}" \
+                 -o "flamegraphs-out/flamegraph-${suite}.svg" -- --bench 2>&1; then
+              echo "Generated flamegraph for ${suite}"
+            else
+              echo "::warning::Flamegraph generation failed for ${suite}, skipping"
+            fi
+            echo "::endgroup::"
+          done
+
+          # Store SVGs on ci-results branch if any were produced
+          if ls flamegraphs-out/*.svg 1>/dev/null 2>&1; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            git fetch origin ci-results
+            git worktree add /tmp/ci-flamegraph origin/ci-results -b ci-flamegraph
+
+            mkdir -p "/tmp/ci-flamegraph/flamegraphs/${TIMESTAMP}"
+            cp flamegraphs-out/*.svg "/tmp/ci-flamegraph/flamegraphs/${TIMESTAMP}/"
+
+            cd /tmp/ci-flamegraph
+            git add flamegraphs/
+            git commit -m "bench: flamegraphs for ${TIMESTAMP}" || true
+
+            for attempt in 1 2 3; do
+              if git push origin HEAD:ci-results 2>/dev/null; then
+                echo "::notice::Flamegraphs pushed (attempt ${attempt})"
+                break
+              fi
+              git fetch origin ci-results
+              git rebase origin/ci-results
+            done
+            cd -
+
+            git worktree remove /tmp/ci-flamegraph --force 2>/dev/null || true
+          else
+            echo "::warning::No flamegraph SVGs were generated"
+          fi
 
   # ── Docker image ───────────────────────────────────────────────────────
   docker:
