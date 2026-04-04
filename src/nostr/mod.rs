@@ -84,6 +84,7 @@ pub fn has_protected_tag(tags: &[Tag]) -> bool {
 /// Stores up to 32 bytes with an explicit length so that short hex prefixes
 /// (e.g. "aabb") match any value that starts with those bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct HexPrefix {
     /// Decoded bytes, zero-padded to 32.
     pub bytes: [u8; 32],
@@ -99,11 +100,6 @@ impl HexPrefix {
     }
 }
 
-impl Default for HexPrefix {
-    fn default() -> Self {
-        HexPrefix { bytes: [0u8; 32], len: 0 }
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
@@ -226,7 +222,7 @@ fn decode_hex_prefix(s: &str, field: &str) -> Result<HexPrefix, String> {
     if s.len() > 64 {
         return Err(format!("invalid: {} too long", field));
     }
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(format!("invalid: {} odd-length hex prefix", field));
     }
     if !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -1366,7 +1362,10 @@ mod tests {
 
     #[test]
     fn test_hex_prefix_matches_exact() {
-        let prefix = HexPrefix { bytes: [0xaa; 32], len: 32 };
+        let prefix = HexPrefix {
+            bytes: [0xaa; 32],
+            len: 32,
+        };
         assert!(prefix.matches(&[0xaa; 32]));
         assert!(!prefix.matches(&[0xbb; 32]));
     }
@@ -1410,7 +1409,10 @@ mod tests {
         // Use the first 4 bytes of the golden event's ID as a prefix
         let mut prefix_bytes = [0u8; 32];
         prefix_bytes[..4].copy_from_slice(&ev.id.0[..4]);
-        let prefix = HexPrefix { bytes: prefix_bytes, len: 4 };
+        let prefix = HexPrefix {
+            bytes: prefix_bytes,
+            len: 4,
+        };
 
         let f = Filter {
             ids: vec![prefix],
@@ -1424,7 +1426,10 @@ mod tests {
         let ev = make_golden_event();
         let mut prefix_bytes = [0u8; 32];
         prefix_bytes[..2].copy_from_slice(&ev.pubkey.0[..2]);
-        let prefix = HexPrefix { bytes: prefix_bytes, len: 2 };
+        let prefix = HexPrefix {
+            bytes: prefix_bytes,
+            len: 2,
+        };
 
         let f = Filter {
             authors: vec![prefix],
@@ -1439,7 +1444,10 @@ mod tests {
         // Use a prefix that definitely does not match
         let mut prefix_bytes = [0u8; 32];
         prefix_bytes[0] = ev.id.0[0].wrapping_add(1); // guaranteed different
-        let prefix = HexPrefix { bytes: prefix_bytes, len: 1 };
+        let prefix = HexPrefix {
+            bytes: prefix_bytes,
+            len: 1,
+        };
 
         let f = Filter {
             ids: vec![prefix],

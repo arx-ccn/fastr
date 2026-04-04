@@ -149,11 +149,7 @@ pub fn multi_matching_offsets(tags_mmap: &[u8], specs: &[TagSpec]) -> Vec<HashSe
                 }
                 // For hashed values (sentinel 0xFF), compare the full 32-byte hash.
                 // For raw values, compare only the used portion.
-                let cmp_len = if *len == VALUE_LEN_HASHED {
-                    32
-                } else {
-                    *len as usize
-                };
+                let cmp_len = if *len == VALUE_LEN_HASHED { 32 } else { *len as usize };
                 if cmp_len > e.tag_value.len() || cmp_len > val.len() {
                     continue;
                 }
@@ -269,8 +265,7 @@ mod tests {
     // --- Tests for long tag values (issue #19) ---
 
     /// NIP-33 addressable event coordinate: `<kind>:<pubkey-hex>:<d-tag>`
-    const LONG_A_TAG: &str =
-        "30023:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef:my-article-slug";
+    const LONG_A_TAG: &str = "30023:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef:my-article-slug";
 
     /// Relay URL longer than 32 bytes
     const LONG_R_TAG: &str = "wss://relay.example.com/nostr/v1/ws";
@@ -317,10 +312,7 @@ mod tests {
         let specs: Vec<TagSpec> = vec![(b'a', vec![(hash_value(LONG_A_TAG), VALUE_LEN_HASHED)])];
         let results = multi_matching_offsets(&buf, &specs);
         assert_eq!(results.len(), 1);
-        assert!(
-            results[0].contains(&500),
-            "long #a tag must match via hashed lookup"
-        );
+        assert!(results[0].contains(&500), "long #a tag must match via hashed lookup");
     }
 
     #[test]

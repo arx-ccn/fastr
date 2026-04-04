@@ -187,7 +187,10 @@ mod tests {
         let mut f = empty_filter();
         f.authors = vec![HexPrefix { bytes: pk, len: 32 }];
         assert!(matches(&e, &f));
-        f.authors = vec![HexPrefix { bytes: [0xBB; 32], len: 32 }];
+        f.authors = vec![HexPrefix {
+            bytes: [0xBB; 32],
+            len: 32,
+        }];
         assert!(!matches(&e, &f));
     }
 
@@ -198,7 +201,10 @@ mod tests {
         let mut f = empty_filter();
         f.ids = vec![HexPrefix { bytes: id, len: 32 }];
         assert!(matches(&e, &f));
-        f.ids = vec![HexPrefix { bytes: [0x22; 32], len: 32 }];
+        f.ids = vec![HexPrefix {
+            bytes: [0x22; 32],
+            len: 32,
+        }];
         assert!(!matches(&e, &f));
     }
 
@@ -210,11 +216,17 @@ mod tests {
         // 1-byte prefix 0xab should match
         let mut prefix_bytes = [0u8; 32];
         prefix_bytes[0] = 0xab;
-        f.ids = vec![HexPrefix { bytes: prefix_bytes, len: 1 }];
+        f.ids = vec![HexPrefix {
+            bytes: prefix_bytes,
+            len: 1,
+        }];
         assert!(matches(&e, &f));
         // 1-byte prefix 0xac should not match
         prefix_bytes[0] = 0xac;
-        f.ids = vec![HexPrefix { bytes: prefix_bytes, len: 1 }];
+        f.ids = vec![HexPrefix {
+            bytes: prefix_bytes,
+            len: 1,
+        }];
         assert!(!matches(&e, &f));
     }
 
@@ -227,11 +239,17 @@ mod tests {
         let mut prefix_bytes = [0u8; 32];
         prefix_bytes[0] = 0xcd;
         prefix_bytes[1] = 0xcd;
-        f.authors = vec![HexPrefix { bytes: prefix_bytes, len: 2 }];
+        f.authors = vec![HexPrefix {
+            bytes: prefix_bytes,
+            len: 2,
+        }];
         assert!(matches(&e, &f));
         // Wrong second byte
         prefix_bytes[1] = 0xce;
-        f.authors = vec![HexPrefix { bytes: prefix_bytes, len: 2 }];
+        f.authors = vec![HexPrefix {
+            bytes: prefix_bytes,
+            len: 2,
+        }];
         assert!(!matches(&e, &f));
     }
 }

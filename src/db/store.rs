@@ -437,11 +437,7 @@ where
                 // per-entry growth. An attacker could otherwise keep one event ID
                 // hot and grow its HashSet unboundedly, bypassing the entry cap.
                 let pending_entries = map.values().filter(|v| v.is_some()).count();
-                let pending_candidates: usize = map
-                    .values()
-                    .filter_map(|v| v.as_ref())
-                    .map(HashSet::len)
-                    .sum();
+                let pending_candidates: usize = map.values().filter_map(|v| v.as_ref()).map(HashSet::len).sum();
                 match map.get_mut(&id_bytes) {
                     Some(Some(set)) => {
                         // Entry already exists as pending - add candidate only if
