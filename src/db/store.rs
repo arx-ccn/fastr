@@ -433,18 +433,30 @@ where
                 // candidate set. Multiple kind-5 events may reference the same future ID,
                 // so all candidate pubkeys are preserved (insert/extend, never replace).
                 // Cap total preemptive entries to prevent unbounded memory growth.
+                // Compute total candidate count across all pending sets to bound
+                // per-entry growth. An attacker could otherwise keep one event ID
+                // hot and grow its HashSet unboundedly, bypassing the entry cap.
+                let pending_entries = map.values().filter(|v| v.is_some()).count();
+                let pending_candidates: usize = map
+                    .values()
+                    .filter_map(|v| v.as_ref())
+                    .map(HashSet::len)
+                    .sum();
                 match map.get_mut(&id_bytes) {
                     Some(Some(set)) => {
-                        // Entry already exists as pending - just add the candidate.
-                        set.insert(k5.pubkey.0);
+                        // Entry already exists as pending - add candidate only if
+                        // it's already present (idempotent) or we're under the cap.
+                        if set.contains(&k5.pubkey.0) || pending_candidates < max_preemptive {
+                            set.insert(k5.pubkey.0);
+                        }
                     }
                     Some(None) => {
                         // Already confirmed - nothing to do.
                     }
                     None => {
-                        // New preemptive entry: only create if under the cap.
-                        let pending_count = map.values().filter(|v| v.is_some()).count();
-                        if pending_count < max_preemptive {
+                        // New preemptive entry: only create if both entry count and
+                        // total candidate count are under the cap.
+                        if pending_entries < max_preemptive && pending_candidates < max_preemptive {
                             let mut set = HashSet::new();
                             set.insert(k5.pubkey.0);
                             map.insert(id_bytes, Some(set));
@@ -581,13 +593,13 @@ fn process_a_tag_deletion(
     // Scan the dtags index for entries matching (kind, pubkey, d_hash).
     // Collect data_offsets of matching addressable events.
     let dtags_total = dtags.len() / DTAG_ENTRY_SIZE;
-    let mut matching_offsets = Vec::new();
+    let mut matching_offsets: HashSet<u64> = HashSet::new();
     for i in 0..dtags_total {
         let off = i * DTAG_ENTRY_SIZE;
         let dt_bytes: &[u8; DTAG_ENTRY_SIZE] = dtags[off..off + DTAG_ENTRY_SIZE].try_into().unwrap();
         let dt = DtagEntry::from_bytes(dt_bytes);
         if dt.kind == kind && dt.pubkey == coord_pubkey && dt.d_hash == d_hash {
-            matching_offsets.push(dt.data_offset);
+            matching_offsets.insert(dt.data_offset);
         }
     }
 
