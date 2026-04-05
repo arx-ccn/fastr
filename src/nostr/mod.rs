@@ -388,7 +388,7 @@ fn parse_event_obj(obj: &serde_json::Map<String, Value>) -> Result<Event, String
 
 // --- parse_filter ---
 
-fn parse_filter(val: &Value) -> Result<Filter, String> {
+fn parse_filter(val: &Value, max_values: usize) -> Result<Filter, String> {
     let obj = val.as_object().ok_or("invalid: filter not an object")?;
 
     let mut ids: Vec<HexPrefix> = Vec::new();
@@ -403,6 +403,9 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
         match key.as_str() {
             "ids" => {
                 let arr = value.as_array().ok_or("invalid: ids not an array")?;
+                if arr.len() > max_values {
+                    return Err("invalid: too many values in ids".to_owned());
+                }
                 for v in arr {
                     let s = v.as_str().ok_or("invalid: id in ids not a string")?;
                     ids.push(decode_hex_prefix(s, "ids entry")?);
@@ -410,6 +413,9 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
             }
             "authors" => {
                 let arr = value.as_array().ok_or("invalid: authors not an array")?;
+                if arr.len() > max_values {
+                    return Err("invalid: too many values in authors".to_owned());
+                }
                 for v in arr {
                     let s = v.as_str().ok_or("invalid: pubkey in authors not a string")?;
                     authors.push(decode_hex_prefix(s, "authors entry")?);
@@ -417,6 +423,9 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
             }
             "kinds" => {
                 let arr = value.as_array().ok_or("invalid: kinds not an array")?;
+                if arr.len() > max_values {
+                    return Err("invalid: too many values in kinds".to_owned());
+                }
                 for v in arr {
                     let k = v.as_u64().ok_or("invalid: kind not a non-negative integer")?;
                     kinds.push(u16::try_from(k).map_err(|_| "invalid: kind out of range for u16")?);
@@ -436,6 +445,9 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
                 // Safety: k.len() == 2 is guaranteed by the match guard above.
                 let ch = k.as_bytes()[1] as char;
                 let arr = value.as_array().ok_or("invalid: tag filter not an array")?;
+                if arr.len() > max_values {
+                    return Err(format!("invalid: too many values in #{ch}"));
+                }
                 let mut vals = Vec::with_capacity(arr.len());
                 for v in arr {
                     vals.push(v.as_str().ok_or("invalid: tag filter value not a string")?.to_owned());
@@ -459,7 +471,7 @@ fn parse_filter(val: &Value) -> Result<Filter, String> {
 
 // --- parse_client_msg ---
 
-fn parse_sub_and_filters(arr: &[Value], verb: &str) -> Result<(String, Vec<Filter>), String> {
+fn parse_sub_and_filters(arr: &[Value], verb: &str, max_filter_values: usize) -> Result<(String, Vec<Filter>), String> {
     if arr.len() < 3 {
         return Err(format!("invalid: {verb} requires sub_id and at least one filter"));
     }
@@ -469,7 +481,7 @@ fn parse_sub_and_filters(arr: &[Value], verb: &str) -> Result<(String, Vec<Filte
         .to_owned();
     let mut filters = Vec::with_capacity(arr.len() - 2);
     for v in &arr[2..] {
-        filters.push(parse_filter(v)?);
+        filters.push(parse_filter(v, max_filter_values)?);
     }
     Ok((sub_id, filters))
 }
@@ -484,7 +496,7 @@ fn parse_sub_and_filters(arr: &[Value], verb: &str) -> Result<(String, Vec<Filte
 /// ```
 /// use fastr::nostr::{parse_client_msg, ClientMsg};
 /// let raw = r#"["REQ", "sub-1", {"kinds":[1]}]"#;
-/// let msg = parse_client_msg(raw).expect("should parse");
+/// let msg = parse_client_msg(raw, 256).expect("should parse");
 /// match msg {
 ///     ClientMsg::Req { sub_id, filters } => {
 ///         assert_eq!(sub_id, "sub-1");
@@ -493,7 +505,7 @@ fn parse_sub_and_filters(arr: &[Value], verb: &str) -> Result<(String, Vec<Filte
 ///     _ => panic!("expected REQ"),
 /// }
 /// ```
-pub fn parse_client_msg(raw: &str) -> Result<ClientMsg, String> {
+pub fn parse_client_msg(raw: &str, max_filter_values: usize) -> Result<ClientMsg, String> {
     let val: Value = serde_json::from_str(raw).map_err(|_| "invalid: not valid JSON".to_owned())?;
     let arr = val.as_array().ok_or("invalid: message is not a JSON array")?;
     if arr.is_empty() {
@@ -511,11 +523,11 @@ pub fn parse_client_msg(raw: &str) -> Result<ClientMsg, String> {
             Ok(ClientMsg::Event(Box::new(ev)))
         }
         "REQ" => {
-            let (sub_id, filters) = parse_sub_and_filters(arr, "REQ")?;
+            let (sub_id, filters) = parse_sub_and_filters(arr, "REQ", max_filter_values)?;
             Ok(ClientMsg::Req { sub_id, filters })
         }
         "COUNT" => {
-            let (sub_id, filters) = parse_sub_and_filters(arr, "COUNT")?;
+            let (sub_id, filters) = parse_sub_and_filters(arr, "COUNT", max_filter_values)?;
             Ok(ClientMsg::Count { sub_id, filters })
         }
         "CLOSE" => {
@@ -541,7 +553,7 @@ pub fn parse_client_msg(raw: &str) -> Result<ClientMsg, String> {
                 .as_str()
                 .ok_or("invalid: NEG-OPEN sub_id not a string")?
                 .to_owned();
-            let filter = parse_filter(&arr[2])?;
+            let filter = parse_filter(&arr[2], max_filter_values)?;
             let msg = decode_hex_field(&arr[3], "NEG-OPEN message")?;
             Ok(ClientMsg::NegOpen { sub_id, filter, msg })
         }
@@ -843,14 +855,14 @@ mod tests {
         let raw = format!(
             r#"["EVENT",{{"id":"{id_hex}","pubkey":"{pk_hex}","created_at":1700000000,"kind":1,"tags":[],"content":"hello","sig":"{sig_hex}"}}]"#
         );
-        let msg = parse_client_msg(&raw).unwrap();
+        let msg = parse_client_msg(&raw, 256).unwrap();
         assert!(matches!(msg, ClientMsg::Event(_)));
     }
 
     #[test]
     fn test_parse_req_msg() {
         let raw = r#"["REQ","sub1",{"kinds":[1]}]"#;
-        let msg = parse_client_msg(raw).unwrap();
+        let msg = parse_client_msg(raw, 256).unwrap();
         match msg {
             ClientMsg::Req { sub_id, filters } => {
                 assert_eq!(sub_id, "sub1");
@@ -864,23 +876,23 @@ mod tests {
     #[test]
     fn test_parse_close_msg() {
         let raw = r#"["CLOSE","sub1"]"#;
-        let msg = parse_client_msg(raw).unwrap();
+        let msg = parse_client_msg(raw, 256).unwrap();
         assert!(matches!(msg, ClientMsg::Close { sub_id } if sub_id == "sub1"));
     }
 
     #[test]
     fn test_parse_unknown_verb() {
-        assert!(parse_client_msg(r#"["FOO"]"#).is_err());
+        assert!(parse_client_msg(r#"["FOO"]"#, 256).is_err());
     }
 
     #[test]
     fn test_parse_non_array() {
-        assert!(parse_client_msg(r#"{"not":"array"}"#).is_err());
+        assert!(parse_client_msg(r#"{"not":"array"}"#, 256).is_err());
     }
 
     #[test]
     fn test_parse_event_missing_obj() {
-        assert!(parse_client_msg(r#"["EVENT"]"#).is_err());
+        assert!(parse_client_msg(r#"["EVENT"]"#, 256).is_err());
     }
 
     // Helpers for building synthetic EVENT messages in error-path tests.
@@ -900,7 +912,7 @@ mod tests {
     #[test]
     fn test_parse_id_wrong_length() {
         let raw = ev_msg("deadbeef", PK64, SIG128, "0", "[]");
-        let err = parse_client_msg(&raw).unwrap_err();
+        let err = parse_client_msg(&raw, 256).unwrap_err();
         assert!(err.starts_with("invalid: "), "got: {err}");
     }
 
@@ -913,35 +925,35 @@ mod tests {
             "0",
             "[]",
         );
-        let err = parse_client_msg(&raw).unwrap_err();
+        let err = parse_client_msg(&raw, 256).unwrap_err();
         assert!(err.starts_with("invalid: "), "got: {err}");
     }
 
     #[test]
     fn test_parse_sig_wrong_length() {
         let raw = ev_msg(ID64, PK64, "bb", "0", "[]");
-        let err = parse_client_msg(&raw).unwrap_err();
+        let err = parse_client_msg(&raw, 256).unwrap_err();
         assert!(err.starts_with("invalid: "), "got: {err}");
     }
 
     #[test]
     fn test_parse_created_at_string() {
         let raw = ev_msg(ID64, PK64, SIG128, r#""oops""#, "[]");
-        let err = parse_client_msg(&raw).unwrap_err();
+        let err = parse_client_msg(&raw, 256).unwrap_err();
         assert!(err.starts_with("invalid: "), "got: {err}");
     }
 
     #[test]
     fn test_parse_tags_non_array_element() {
         let raw = ev_msg(ID64, PK64, SIG128, "0", r#"["bad"]"#);
-        let err = parse_client_msg(&raw).unwrap_err();
+        let err = parse_client_msg(&raw, 256).unwrap_err();
         assert!(err.starts_with("invalid: "), "got: {err}");
     }
 
     #[test]
     fn test_parse_tags_empty_inner_array() {
         let raw = ev_msg(ID64, PK64, SIG128, "0", "[[]]");
-        let err = parse_client_msg(&raw).unwrap_err();
+        let err = parse_client_msg(&raw, 256).unwrap_err();
         assert!(err.starts_with("invalid: "), "got: {err}");
     }
 
@@ -1245,7 +1257,7 @@ mod tests {
     #[test]
     fn test_parse_count_message() {
         let msg = r#"["COUNT","sub1",{"kinds":[1]}]"#;
-        match parse_client_msg(msg).unwrap() {
+        match parse_client_msg(msg, 256).unwrap() {
             ClientMsg::Count { sub_id, filters } => {
                 assert_eq!(sub_id, "sub1");
                 assert_eq!(filters.len(), 1);
@@ -1303,7 +1315,7 @@ mod tests {
     fn test_parse_filter_ids_short_prefix() {
         // 4 hex chars = 2 bytes prefix
         let msg = r#"["REQ","s1",{"ids":["aabb"]}]"#;
-        match parse_client_msg(msg).unwrap() {
+        match parse_client_msg(msg, 256).unwrap() {
             ClientMsg::Req { filters, .. } => {
                 assert_eq!(filters[0].ids.len(), 1);
                 assert_eq!(filters[0].ids[0].len, 2);
@@ -1318,7 +1330,7 @@ mod tests {
     fn test_parse_filter_ids_full_length() {
         let hex64 = "aa".repeat(32);
         let msg = format!(r#"["REQ","s1",{{"ids":["{}"]}}]"#, hex64);
-        match parse_client_msg(&msg).unwrap() {
+        match parse_client_msg(&msg, 256).unwrap() {
             ClientMsg::Req { filters, .. } => {
                 assert_eq!(filters[0].ids[0].len, 32);
                 assert_eq!(filters[0].ids[0].bytes, [0xaa; 32]);
@@ -1330,7 +1342,7 @@ mod tests {
     #[test]
     fn test_parse_filter_authors_short_prefix() {
         let msg = r#"["REQ","s1",{"authors":["ab"]}]"#;
-        match parse_client_msg(msg).unwrap() {
+        match parse_client_msg(msg, 256).unwrap() {
             ClientMsg::Req { filters, .. } => {
                 assert_eq!(filters[0].authors.len(), 1);
                 assert_eq!(filters[0].authors[0].len, 1);
@@ -1343,19 +1355,59 @@ mod tests {
     #[test]
     fn test_parse_filter_ids_odd_length_rejected() {
         let msg = r#"["REQ","s1",{"ids":["aab"]}]"#;
-        assert!(parse_client_msg(msg).is_err());
+        assert!(parse_client_msg(msg, 256).is_err());
     }
 
     #[test]
     fn test_parse_filter_ids_empty_string_rejected() {
         let msg = r#"["REQ","s1",{"ids":[""]}]"#;
-        assert!(parse_client_msg(msg).is_err());
+        assert!(parse_client_msg(msg, 256).is_err());
     }
 
     #[test]
     fn test_parse_filter_ids_uppercase_rejected() {
         let msg = r#"["REQ","s1",{"ids":["AABB"]}]"#;
-        assert!(parse_client_msg(msg).is_err());
+        assert!(parse_client_msg(msg, 256).is_err());
+    }
+
+    #[test]
+    fn test_parse_filter_too_many_ids_rejected() {
+        let ids: Vec<String> = (0..257).map(|i| format!("\"{}\"", format!("{:064x}", i))).collect();
+        let msg = format!(r#"["REQ","s1",{{"ids":[{}]}}]"#, ids.join(","));
+        let err = parse_client_msg(&msg, 256).unwrap_err();
+        assert!(err.contains("too many values"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_filter_too_many_authors_rejected() {
+        let authors: Vec<String> = (0..257).map(|i| format!("\"{}\"", format!("{:064x}", i))).collect();
+        let msg = format!(r#"["REQ","s1",{{"authors":[{}]}}]"#, authors.join(","));
+        let err = parse_client_msg(&msg, 256).unwrap_err();
+        assert!(err.contains("too many values"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_filter_too_many_kinds_rejected() {
+        let kinds: Vec<String> = (0..257).map(|i| i.to_string()).collect();
+        let msg = format!(r#"["REQ","s1",{{"kinds":[{}]}}]"#, kinds.join(","));
+        let err = parse_client_msg(&msg, 256).unwrap_err();
+        assert!(err.contains("too many values"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_filter_too_many_tag_values_rejected() {
+        let vals: Vec<String> = (0..257).map(|i| format!("\"v{i}\"")).collect();
+        let joined = vals.join(",");
+        let msg = format!("[\"REQ\",\"s1\",{{\"#e\":[{joined}]}}]");
+        let err = parse_client_msg(&msg, 256).unwrap_err();
+        assert!(err.contains("too many values"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_filter_at_limit_accepted() {
+        let ids: Vec<String> = (0..256).map(|i| format!("\"{}\"", format!("{:064x}", i))).collect();
+        let msg = format!(r#"["REQ","s1",{{"ids":[{}]}}]"#, ids.join(","));
+        assert!(parse_client_msg(&msg, 256).is_ok());
     }
 
     #[test]
