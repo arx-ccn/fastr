@@ -188,7 +188,7 @@ fn do_import<R: BufRead>(store: &Store, reader: R) -> Result<(u64, u64, u64)> {
             format!(r#"["EVENT",{line}]"#)
         };
 
-        let ev = match parse_client_msg(&raw) {
+        let ev = match parse_client_msg(&raw, usize::MAX) {
             Ok(ClientMsg::Event(ev)) => *ev,
             Ok(_) => {
                 eprintln!("line {}: not an EVENT message", line_no + 1);

@@ -227,7 +227,7 @@ where
                     continue;
                 }
 
-                match parse_client_msg(raw) {
+                match parse_client_msg(raw, config.max_filter_values) {
                     Err(reason) => {
                         let notice = ServerMsg::Notice { message: &reason }.to_json();
                         let _ = out_tx.send(Out::Text(notice)).await;

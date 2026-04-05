@@ -17,6 +17,8 @@ pub struct Config {
     pub max_message_bytes: usize,
     /// Maximum subscription ID length in characters (NIP-01: max 64). Default: 64
     pub max_subid_length: usize,
+    /// Maximum number of values in a single filter field (ids, authors, kinds, tag values). Default: 256
+    pub max_filter_values: usize,
     /// Directory where the store files live. Default: "./data"
     pub data_dir: std::path::PathBuf,
     /// Relay WebSocket URL used for NIP-42 AUTH verification. Default: derived from listen_addr.
@@ -44,6 +46,7 @@ impl Default for Config {
             max_limit: env_parse("FASTR_MAX_LIMIT", 500),
             max_message_bytes: env_parse("FASTR_MAX_MESSAGE_BYTES", 128 * 1024),
             max_subid_length: env_parse("FASTR_MAX_SUBID_LENGTH", 64).clamp(1, 64),
+            max_filter_values: env_parse("FASTR_MAX_FILTER_VALUES", 256),
             data_dir: std::env::var("FASTR_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::path::PathBuf::from("./data")),
