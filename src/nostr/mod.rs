@@ -177,6 +177,8 @@ pub enum ServerMsg<'a> {
     NegMsg {
         sub_id: &'a str,
         msg: &'a [u8],
+        /// Optional maximum number of records the relay supports per negentropy session.
+        max_records: Option<usize>,
     },
     /// NIP-77: server error for a negentropy session.
     NegErr {
@@ -727,13 +729,17 @@ impl ServerMsg<'_> {
                     serde_json::to_string(message).expect("message serialization"),
                 )
             }
-            ServerMsg::NegMsg { sub_id, msg } => {
+            ServerMsg::NegMsg {
+                sub_id,
+                msg,
+                max_records,
+            } => {
                 let hex = hex_encode_bytes(msg);
-                format!(
-                    "[\"NEG-MSG\",{},\"{}\"]",
-                    serde_json::to_string(sub_id).expect("sub_id serialization"),
-                    hex,
-                )
+                let sub = serde_json::to_string(sub_id).expect("sub_id serialization");
+                match max_records {
+                    Some(max) => format!("[\"NEG-MSG\",{},\"{}\",{}]", sub, hex, max),
+                    None => format!("[\"NEG-MSG\",{},\"{}\"]", sub, hex),
+                }
             }
             ServerMsg::NegErr { sub_id, reason } => {
                 format!(
