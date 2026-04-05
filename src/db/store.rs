@@ -1323,7 +1323,13 @@ impl Store {
     /// # Errors
     ///
     /// Returns an `Err` if internal locking fails (e.g., tombstone lock is poisoned).
-    pub fn iter_negentropy<F>(&self, filter: &Filter, auth_pk: Option<&[u8; 32]>, mut f: F) -> Result<(), Error>
+    pub fn iter_negentropy<F>(
+        &self,
+        filter: &Filter,
+        auth_pk: Option<&[u8; 32]>,
+        max_records: usize,
+        mut f: F,
+    ) -> Result<(), Error>
     where
         F: FnMut(i64, [u8; 32]),
     {
@@ -1420,6 +1426,9 @@ impl Store {
                 }
             }
 
+            if items.len() >= max_records {
+                return Err(Error::Rejected("too many records for negentropy session"));
+            }
             items.push((entry.created_at, entry.id));
         }
 

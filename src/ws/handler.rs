@@ -579,7 +579,7 @@ async fn handle_neg_open(
     let mut storage = NegentropyStorageVector::new();
     let mut insert_error: Option<String> = None;
 
-    if let Err(e) = store.iter_negentropy(&filter, auth_pk, |ts, id| {
+    if let Err(e) = store.iter_negentropy(&filter, auth_pk, config.max_neg_records, |ts, id| {
         if insert_error.is_none() {
             if let Err(e) = storage.insert(ts as u64, NegId::from_byte_array(id)) {
                 insert_error = Some(e.to_string());
@@ -642,6 +642,7 @@ async fn handle_neg_open(
             let resp = ServerMsg::NegMsg {
                 sub_id: &sub_id,
                 msg: &reply,
+                max_records: Some(config.max_neg_records),
             }
             .to_json();
             let _ = out_tx.send(Out::Text(resp)).await;
@@ -696,6 +697,7 @@ async fn handle_neg_msg(sub_id: String, msg: Vec<u8>, out_tx: &mpsc::Sender<Out>
             let resp = ServerMsg::NegMsg {
                 sub_id: &sub_id,
                 msg: &reply,
+                max_records: None,
             }
             .to_json();
             let _ = out_tx.send(Out::Text(resp)).await;
@@ -1847,6 +1849,99 @@ mod tests {
             v[1].as_str().unwrap_or("").contains("too many"),
             "NOTICE should mention subscription limit: {resp}",
         );
+    }
+
+    /// Verifies that NEG-OPEN rejects sessions that exceed `max_neg_records`.
+    ///
+    /// Spawns a server with `max_neg_records = 3`, stores 5 events, and opens a NEG-OPEN
+    /// with a broad filter. The server should respond with NEG-ERR.
+    #[tokio::test]
+    async fn test_neg_open_rejects_when_exceeding_max_records() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.keep()).unwrap());
+        let config = Arc::new(Config {
+            relay_url: format!("ws://127.0.0.1:{port}"),
+            max_neg_records: 3,
+            ..Config::default()
+        });
+        let fanout = Fanout::new();
+        let srv_store = Arc::clone(&store);
+        let srv_config = Arc::clone(&config);
+        let srv_fanout = Arc::clone(&fanout);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, peer)) = listener.accept().await {
+                    let s = Arc::clone(&srv_store);
+                    let c = Arc::clone(&srv_config);
+                    let f = Arc::clone(&srv_fanout);
+                    tokio::spawn(async move {
+                        let _ = handle_connection(stream, peer, s, c, f).await;
+                    });
+                }
+            }
+        });
+
+        // Store 5 events — exceeds the limit of 3.
+        for i in 1..=5 {
+            store.append(&make_event(i, 1, 1000 + i as i64, vec![])).unwrap();
+        }
+
+        let (_, hex_msg) = neg_initiate(&[]);
+        let mut ws = connect(port).await;
+
+        let raw = format!(r#"["NEG-OPEN","s1",{{}},"{hex_msg}"]"#);
+        ws.send(TMsg::Text(raw.into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "NEG-ERR", "expected NEG-ERR when records exceed limit: {resp}");
+        assert!(
+            v[2].as_str().unwrap_or("").contains("too many records"),
+            "NEG-ERR reason should mention too many records: {resp}",
+        );
+    }
+
+    /// Verifies that NEG-MSG includes the max_records as a 4th element.
+    #[tokio::test]
+    async fn test_neg_msg_includes_max_records() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.keep()).unwrap());
+        let config = Arc::new(Config {
+            relay_url: format!("ws://127.0.0.1:{port}"),
+            max_neg_records: 100,
+            ..Config::default()
+        });
+        let fanout = Fanout::new();
+        let srv_store = Arc::clone(&store);
+        let srv_config = Arc::clone(&config);
+        let srv_fanout = Arc::clone(&fanout);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, peer)) = listener.accept().await {
+                    let s = Arc::clone(&srv_store);
+                    let c = Arc::clone(&srv_config);
+                    let f = Arc::clone(&srv_fanout);
+                    tokio::spawn(async move {
+                        let _ = handle_connection(stream, peer, s, c, f).await;
+                    });
+                }
+            }
+        });
+
+        store.append(&make_event(1, 1, 1000, vec![])).unwrap();
+
+        let (_, hex_msg) = neg_initiate(&[]);
+        let mut ws = connect(port).await;
+
+        let raw = format!(r#"["NEG-OPEN","s1",{{}},"{hex_msg}"]"#);
+        ws.send(TMsg::Text(raw.into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "NEG-MSG", "expected NEG-MSG: {resp}");
+        assert_eq!(v[3], 100, "4th element should be max_neg_records: {resp}");
     }
 
     /// Verifies that omitting the `limit` field in a REQ filter respects `max_limit` config.

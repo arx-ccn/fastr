@@ -26,6 +26,9 @@ pub struct Config {
     pub relay_url: String,
     /// Interval in seconds between background compaction runs. 0 = disabled. Default: 21600 (6h).
     pub compact_interval: u64,
+    /// Maximum number of records allowed in a single negentropy session. Default: 500_000.
+    /// If a NEG-OPEN filter matches more events than this, the server responds with NEG-ERR.
+    pub max_neg_records: usize,
 }
 
 impl Default for Config {
@@ -52,6 +55,7 @@ impl Default for Config {
                 .unwrap_or_else(|_| std::path::PathBuf::from("./data")),
             relay_url,
             compact_interval: env_parse("FASTR_COMPACT_INTERVAL", 21600),
+            max_neg_records: env_parse("FASTR_MAX_NEG_RECORDS", 500_000),
         }
     }
 }
