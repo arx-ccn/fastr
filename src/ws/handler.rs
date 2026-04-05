@@ -959,12 +959,19 @@ mod tests {
         // closes the connection rather than buffering the full message.
         // Drain any pending messages (e.g. AUTH challenge) until we see close/error.
         use futures_util::StreamExt;
+        use std::time::Duration;
         loop {
-            match ws.next().await {
-                None => break,
-                Some(Err(_)) => break,
-                Some(Ok(TMsg::Close(_))) => break,
-                Some(Ok(_)) => continue, // skip AUTH, Ping, etc.
+            match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+                Err(_elapsed) => panic!("drain loop timed out waiting for close/error"),
+                Ok(None) => break,
+                Ok(Some(Err(_))) => break,
+                Ok(Some(Ok(TMsg::Close(_)))) => break,
+                Ok(Some(Ok(TMsg::Text(ref t)))) => {
+                    assert!(!t.contains("NOTICE"), "unexpected NOTICE from server: {t}");
+                    // Non-NOTICE text (e.g. AUTH challenge) is fine — keep draining.
+                }
+                Ok(Some(Ok(TMsg::Ping(_) | TMsg::Pong(_)))) => {}
+                Ok(Some(Ok(frame))) => panic!("unexpected frame: {frame:?}"),
             }
         }
     }
