@@ -1372,7 +1372,7 @@ mod tests {
 
     #[test]
     fn test_parse_filter_too_many_ids_rejected() {
-        let ids: Vec<String> = (0..257).map(|i| format!("\"{}\"", format!("{:064x}", i))).collect();
+        let ids: Vec<String> = (0..257).map(|i| format!("\"{:064x}\"", i)).collect();
         let msg = format!(r#"["REQ","s1",{{"ids":[{}]}}]"#, ids.join(","));
         let err = parse_client_msg(&msg, 256).unwrap_err();
         assert!(err.contains("too many values"), "got: {err}");
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[test]
     fn test_parse_filter_too_many_authors_rejected() {
-        let authors: Vec<String> = (0..257).map(|i| format!("\"{}\"", format!("{:064x}", i))).collect();
+        let authors: Vec<String> = (0..257).map(|i| format!("\"{:064x}\"", i)).collect();
         let msg = format!(r#"["REQ","s1",{{"authors":[{}]}}]"#, authors.join(","));
         let err = parse_client_msg(&msg, 256).unwrap_err();
         assert!(err.contains("too many values"), "got: {err}");
@@ -1405,7 +1405,7 @@ mod tests {
 
     #[test]
     fn test_parse_filter_at_limit_accepted() {
-        let ids: Vec<String> = (0..256).map(|i| format!("\"{}\"", format!("{:064x}", i))).collect();
+        let ids: Vec<String> = (0..256).map(|i| format!("\"{:064x}\"", i)).collect();
         let msg = format!(r#"["REQ","s1",{{"ids":[{}]}}]"#, ids.join(","));
         assert!(parse_client_msg(&msg, 256).is_ok());
     }
