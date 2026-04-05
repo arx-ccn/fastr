@@ -102,7 +102,10 @@ pub async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let ws = tokio_tungstenite::accept_async(stream)
+    let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    ws_config.max_message_size = Some(config.max_message_bytes);
+    ws_config.max_frame_size = Some(config.max_message_bytes);
+    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config))
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -935,18 +938,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_oversized_message_notice_connection_stays_open() {
+    async fn test_oversized_message_drops_connection() {
         let (port, _) = spawn_server().await;
-        let mut ws = connect(port).await;
+
+        // Connect with a large client-side limit so the *client* happily sends
+        // the oversized frame; the *server* should reject it at the frame level.
+        let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        ws_config.max_message_size = Some(1 << 20);
+        ws_config.max_frame_size = Some(1 << 20);
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async_with_config(format!("ws://127.0.0.1:{port}"), Some(ws_config), false)
+                .await
+                .unwrap();
+
         let big = "x".repeat(200 * 1024);
         let msg = format!(r#"["REQ","s",{{"ids":["{big}"]}}]"#);
         ws.send(TMsg::Text(msg.into())).await.unwrap();
-        let resp = recv_text(&mut ws).await;
-        assert!(resp.contains("NOTICE"), "expected NOTICE: {resp}");
-        // Connection must remain alive.
-        ws.send(TMsg::Text(r#"["REQ","alive",{}]"#.into())).await.unwrap();
-        let eose = recv_text(&mut ws).await;
-        assert!(eose.contains("EOSE"), "connection must still be alive: {eose}");
+
+        // The server enforces max_message_bytes at the frame level, so it
+        // closes the connection rather than buffering the full message.
+        // Drain any pending messages (e.g. AUTH challenge) until we see close/error.
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+                Err(_elapsed) => panic!("drain loop timed out waiting for close/error"),
+                Ok(None) => break,
+                Ok(Some(Err(_))) => break,
+                Ok(Some(Ok(TMsg::Close(_)))) => break,
+                Ok(Some(Ok(TMsg::Text(ref t)))) => {
+                    assert!(!t.contains("NOTICE"), "unexpected NOTICE from server: {t}");
+                    // Non-NOTICE text (e.g. AUTH challenge) is fine — keep draining.
+                }
+                Ok(Some(Ok(TMsg::Ping(_) | TMsg::Pong(_)))) => {}
+                Ok(Some(Ok(frame))) => panic!("unexpected frame: {frame:?}"),
+            }
+        }
     }
 
     #[tokio::test]
