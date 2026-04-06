@@ -1168,7 +1168,7 @@ impl Store {
     where
         F: FnMut(&[u8]) -> Result<(), Error>,
     {
-        self.query_authed(filter, None, cb)
+        self.query_authed(filter, &[], cb)
     }
 
     /// Query stored events matching `filter`, invoking `cb` with each event's serialized bytes.
@@ -1197,14 +1197,14 @@ impl Store {
     /// use fastr::nostr::Filter;
     /// let store = Store::open(Path::new("/tmp/store"))?;
     /// let filter = Filter { kinds: vec![], authors: vec![], ids: vec![], since: None, until: None, limit: None, tags: std::collections::HashMap::new() };
-    /// store.query_authed(&filter, None, |ev_bytes| {
+    /// store.query_authed(&filter, &[], |ev_bytes| {
     ///     println!("event {} bytes", ev_bytes.len());
     ///     Ok(())
     /// })?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn query_authed<F>(&self, filter: &Filter, auth_pubkey: Option<&[u8; 32]>, mut cb: F) -> Result<(), Error>
+    pub fn query_authed<F>(&self, filter: &Filter, auth_pubkeys: &[[u8; 32]], mut cb: F) -> Result<(), Error>
     where
         F: FnMut(&[u8]) -> Result<(), Error>,
     {
@@ -1215,11 +1215,19 @@ impl Store {
         let total = idx_slice.len() / INDEX_ENTRY_SIZE;
         let limit = filter.limit.unwrap_or(500);
 
-        // NIP-17: pre-compute set of data_offsets where the p-tag matches auth_pubkey.
+        // NIP-17: pre-compute set of data_offsets where a p-tag matches any auth pubkey.
         // Only scan tags.s when the filter could actually match kind-1059 events.
-        let nip17_allowed: Option<HashSet<u64>> = auth_pubkey
-            .filter(|_| filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP))
-            .map(|pk| tags::matching_offsets(&tags_slice, b'p', pk));
+        let nip17_allowed: Option<HashSet<u64>> = if auth_pubkeys.is_empty() {
+            None
+        } else if filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP) {
+            let mut set = HashSet::new();
+            for pk in auth_pubkeys {
+                set.extend(tags::matching_offsets(&tags_slice, b'p', pk));
+            }
+            Some(set)
+        } else {
+            None
+        };
 
         // Pre-compute tag offset sets via a single pass over tags.s.
         // Decode all filter values to [u8;32]+len first (stack-allocated), then scan once.
@@ -1326,7 +1334,7 @@ impl Store {
     pub fn iter_negentropy<F>(
         &self,
         filter: &Filter,
-        auth_pk: Option<&[u8; 32]>,
+        auth_pubkeys: &[[u8; 32]],
         max_records: usize,
         mut f: F,
     ) -> Result<(), Error>
@@ -1336,10 +1344,18 @@ impl Store {
         let idx_slice = self.index.slice();
         let tags_slice = self.tags.slice();
 
-        // NIP-17: pre-compute set of data_offsets where the p-tag matches auth_pk.
-        let nip17_allowed: Option<HashSet<u64>> = auth_pk
-            .filter(|_| filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP))
-            .map(|pk| tags::matching_offsets(&tags_slice, b'p', pk));
+        // NIP-17: pre-compute set of data_offsets where a p-tag matches any auth pubkey.
+        let nip17_allowed: Option<HashSet<u64>> = if auth_pubkeys.is_empty() {
+            None
+        } else if filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP) {
+            let mut set = HashSet::new();
+            for pk in auth_pubkeys {
+                set.extend(tags::matching_offsets(&tags_slice, b'p', pk));
+            }
+            Some(set)
+        } else {
+            None
+        };
 
         // Pre-compute tag offset sets via a single pass over tags.s.
         let tag_sets: Vec<(u8, HashSet<u64>)> = if filter.tags.is_empty() {
