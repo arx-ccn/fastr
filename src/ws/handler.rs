@@ -372,7 +372,7 @@ async fn handle_event(
                 send_ok(&id, true, "", out_tx).await;
             }
             Err(Error::Duplicate) => {
-                send_ok(&id, false, "duplicate: already have this event", out_tx).await;
+                send_ok(&id, true, "duplicate: already have this event", out_tx).await;
             }
             Err(e) => {
                 warn!("store append error: {e}");
@@ -391,7 +391,7 @@ async fn handle_event(
             send_ok(&id, true, "", out_tx).await;
         }
         Err(Error::Duplicate) => {
-            send_ok(&id, false, "duplicate: already have this event", out_tx).await;
+            send_ok(&id, true, "duplicate: already have this event", out_tx).await;
         }
         Err(Error::Rejected(reason)) => {
             send_ok(&id, false, reason, out_tx).await;
@@ -466,22 +466,37 @@ async fn handle_req(
     // Transcode BASED -> JSON directly, bypassing Event struct entirely.
     // Collect all events into a batch, then send once through the channel.
     // This cuts channel operations from N to 1, eliminating per-event async overhead.
-    let mut batch: Vec<String> = Vec::with_capacity(128);
+    //
+    // NIP-01: results must be sorted by created_at descending. The index is
+    // ordered by append time which may differ, so we collect (created_at, json)
+    // pairs, sort, then flatten into the final batch.
+    let mut unsorted: Vec<(i64, String)> = Vec::with_capacity(128);
     let mut json_buf = String::with_capacity(1024);
     // NIP-17: pass authenticated pubkey so kind-1059 events are filtered.
     let auth_pk = auth.authenticated.as_ref().map(|pk| &pk.0);
     for filter in &filters {
         let sid = sub_id.clone();
         let res = store.query_authed(filter, auth_pk, |dp_bytes| {
+            // created_at is stored as LE i64 at bytes 128..136 of the data pack.
+            let created_at = i64::from_le_bytes(
+                dp_bytes[128..136]
+                    .try_into()
+                    .map_err(|_| std::io::Error::other("short data pack"))?,
+            );
             json_buf.clear();
             pack::transcode_to_event_json(dp_bytes, &sid, &mut json_buf)?;
-            batch.push(std::mem::take(&mut json_buf));
+            unsorted.push((created_at, std::mem::take(&mut json_buf)));
             Ok(())
         });
         if let Err(e) = res {
             warn!("store query error during REQ: {e}");
         }
     }
+
+    // Sort by created_at descending (NIP-01).
+    unsorted.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let mut batch: Vec<String> = Vec::with_capacity(unsorted.len() + 1);
+    batch.extend(unsorted.into_iter().map(|(_, json)| json));
 
     // Append EOSE to the batch so it arrives in the same channel message.
     let eose = ServerMsg::Eose { sub_id: &sub_id }.to_json();
