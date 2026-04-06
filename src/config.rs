@@ -31,7 +31,7 @@ pub struct Config {
     pub max_neg_records: usize,
     /// Maximum number of tags allowed on an incoming event. Default: 2000.
     pub max_event_tags: usize,
-    /// Maximum content length (in bytes) allowed on an incoming event. Default: 8192.
+    /// Maximum content length (in bytes) allowed on an incoming event. Default: 50 KiB (51200).
     pub max_content_length: usize,
 }
 
@@ -61,7 +61,7 @@ impl Default for Config {
             compact_interval: env_parse("FASTR_COMPACT_INTERVAL", 21600),
             max_neg_records: env_parse("FASTR_MAX_NEG_RECORDS", 500_000),
             max_event_tags: env_parse("FASTR_MAX_EVENT_TAGS", 2000),
-            max_content_length: env_parse("FASTR_MAX_CONTENT_LENGTH", 8192),
+            max_content_length: env_parse("FASTR_MAX_CONTENT_LENGTH", 50 * 1024),
         }
     }
 }
