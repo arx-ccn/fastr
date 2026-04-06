@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 /// Relay configuration, loaded from environment variables at startup.
@@ -33,6 +34,10 @@ pub struct Config {
     pub max_event_tags: usize,
     /// Maximum content length (in bytes) allowed on an incoming event. Default: 50 KiB (51200).
     pub max_content_length: usize,
+    /// Per-kind content length overrides. Kinds listed here use their own max instead of
+    /// `max_content_length`. Parsed from `FASTR_MAX_CONTENT_LENGTH_PER_KIND` as
+    /// comma-separated `kind:bytes` pairs, e.g. `1053:102400,30023:102400`.
+    pub max_content_length_per_kind: HashMap<u16, usize>,
 }
 
 impl Default for Config {
@@ -62,12 +67,35 @@ impl Default for Config {
             max_neg_records: env_parse("FASTR_MAX_NEG_RECORDS", 500_000),
             max_event_tags: env_parse("FASTR_MAX_EVENT_TAGS", 2000),
             max_content_length: env_parse("FASTR_MAX_CONTENT_LENGTH", 50 * 1024),
+            max_content_length_per_kind: parse_kind_limits("FASTR_MAX_CONTENT_LENGTH_PER_KIND"),
         }
+    }
+}
+
+impl Config {
+    /// Return the effective max content length for a given event kind.
+    pub fn content_limit_for_kind(&self, kind: u16) -> usize {
+        self.max_content_length_per_kind
+            .get(&kind)
+            .copied()
+            .unwrap_or(self.max_content_length)
     }
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Parse `kind:bytes,kind:bytes,...` from an env var into a HashMap.
+fn parse_kind_limits(key: &str) -> HashMap<u16, usize> {
+    std::env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|entry| {
+            let (k, v) = entry.split_once(':')?;
+            Some((k.trim().parse().ok()?, v.trim().parse().ok()?))
+        })
+        .collect()
 }
 
 #[cfg(test)]

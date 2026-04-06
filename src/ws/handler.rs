@@ -358,7 +358,7 @@ async fn handle_event(
         send_ok(&id, false, "invalid: too many tags", out_tx).await;
         return;
     }
-    if ev.content.len() > config.max_content_length {
+    if ev.content.len() > config.content_limit_for_kind(ev.kind) {
         send_ok(&id, false, "invalid: content too long", out_tx).await;
         return;
     }
