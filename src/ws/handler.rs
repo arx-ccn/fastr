@@ -20,6 +20,9 @@ use crate::pack::{self, Event, EventId};
 use crate::ws::auth::{verify_auth_event, AuthState};
 use crate::ws::fanout::{Fanout, LiveEvent};
 
+/// Maximum number of pubkeys a single connection can authenticate as.
+const MAX_AUTH_PUBKEYS: usize = 16;
+
 /// Unified subscription entry: either a live fanout subscription or a negentropy session.
 enum Sub {
     Live,
@@ -286,18 +289,30 @@ where
                         let id = ev.id.clone();
                         match verify_auth_event(&ev, &auth.challenge, &config.relay_url) {
                             Ok(pubkey) => {
-                                auth.authenticated.insert(pubkey.clone());
-                                // NIP-17: update shared auth pubkeys for the forward task.
-                                if let Ok(mut g) = auth_pk_shared.write() {
-                                    g.insert(pubkey);
+                                if auth.authenticated.len() >= MAX_AUTH_PUBKEYS
+                                    && !auth.authenticated.contains(&pubkey)
+                                {
+                                    let ok = ServerMsg::Ok {
+                                        id: &id,
+                                        accepted: false,
+                                        reason: "auth-required: too many authenticated pubkeys",
+                                    }
+                                    .to_json();
+                                    let _ = out_tx.send(Out::Text(ok)).await;
+                                } else {
+                                    auth.authenticated.insert(pubkey.clone());
+                                    // NIP-17: update shared auth pubkeys for the forward task.
+                                    if let Ok(mut g) = auth_pk_shared.write() {
+                                        g.insert(pubkey);
+                                    }
+                                    let ok = ServerMsg::Ok {
+                                        id: &id,
+                                        accepted: true,
+                                        reason: "",
+                                    }
+                                    .to_json();
+                                    let _ = out_tx.send(Out::Text(ok)).await;
                                 }
-                                let ok = ServerMsg::Ok {
-                                    id: &id,
-                                    accepted: true,
-                                    reason: "",
-                                }
-                                .to_json();
-                                let _ = out_tx.send(Out::Text(ok)).await;
                             }
                             Err(reason) => {
                                 let ok = ServerMsg::Ok {
@@ -1361,19 +1376,20 @@ mod tests {
         assert_eq!(v[0], "OK", "EVENT response: {resp}");
         assert_eq!(v[2], true, "kind-22242 via EVENT must be accepted: {resp}");
 
-        // Subscriber must NOT receive the event. Send a ping and expect pong back
-        // without any EVENT frame in between.
+        // Subscriber must NOT receive the event. Drain all frames until timeout.
         sub_ws.send(TMsg::Ping(vec![42].into())).await.unwrap();
-        let msg = tokio::time::timeout(std::time::Duration::from_millis(500), sub_ws.next()).await;
-        match msg {
-            Ok(Some(Ok(TMsg::Pong(_)))) => {} // correct: no event, just pong
-            Ok(Some(Ok(TMsg::Text(t)))) => {
-                let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
-                if v[0] == "EVENT" {
-                    panic!("kind-22242 must not be broadcast to subscribers");
+        let deadline = std::time::Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout(deadline, sub_ws.next()).await {
+                Ok(Some(Ok(TMsg::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v[0] == "EVENT" {
+                        panic!("kind-22242 must not be broadcast to subscribers");
+                    }
                 }
+                Ok(Some(Ok(TMsg::Pong(_) | TMsg::Ping(_)))) => continue,
+                _ => break, // timeout, close, or error — done draining
             }
-            _ => {} // timeout or close is fine
         }
     }
 
