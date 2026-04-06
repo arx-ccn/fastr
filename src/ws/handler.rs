@@ -289,8 +289,7 @@ where
                         let id = ev.id.clone();
                         match verify_auth_event(&ev, &auth.challenge, &config.relay_url) {
                             Ok(pubkey) => {
-                                if auth.authenticated.len() >= MAX_AUTH_PUBKEYS
-                                    && !auth.authenticated.contains(&pubkey)
+                                if auth.authenticated.len() >= MAX_AUTH_PUBKEYS && !auth.authenticated.contains(&pubkey)
                                 {
                                     let ok = ServerMsg::Ok {
                                         id: &id,
