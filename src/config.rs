@@ -32,12 +32,15 @@ pub struct Config {
     pub max_neg_records: usize,
     /// Maximum number of tags allowed on an incoming event. Default: 2000.
     pub max_event_tags: usize,
-    /// Maximum content length (in bytes) allowed on an incoming event. Default: 50 KiB (51200).
-    pub max_content_length: usize,
-    /// Per-kind content length overrides. Kinds listed here use their own max instead of
-    /// `max_content_length`. Parsed from `FASTR_MAX_CONTENT_LENGTH_PER_KIND` as
-    /// comma-separated `kind:bytes` pairs, e.g. `1053:102400,30023:102400`.
+    /// Per-kind maximum content length (in bytes). Every kind falls back to the global default
+    /// (FASTR_MAX_CONTENT_LENGTH, default 50 KiB). Individual kinds can be overridden via
+    /// `FASTR_MAX_CONTENT_LENGTH_PER_KIND` as comma-separated `kind:bytes` pairs,
+    /// e.g. `30023:102400`.
+    /// NIP-11 `max_content_length` is reported as the limit for kind 1.
     pub max_content_length_per_kind: HashMap<u16, usize>,
+    /// Global default content length limit. Kinds not in max_content_length_per_kind use this.
+    /// Default: 50 KiB (51200). Override with `FASTR_MAX_CONTENT_LENGTH`.
+    pub max_content_length: usize,
 }
 
 impl Default for Config {
@@ -182,5 +185,15 @@ mod tests {
         };
         assert_eq!(cfg.content_limit_for_kind(30023), 200 * 1024);
         assert_eq!(cfg.content_limit_for_kind(1), 50 * 1024);
+    }
+
+    #[test]
+    fn test_nip11_reports_kind1_limit() {
+        let cfg = Config {
+            max_content_length_per_kind: HashMap::from([(1, 69420)]),
+            ..Config::default()
+        };
+        // NIP-11 should report the kind-1 specific limit, not the global default
+        assert_eq!(cfg.content_limit_for_kind(1), 69420);
     }
 }

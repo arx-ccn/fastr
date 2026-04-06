@@ -65,7 +65,7 @@ impl RelayInfo {
                 max_limit: config.max_limit,
                 max_subid_length: config.max_subid_length,
                 max_event_tags: config.max_event_tags,
-                max_content_length: config.max_content_length,
+                max_content_length: config.content_limit_for_kind(1),
                 created_at_upper_limit: CREATED_AT_WINDOW,
                 auth_required: false,
             },
@@ -313,6 +313,6 @@ mod tests {
         assert_eq!(lim["max_limit"], cfg.max_limit);
         assert_eq!(lim["max_subid_length"], cfg.max_subid_length);
         assert_eq!(lim["max_event_tags"], cfg.max_event_tags);
-        assert_eq!(lim["max_content_length"], cfg.max_content_length);
+        assert_eq!(lim["max_content_length"], cfg.content_limit_for_kind(1));
     }
 }
