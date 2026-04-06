@@ -175,9 +175,11 @@ mod tests {
 
     #[test]
     fn test_content_limit_for_kind_override() {
-        let mut cfg = Config::default();
-        cfg.max_content_length = 50 * 1024;
-        cfg.max_content_length_per_kind.insert(30023, 200 * 1024);
+        let cfg = Config {
+            max_content_length: 50 * 1024,
+            max_content_length_per_kind: HashMap::from([(30023, 200 * 1024)]),
+            ..Config::default()
+        };
         assert_eq!(cfg.content_limit_for_kind(30023), 200 * 1024);
         assert_eq!(cfg.content_limit_for_kind(1), 50 * 1024);
     }
