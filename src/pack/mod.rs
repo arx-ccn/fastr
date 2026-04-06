@@ -7,7 +7,7 @@ use crate::error::{Error, PackError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventId(pub [u8; 32]);
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Pubkey(pub [u8; 32]);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sig(pub [u8; 64]);

@@ -14,11 +14,14 @@ use crate::db::Store;
 use crate::error::Error;
 use crate::nostr::{
     classify_kind, has_protected_tag, parse_client_msg, validate_event, validate_sub_id, ClientMsg, Filter, KindClass,
-    ServerMsg,
+    ServerMsg, KIND_AUTH,
 };
 use crate::pack::{self, Event, EventId};
 use crate::ws::auth::{verify_auth_event, AuthState};
 use crate::ws::fanout::{Fanout, LiveEvent};
+
+/// Maximum number of pubkeys a single connection can authenticate as.
+const MAX_AUTH_PUBKEYS: usize = 16;
 
 /// Unified subscription entry: either a live fanout subscription or a negentropy session.
 enum Sub {
@@ -118,7 +121,9 @@ where
     let (live_tx, mut live_rx) = mpsc::channel::<LiveEvent>(256);
 
     // NIP-17: share authenticated pubkey with the forward task for gift-wrap filtering.
-    let auth_pk_shared = std::sync::Arc::new(std::sync::RwLock::new(None::<crate::pack::Pubkey>));
+    let auth_pk_shared = std::sync::Arc::new(std::sync::RwLock::new(
+        std::collections::HashSet::<crate::pack::Pubkey>::new(),
+    ));
     let auth_pk_fwd = auth_pk_shared.clone();
 
     // Forward task: bridge live events into the unified outbound channel.
@@ -128,8 +133,10 @@ where
         while let Some(le) = live_rx.recv().await {
             // NIP-17: kind-1059 (gift-wrapped DM) only delivered to the p-tag recipient.
             if le.event.kind == crate::nostr::KIND_GIFT_WRAP {
-                let auth_pk = auth_pk_fwd.read().ok().and_then(|g| g.clone());
-                let allowed = auth_pk.is_some_and(|pk| crate::nostr::event_has_p_tag(&le.event, &pk.0));
+                let allowed = auth_pk_fwd
+                    .read()
+                    .ok()
+                    .is_some_and(|pks| pks.iter().any(|pk| crate::nostr::event_has_p_tag(&le.event, &pk.0)));
                 if !allowed {
                     continue;
                 }
@@ -282,18 +289,29 @@ where
                         let id = ev.id.clone();
                         match verify_auth_event(&ev, &auth.challenge, &config.relay_url) {
                             Ok(pubkey) => {
-                                auth.authenticated = Some(pubkey.clone());
-                                // NIP-17: update shared auth pubkey for the forward task.
-                                if let Ok(mut g) = auth_pk_shared.write() {
-                                    *g = Some(pubkey);
+                                if auth.authenticated.len() >= MAX_AUTH_PUBKEYS && !auth.authenticated.contains(&pubkey)
+                                {
+                                    let ok = ServerMsg::Ok {
+                                        id: &id,
+                                        accepted: false,
+                                        reason: "auth-required: too many authenticated pubkeys",
+                                    }
+                                    .to_json();
+                                    let _ = out_tx.send(Out::Text(ok)).await;
+                                } else {
+                                    auth.authenticated.insert(pubkey.clone());
+                                    // NIP-17: update shared auth pubkeys for the forward task.
+                                    if let Ok(mut g) = auth_pk_shared.write() {
+                                        g.insert(pubkey);
+                                    }
+                                    let ok = ServerMsg::Ok {
+                                        id: &id,
+                                        accepted: true,
+                                        reason: "",
+                                    }
+                                    .to_json();
+                                    let _ = out_tx.send(Out::Text(ok)).await;
                                 }
-                                let ok = ServerMsg::Ok {
-                                    id: &id,
-                                    accepted: true,
-                                    reason: "",
-                                }
-                                .to_json();
-                                let _ = out_tx.send(Out::Text(ok)).await;
                             }
                             Err(reason) => {
                                 let ok = ServerMsg::Ok {
@@ -346,7 +364,7 @@ async fn handle_event(
     }
 
     // NIP-70: reject protected events unless AUTH'd as the event author
-    if has_protected_tag(&ev.tags) && auth.authenticated.as_ref() != Some(&ev.pubkey) {
+    if has_protected_tag(&ev.tags) && !auth.authenticated.contains(&ev.pubkey) {
         send_ok(&id, false, "auth-required: protected event", out_tx).await;
         return;
     }
@@ -354,8 +372,11 @@ async fn handle_event(
     // Kind classification - ephemeral events skip storage
     let kind_class = classify_kind(ev.kind, &ev.tags);
     if matches!(kind_class, KindClass::Ephemeral) {
-        let ev = Arc::new(ev);
-        fanout.broadcast(Arc::clone(&ev)).await;
+        // NIP-42: never broadcast kind-22242 AUTH events to subscribers.
+        if ev.kind != KIND_AUTH {
+            let ev = Arc::new(ev);
+            fanout.broadcast(Arc::clone(&ev)).await;
+        }
         send_ok(&id, true, "", out_tx).await;
         return;
     }
@@ -472,11 +493,11 @@ async fn handle_req(
     // pairs, sort, then flatten into the final batch.
     let mut unsorted: Vec<(i64, String)> = Vec::with_capacity(128);
     let mut json_buf = String::with_capacity(1024);
-    // NIP-17: pass authenticated pubkey so kind-1059 events are filtered.
-    let auth_pk = auth.authenticated.as_ref().map(|pk| &pk.0);
+    // NIP-17: pass authenticated pubkeys so kind-1059 events are filtered.
+    let auth_pks: Vec<[u8; 32]> = auth.authenticated.iter().map(|pk| pk.0).collect();
     for filter in &filters {
         let sid = sub_id.clone();
-        let res = store.query_authed(filter, auth_pk, |dp_bytes| {
+        let res = store.query_authed(filter, &auth_pks, |dp_bytes| {
             // created_at is stored as LE i64 at bytes 128..136 of the data pack.
             let created_at = i64::from_le_bytes(
                 dp_bytes[128..136]
@@ -593,11 +614,11 @@ async fn handle_neg_open(
     }
 
     // Build the negentropy storage.
-    let auth_pk = auth.authenticated.as_ref().map(|pk| &pk.0);
+    let auth_pks: Vec<[u8; 32]> = auth.authenticated.iter().map(|pk| pk.0).collect();
     let mut storage = NegentropyStorageVector::new();
     let mut insert_error: Option<String> = None;
 
-    if let Err(e) = store.iter_negentropy(&filter, auth_pk, config.max_neg_records, |ts, id| {
+    if let Err(e) = store.iter_negentropy(&filter, &auth_pks, config.max_neg_records, |ts, id| {
         if insert_error.is_none() {
             if let Err(e) = storage.insert(ts as u64, NegId::from_byte_array(id)) {
                 insert_error = Some(e.to_string());
@@ -1299,6 +1320,91 @@ mod tests {
             }
         }
         assert_eq!(count, 1, "unauthenticated REQ must still work");
+    }
+
+    #[tokio::test]
+    async fn test_nip42_multiple_pubkeys_retained() {
+        let (port, _) = spawn_server().await;
+        let mut ws = connect(port).await;
+
+        let first = recv_text_raw(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let challenge = v[1].as_str().unwrap().to_owned();
+        let relay_url = format!("ws://127.0.0.1:{port}");
+
+        // AUTH as pubkey A (sk_scalar=1).
+        let ev_a = make_auth_event_for_conn(1, &challenge, &relay_url, 0);
+        ws.send(TMsg::Text(format!(r#"["AUTH",{}]"#, event_json(&ev_a)).into()))
+            .await
+            .unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[2], true, "first auth must succeed");
+
+        // AUTH as pubkey B (sk_scalar=2).
+        let ev_b = make_auth_event_for_conn(2, &challenge, &relay_url, 0);
+        ws.send(TMsg::Text(format!(r#"["AUTH",{}]"#, event_json(&ev_b)).into()))
+            .await
+            .unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[2], true, "second auth must succeed");
+
+        // NIP-70: send a protected event as pubkey A — must be accepted (not just B).
+        let protected_ev = make_event(
+            1,
+            1,
+            0,
+            vec![crate::pack::Tag {
+                fields: vec!["-".to_owned()],
+            }],
+        );
+        ws.send(event_msg(&protected_ev).into()).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "OK");
+        assert_eq!(
+            v[2], true,
+            "protected event from first-auth'd pubkey must be accepted: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nip42_kind22242_not_broadcast() {
+        let (port, _) = spawn_server().await;
+
+        // Subscriber: connect and subscribe to ephemeral events.
+        let mut sub_ws = connect(port).await;
+        sub_ws
+            .send(TMsg::Text(r#"["REQ","live",{"kinds":[22242]}]"#.into()))
+            .await
+            .unwrap();
+        let _ = recv_text(&mut sub_ws).await; // EOSE
+
+        // Publisher: submit a kind-22242 event via EVENT (not AUTH).
+        let mut pub_ws = connect(port).await;
+        let ev = make_event(1, 22242, 0, vec![]);
+        pub_ws.send(event_msg(&ev).into()).await.unwrap();
+        let resp = recv_text(&mut pub_ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "OK", "EVENT response: {resp}");
+        assert_eq!(v[2], true, "kind-22242 via EVENT must be accepted: {resp}");
+
+        // Subscriber must NOT receive the event. Drain all frames until timeout.
+        sub_ws.send(TMsg::Ping(vec![42].into())).await.unwrap();
+        let deadline = std::time::Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout(deadline, sub_ws.next()).await {
+                Ok(Some(Ok(TMsg::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v[0] == "EVENT" {
+                        panic!("kind-22242 must not be broadcast to subscribers");
+                    }
+                }
+                Ok(Some(Ok(TMsg::Pong(_) | TMsg::Ping(_)))) => continue,
+                _ => break, // timeout, close, or error — done draining
+            }
+        }
     }
 
     // NIP-45 COUNT handler tests
