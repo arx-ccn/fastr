@@ -1,6 +1,8 @@
 /// NIP-42 client authentication state and challenge/verification logic.
 use std::io::Read;
 
+use std::collections::HashSet;
+
 use crate::db::store::unix_now;
 use crate::nostr::{validate_event, KIND_AUTH};
 use crate::pack::{Event, Pubkey};
@@ -27,8 +29,8 @@ fn generate_challenge() -> String {
 pub struct AuthState {
     /// Challenge string sent to the client on connection open.
     pub challenge: String,
-    /// Set to the client's pubkey on successful authentication.
-    pub authenticated: Option<Pubkey>,
+    /// Pubkeys the client has successfully authenticated as.
+    pub authenticated: HashSet<Pubkey>,
 }
 
 impl Default for AuthState {
@@ -41,7 +43,7 @@ impl AuthState {
     pub fn new() -> Self {
         AuthState {
             challenge: generate_challenge(),
-            authenticated: None,
+            authenticated: HashSet::new(),
         }
     }
 }
@@ -64,9 +66,9 @@ pub fn verify_auth_event(ev: &Event, expected_challenge: &str, relay_url: &str) 
         return Err("auth-required: wrong event kind".to_owned());
     }
 
-    // 2. Timestamp bounds.
+    // 2. Timestamp bounds (overflow-safe: no subtraction on untrusted input).
     let now = unix_now();
-    if (ev.created_at - now).abs() > 600 {
+    if !(now - 600..=now + 600).contains(&ev.created_at) {
         return Err("auth-required: created_at out of range".to_owned());
     }
 
@@ -222,6 +224,24 @@ mod tests {
             state.challenge.chars().all(|c| c.is_ascii_hexdigit()),
             "challenge must be hex"
         );
-        assert!(state.authenticated.is_none());
+        assert!(state.authenticated.is_empty());
+    }
+
+    #[test]
+    fn test_created_at_i64_min_no_overflow() {
+        let challenge = "abc";
+        let relay = "ws://relay.example.com";
+        let ev = make_auth_event(1, 22242, i64::MIN, challenge, relay);
+        let err = verify_auth_event(&ev, challenge, relay).unwrap_err();
+        assert!(err.contains("created_at out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn test_created_at_i64_max_no_overflow() {
+        let challenge = "abc";
+        let relay = "ws://relay.example.com";
+        let ev = make_auth_event(1, 22242, i64::MAX, challenge, relay);
+        let err = verify_auth_event(&ev, challenge, relay).unwrap_err();
+        assert!(err.contains("created_at out of range"), "got: {err}");
     }
 }
