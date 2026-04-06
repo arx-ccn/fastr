@@ -29,6 +29,10 @@ pub struct Config {
     /// Maximum number of records allowed in a single negentropy session. Default: 500_000.
     /// If a NEG-OPEN filter matches more events than this, the server responds with NEG-ERR.
     pub max_neg_records: usize,
+    /// Maximum number of tags allowed on an incoming event. Default: 2000.
+    pub max_event_tags: usize,
+    /// Maximum content length (in bytes) allowed on an incoming event. Default: 8192.
+    pub max_content_length: usize,
 }
 
 impl Default for Config {
@@ -56,6 +60,8 @@ impl Default for Config {
             relay_url,
             compact_interval: env_parse("FASTR_COMPACT_INTERVAL", 21600),
             max_neg_records: env_parse("FASTR_MAX_NEG_RECORDS", 500_000),
+            max_event_tags: env_parse("FASTR_MAX_EVENT_TAGS", 2000),
+            max_content_length: env_parse("FASTR_MAX_CONTENT_LENGTH", 8192),
         }
     }
 }
