@@ -88,14 +88,27 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
 
 /// Parse `kind:bytes,kind:bytes,...` from an env var into a HashMap.
 fn parse_kind_limits(key: &str) -> HashMap<u16, usize> {
-    std::env::var(key)
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|entry| {
-            let (k, v) = entry.split_once(':')?;
-            Some((k.trim().parse().ok()?, v.trim().parse().ok()?))
-        })
-        .collect()
+    let raw = match std::env::var(key) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return HashMap::new(),
+    };
+    let mut map = HashMap::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match entry.split_once(':') {
+            Some((k, v)) => match (k.trim().parse::<u16>(), v.trim().parse::<usize>()) {
+                (Ok(kind), Ok(limit)) => {
+                    map.insert(kind, limit);
+                }
+                _ => eprintln!("warning: ignoring malformed {key} entry: {entry:?}"),
+            },
+            None => eprintln!("warning: ignoring malformed {key} entry: {entry:?}"),
+        }
+    }
+    map
 }
 
 #[cfg(test)]
@@ -139,5 +152,33 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.listen_addr.port(), 9000);
         unsafe { std::env::remove_var("FASTR_PORT") };
+    }
+
+    #[test]
+    fn test_parse_kind_limits_valid() {
+        unsafe { std::env::set_var("FASTR_TEST_KIND_LIMITS", "1053:102400,30023:204800") };
+        let map = parse_kind_limits("FASTR_TEST_KIND_LIMITS");
+        assert_eq!(map.get(&1053), Some(&102400));
+        assert_eq!(map.get(&30023), Some(&204800));
+        assert_eq!(map.len(), 2);
+        unsafe { std::env::remove_var("FASTR_TEST_KIND_LIMITS") };
+    }
+
+    #[test]
+    fn test_parse_kind_limits_malformed_skipped() {
+        unsafe { std::env::set_var("FASTR_TEST_KIND_LIMITS2", "1053:abc,bad,30023:100") };
+        let map = parse_kind_limits("FASTR_TEST_KIND_LIMITS2");
+        assert_eq!(map.get(&30023), Some(&100));
+        assert_eq!(map.len(), 1);
+        unsafe { std::env::remove_var("FASTR_TEST_KIND_LIMITS2") };
+    }
+
+    #[test]
+    fn test_content_limit_for_kind_override() {
+        let mut cfg = Config::default();
+        cfg.max_content_length = 50 * 1024;
+        cfg.max_content_length_per_kind.insert(30023, 200 * 1024);
+        assert_eq!(cfg.content_limit_for_kind(30023), 200 * 1024);
+        assert_eq!(cfg.content_limit_for_kind(1), 50 * 1024);
     }
 }
