@@ -90,3 +90,26 @@ Commit: `c6a4f6f` | Date: 2026-04-05T09:11:50Z
 | transcode_vs_deser/transcode/10000 | 400.92 us |
 | transcode_vs_deser/transcode/100000 | 4.16 ms |
 | validate_event | 44.43 us |
+## Benchmark Results
+
+Commit: `bf00b78` | Date: 2026-04-06T10:16:27Z
+
+| Benchmark | Median |
+|-----------|--------|
+| deserialize_trusted | 267.3 ns |
+| hex_decode_64 | 32.4 ns |
+| hex_encode_32 | 29.6 ns |
+| parse_client_msg | 1.45 us |
+| query_by_author/10000 | 351.53 us |
+| query_by_author/100000 | 362.31 us |
+| query_by_kind/10000 | 401.53 us |
+| query_by_kind/100000 | 4.19 ms |
+| query_by_tag_e/10000 | 356.17 us |
+| query_by_tag_e/100000 | 811.25 us |
+| serialize | 208.5 ns |
+| serialize_fast | 84.4 ns |
+| transcode_vs_deser/deser+json/10000 | 398.57 us |
+| transcode_vs_deser/deser+json/100000 | 4.11 ms |
+| transcode_vs_deser/transcode/10000 | 396.99 us |
+| transcode_vs_deser/transcode/100000 | 4.13 ms |
+| validate_event | 44.43 us |
