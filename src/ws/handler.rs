@@ -500,7 +500,9 @@ async fn handle_req(
         let res = store.query_authed(filter, &auth_pks, |dp_bytes| {
             // created_at is stored as LE i64 at bytes 128..136 of the data pack.
             let created_at = i64::from_le_bytes(
-                dp_bytes[128..136]
+                dp_bytes
+                    .get(128..136)
+                    .ok_or_else(|| std::io::Error::other("short data pack"))?
                     .try_into()
                     .map_err(|_| std::io::Error::other("short data pack"))?,
             );
@@ -2152,5 +2154,72 @@ mod tests {
             event_count, 5,
             "omitting limit should return at most max_limit events, got {event_count}"
         );
+    }
+
+    /// NIP-01: duplicate events must return OK with accepted=true (#29).
+    #[tokio::test]
+    async fn test_duplicate_event_returns_ok_true() {
+        let (port, _) = spawn_server().await;
+        let mut ws = connect(port).await;
+        let ev = make_event(1, 1, 1_700_000_000, vec![]);
+        let msg = event_msg(&ev);
+
+        // First submission — accepted.
+        ws.send(TMsg::Text(msg.clone().into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "OK");
+        assert_eq!(v[2], true, "first submit must be accepted: {resp}");
+
+        // Second (duplicate) submission — must still be accepted=true.
+        ws.send(TMsg::Text(msg.into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "OK");
+        assert_eq!(v[2], true, "duplicate must be accepted (true): {resp}");
+        assert!(
+            v[3].as_str().unwrap_or("").contains("duplicate"),
+            "duplicate reason expected: {resp}"
+        );
+    }
+
+    /// NIP-01: query results must be sorted by created_at descending (#32).
+    #[tokio::test]
+    async fn test_query_results_sorted_by_created_at_desc() {
+        let (port, store) = spawn_server().await;
+
+        // Insert events with non-monotonic timestamps (out of append order).
+        // sk_scalar must differ so events get distinct ids.
+        store.append(&make_event(1, 1, 3000, vec![])).unwrap();
+        store.append(&make_event(2, 1, 1000, vec![])).unwrap();
+        store.append(&make_event(3, 1, 5000, vec![])).unwrap();
+        store.append(&make_event(4, 1, 2000, vec![])).unwrap();
+
+        let mut ws = connect(port).await;
+        ws.send(TMsg::Text(r#"["REQ","s1",{"kinds":[1]}]"#.into()))
+            .await
+            .unwrap();
+
+        let mut timestamps: Vec<i64> = Vec::new();
+        for _ in 0..20 {
+            let resp = recv_text(&mut ws).await;
+            let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            match v[0].as_str().unwrap() {
+                "EVENT" => {
+                    let ts = v[2]["created_at"].as_i64().unwrap();
+                    timestamps.push(ts);
+                }
+                "EOSE" => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(timestamps.len(), 4, "expected 4 events");
+        for w in timestamps.windows(2) {
+            assert!(
+                w[0] >= w[1],
+                "events must be in descending created_at order, got {timestamps:?}"
+            );
+        }
     }
 }
