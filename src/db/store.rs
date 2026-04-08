@@ -11,7 +11,7 @@ use arc_swap::ArcSwap;
 use crate::db::index::{self, IndexEntry, INDEX_ENTRY_SIZE, OLD_INDEX_ENTRY_SIZE};
 use crate::db::{tags, vanish};
 use crate::error::Error;
-use crate::nostr::{self, Filter, KIND_DELETION};
+use crate::nostr::{self, Filter, KindClass, KIND_DELETION};
 use crate::pack::{self, hex, Event};
 
 /// 4-byte file header: 3 magic bytes + 1 version byte.
@@ -1014,6 +1014,14 @@ impl Store {
 
     /// Append a validated event. Returns `Err(Error::Duplicate)` if already stored.
     pub fn append(&self, ev: &Event) -> Result<(), Error> {
+        use crate::nostr::classify_kind;
+        let kind_class = classify_kind(ev.kind, &ev.tags);
+        self.append_classified(ev, kind_class)
+    }
+
+    /// Append an event with a pre-computed `KindClass`, avoiding redundant
+    /// `classify_kind` calls when the caller already has the classification.
+    pub fn append_classified(&self, ev: &Event, kind_class: KindClass) -> Result<(), Error> {
         // NIP-40: reject events that are already expired.
         let expiry = nostr::event_expiry(ev).unwrap_or(0);
         if expiry != 0 && expiry <= unix_now() {
@@ -1041,8 +1049,6 @@ impl Store {
         }
 
         // Replaceable event dedup - must happen BEFORE disk write
-        use crate::nostr::{classify_kind, KindClass};
-        let kind_class = classify_kind(ev.kind, &ev.tags);
         let projected_index_offset = w.index.offset;
         match &kind_class {
             KindClass::Replaceable => {
