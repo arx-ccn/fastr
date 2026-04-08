@@ -243,7 +243,7 @@ where
                         let _ = out_tx.send(Out::Text(notice)).await;
                     }
                     Ok(ClientMsg::Event(ev)) => {
-                        handle_event(*ev, &store, &fanout, &out_tx, &auth).await;
+                        handle_event(*ev, &store, &fanout, &out_tx, &auth, &config).await;
                     }
                     Ok(ClientMsg::Req { sub_id, filters }) => {
                         if let Err(reason) = validate_sub_id(&sub_id, config.max_subid_length) {
@@ -349,8 +349,19 @@ async fn handle_event(
     fanout: &Arc<Fanout>,
     out_tx: &mpsc::Sender<Out>,
     auth: &AuthState,
+    config: &Config,
 ) {
     let id = ev.id.clone();
+
+    // Enforce advertised NIP-11 limits before expensive crypto validation.
+    if ev.tags.len() > config.max_event_tags {
+        send_ok(&id, false, "invalid: too many tags", out_tx).await;
+        return;
+    }
+    if ev.content.len() > config.content_limit_for_kind(ev.kind) {
+        send_ok(&id, false, "invalid: content too long", out_tx).await;
+        return;
+    }
 
     if let Err(reason) = validate_event(&ev) {
         send_ok(&id, false, &reason, out_tx).await;

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 /// Relay configuration, loaded from environment variables at startup.
@@ -29,6 +30,17 @@ pub struct Config {
     /// Maximum number of records allowed in a single negentropy session. Default: 500_000.
     /// If a NEG-OPEN filter matches more events than this, the server responds with NEG-ERR.
     pub max_neg_records: usize,
+    /// Maximum number of tags allowed on an incoming event. Default: 2000.
+    pub max_event_tags: usize,
+    /// Per-kind maximum content length (in bytes). Every kind falls back to the global default
+    /// (FASTR_MAX_CONTENT_LENGTH, default 50 KiB). Individual kinds can be overridden via
+    /// `FASTR_MAX_CONTENT_LENGTH_PER_KIND` as comma-separated `kind:bytes` pairs,
+    /// e.g. `30023:102400`.
+    /// NIP-11 `max_content_length` is reported as the limit for kind 1.
+    pub max_content_length_per_kind: HashMap<u16, usize>,
+    /// Global default content length limit. Kinds not in max_content_length_per_kind use this.
+    /// Default: 50 KiB (51200). Override with `FASTR_MAX_CONTENT_LENGTH`.
+    pub max_content_length: usize,
 }
 
 impl Default for Config {
@@ -56,12 +68,50 @@ impl Default for Config {
             relay_url,
             compact_interval: env_parse("FASTR_COMPACT_INTERVAL", 21600),
             max_neg_records: env_parse("FASTR_MAX_NEG_RECORDS", 500_000),
+            max_event_tags: env_parse("FASTR_MAX_EVENT_TAGS", 2000),
+            max_content_length: env_parse("FASTR_MAX_CONTENT_LENGTH", 50 * 1024),
+            max_content_length_per_kind: parse_kind_limits("FASTR_MAX_CONTENT_LENGTH_PER_KIND"),
         }
+    }
+}
+
+impl Config {
+    /// Return the effective max content length for a given event kind.
+    pub fn content_limit_for_kind(&self, kind: u16) -> usize {
+        self.max_content_length_per_kind
+            .get(&kind)
+            .copied()
+            .unwrap_or(self.max_content_length)
     }
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Parse `kind:bytes,kind:bytes,...` from an env var into a HashMap.
+fn parse_kind_limits(key: &str) -> HashMap<u16, usize> {
+    let raw = match std::env::var(key) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return HashMap::new(),
+    };
+    let mut map = HashMap::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match entry.split_once(':') {
+            Some((k, v)) => match (k.trim().parse::<u16>(), v.trim().parse::<usize>()) {
+                (Ok(kind), Ok(limit)) => {
+                    map.insert(kind, limit);
+                }
+                _ => eprintln!("warning: ignoring malformed {key} entry: {entry:?}"),
+            },
+            None => eprintln!("warning: ignoring malformed {key} entry: {entry:?}"),
+        }
+    }
+    map
 }
 
 #[cfg(test)]
@@ -105,5 +155,45 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.listen_addr.port(), 9000);
         unsafe { std::env::remove_var("FASTR_PORT") };
+    }
+
+    #[test]
+    fn test_parse_kind_limits_valid() {
+        unsafe { std::env::set_var("FASTR_TEST_KIND_LIMITS", "1053:102400,30023:204800") };
+        let map = parse_kind_limits("FASTR_TEST_KIND_LIMITS");
+        assert_eq!(map.get(&1053), Some(&102400));
+        assert_eq!(map.get(&30023), Some(&204800));
+        assert_eq!(map.len(), 2);
+        unsafe { std::env::remove_var("FASTR_TEST_KIND_LIMITS") };
+    }
+
+    #[test]
+    fn test_parse_kind_limits_malformed_skipped() {
+        unsafe { std::env::set_var("FASTR_TEST_KIND_LIMITS2", "1053:abc,bad,30023:100") };
+        let map = parse_kind_limits("FASTR_TEST_KIND_LIMITS2");
+        assert_eq!(map.get(&30023), Some(&100));
+        assert_eq!(map.len(), 1);
+        unsafe { std::env::remove_var("FASTR_TEST_KIND_LIMITS2") };
+    }
+
+    #[test]
+    fn test_content_limit_for_kind_override() {
+        let cfg = Config {
+            max_content_length: 50 * 1024,
+            max_content_length_per_kind: HashMap::from([(30023, 200 * 1024)]),
+            ..Config::default()
+        };
+        assert_eq!(cfg.content_limit_for_kind(30023), 200 * 1024);
+        assert_eq!(cfg.content_limit_for_kind(1), 50 * 1024);
+    }
+
+    #[test]
+    fn test_nip11_reports_kind1_limit() {
+        let cfg = Config {
+            max_content_length_per_kind: HashMap::from([(1, 69420)]),
+            ..Config::default()
+        };
+        // NIP-11 should report the kind-1 specific limit, not the global default
+        assert_eq!(cfg.content_limit_for_kind(1), 69420);
     }
 }
