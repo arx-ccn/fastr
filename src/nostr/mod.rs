@@ -589,16 +589,35 @@ pub fn parse_client_msg(raw: &str, max_filter_values: usize) -> Result<ClientMsg
 /// Build the NIP-01 canonical JSON string for event ID computation.
 /// [0, "<pubkey-hex>", <created_at>, <kind>, <tags>, "<content>"]
 pub fn canonical_json(ev: &Event) -> String {
-    let pubkey_hex = hex_encode_bytes(&ev.pubkey.0);
-    // Build tags as a serde_json Value array of arrays of strings.
-    let tags_val: Value = Value::Array(
-        ev.tags
-            .iter()
-            .map(|t| Value::Array(t.fields.iter().map(|f| Value::String(f.clone())).collect()))
-            .collect(),
-    );
-    let tuple = (0u8, &pubkey_hex, ev.created_at, ev.kind, &tags_val, &ev.content);
-    serde_json::to_string(&tuple).expect("canonical_json serialization must not fail")
+    use crate::pack::hex::encode_into;
+    use crate::pack::write_json_str;
+    use std::fmt::Write;
+
+    let mut buf = String::with_capacity(256);
+    buf.push_str("[0,\"");
+    encode_into(&ev.pubkey.0, &mut buf);
+    buf.push_str("\",");
+    let _ = write!(buf, "{}", ev.created_at);
+    buf.push(',');
+    let _ = write!(buf, "{}", ev.kind);
+    buf.push_str(",[");
+    for (i, tag) in ev.tags.iter().enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        buf.push('[');
+        for (j, field) in tag.fields.iter().enumerate() {
+            if j > 0 {
+                buf.push(',');
+            }
+            write_json_str(field, &mut buf);
+        }
+        buf.push(']');
+    }
+    buf.push_str("],");
+    write_json_str(&ev.content, &mut buf);
+    buf.push(']');
+    buf
 }
 
 // --- validate_event ---
@@ -702,51 +721,73 @@ impl ServerMsg<'_> {
                 buf
             }
             ServerMsg::Ok { id, accepted, reason } => {
-                let id_hex = hex_encode_bytes(&id.0);
-                format!(
-                    "[\"OK\",\"{}\",{},{}]",
-                    id_hex,
-                    accepted,
-                    serde_json::to_string(reason).expect("reason serialization"),
-                )
+                use crate::pack::hex::encode_into;
+                use crate::pack::write_json_str;
+                let mut buf = String::with_capacity(128);
+                buf.push_str("[\"OK\",\"");
+                encode_into(&id.0, &mut buf);
+                buf.push_str("\",");
+                buf.push_str(if *accepted { "true," } else { "false," });
+                write_json_str(reason, &mut buf);
+                buf.push(']');
+                buf
             }
             ServerMsg::Eose { sub_id } => {
-                format!(
-                    "[\"EOSE\",{}]",
-                    serde_json::to_string(sub_id).expect("sub_id serialization"),
-                )
+                use crate::pack::write_json_str;
+                let mut buf = String::with_capacity(64);
+                buf.push_str("[\"EOSE\",");
+                write_json_str(sub_id, &mut buf);
+                buf.push(']');
+                buf
             }
             ServerMsg::Notice { message } => {
-                format!(
-                    "[\"NOTICE\",{}]",
-                    serde_json::to_string(message).expect("message serialization"),
-                )
+                use crate::pack::write_json_str;
+                let mut buf = String::with_capacity(64);
+                buf.push_str("[\"NOTICE\",");
+                write_json_str(message, &mut buf);
+                buf.push(']');
+                buf
             }
             ServerMsg::Closed { sub_id, message } => {
-                format!(
-                    "[\"CLOSED\",{},{}]",
-                    serde_json::to_string(sub_id).expect("sub_id serialization"),
-                    serde_json::to_string(message).expect("message serialization"),
-                )
+                use crate::pack::write_json_str;
+                let mut buf = String::with_capacity(128);
+                buf.push_str("[\"CLOSED\",");
+                write_json_str(sub_id, &mut buf);
+                buf.push(',');
+                write_json_str(message, &mut buf);
+                buf.push(']');
+                buf
             }
             ServerMsg::NegMsg {
                 sub_id,
                 msg,
                 max_records,
             } => {
-                let hex = hex_encode_bytes(msg);
-                let sub = serde_json::to_string(sub_id).expect("sub_id serialization");
-                match max_records {
-                    Some(max) => format!("[\"NEG-MSG\",{},\"{}\",{}]", sub, hex, max),
-                    None => format!("[\"NEG-MSG\",{},\"{}\"]", sub, hex),
+                use crate::pack::hex::encode_into;
+                use crate::pack::write_json_str;
+                use std::fmt::Write;
+                let mut buf = String::with_capacity(128);
+                buf.push_str("[\"NEG-MSG\",");
+                write_json_str(sub_id, &mut buf);
+                buf.push_str(",\"");
+                encode_into(msg, &mut buf);
+                buf.push('"');
+                if let Some(max) = max_records {
+                    buf.push(',');
+                    let _ = write!(buf, "{}", max);
                 }
+                buf.push(']');
+                buf
             }
             ServerMsg::NegErr { sub_id, reason } => {
-                format!(
-                    "[\"NEG-ERR\",{},{}]",
-                    serde_json::to_string(sub_id).expect("sub_id serialization"),
-                    serde_json::to_string(reason).expect("reason serialization"),
-                )
+                use crate::pack::write_json_str;
+                let mut buf = String::with_capacity(128);
+                buf.push_str("[\"NEG-ERR\",");
+                write_json_str(sub_id, &mut buf);
+                buf.push(',');
+                write_json_str(reason, &mut buf);
+                buf.push(']');
+                buf
             }
         }
     }

@@ -16,12 +16,10 @@ tokio             = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 # futures-util: SinkExt/StreamExt traits for WebSocket split; re-exported by tungstenite but must be in scope
 futures-util       = { version = "0.3", default-features = false, features = ["sink", "async-await"] }
-serde             = { version = "1", features = ["derive"] }
 serde_json        = "1"
 thiserror         = "2"
 tracing           = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bytes             = "1"
 # secp256k1: NIP-01 mandates schnorr sig verify; std has no crypto primitives
 secp256k1         = "0.31"
 # anyhow: error handling in the binary (main.rs); not used in library code

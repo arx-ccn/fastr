@@ -103,14 +103,32 @@ pub fn matches(entry: &IndexEntry, filter: &Filter) -> bool {
             return false;
         }
     }
-    if !filter.kinds.is_empty() && !filter.kinds.contains(&entry.kind) {
-        return false;
+    if !filter.kinds.is_empty() {
+        if filter.kinds.len() == 1 {
+            if entry.kind != filter.kinds[0] {
+                return false;
+            }
+        } else if !filter.kinds.contains(&entry.kind) {
+            return false;
+        }
     }
-    if !filter.authors.is_empty() && !filter.authors.iter().any(|pk| pk.matches(&entry.pubkey)) {
-        return false;
+    if !filter.authors.is_empty() {
+        if filter.authors.len() == 1 {
+            if !filter.authors[0].matches(&entry.pubkey) {
+                return false;
+            }
+        } else if !filter.authors.iter().any(|pk| pk.matches(&entry.pubkey)) {
+            return false;
+        }
     }
-    if !filter.ids.is_empty() && !filter.ids.iter().any(|id| id.matches(&entry.id)) {
-        return false;
+    if !filter.ids.is_empty() {
+        if filter.ids.len() == 1 {
+            if !filter.ids[0].matches(&entry.id) {
+                return false;
+            }
+        } else if !filter.ids.iter().any(|id| id.matches(&entry.id)) {
+            return false;
+        }
     }
     true
 }

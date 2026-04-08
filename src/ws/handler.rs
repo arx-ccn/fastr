@@ -383,7 +383,7 @@ async fn handle_event(
 
     // NIP-62: handle vanish requests
     if matches!(&kind_class, KindClass::Vanish) {
-        match store.append(&ev) {
+        match store.append_classified(&ev, kind_class) {
             Ok(()) => {
                 if let Err(e) = store.vanish(&ev) {
                     warn!("vanish error: {e}");
@@ -403,7 +403,7 @@ async fn handle_event(
         return;
     }
 
-    match store.append(&ev) {
+    match store.append_classified(&ev, kind_class) {
         Ok(()) => {
             let ev = Arc::new(ev);
             if !store.is_tombstoned(&ev.id.0) {
