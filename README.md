@@ -16,10 +16,6 @@ We did it, nostr!
 
 ## Numbers
 
-<div align="center">
- <img src="https://blossom.primal.net/9cd787d219081808e6641db1e8df7c5bb7c72a67d69508b9bd0cef185d242bfb.png" alt="fastr defeats strfry: 791x critical hit" width="600" />
-</div>
-
 500k events, 8 CPU / 8 GB RAM, 50k queries:
 
 | Metric | fastr | strfry | difference |
@@ -42,19 +38,11 @@ We did it, nostr!
 strfry wrote **94 GB** of journal brainrot just to ingest 500k immutable events.
 fastr wrote **119 MB**.
 
-<div align="center">
- <img src="https://blossom.primal.net/d038c06bb3a209af4fb178906ec11e754578bc820bfb2fae81b531bd21064702.png" alt="fastr war criminal mogging strfry" width="600" />
-</div>
-
 ---
 
 ## How it works
 
 ### Storage
-
-<div align="center">
- <img src="https://blossom.primal.net/ee07dce623e286d0b8081959d9ee123bd6da5520dfad48474eb0bde3c3c6294a.png" alt="fastr carries one box; LMDB carries an avalanche" width="600" />
-</div>
 
 ```
 data/
