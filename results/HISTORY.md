@@ -182,3 +182,26 @@ Commit: `e50ff65` | Date: 2026-04-09T15:49:02Z
 | transcode_vs_deser/transcode/10000 | 402.25 us |
 | transcode_vs_deser/transcode/100000 | 4.19 ms |
 | validate_event | 44.44 us |
+## Benchmark Results
+
+Commit: `805baa3` | Date: 2026-04-14T09:54:51Z
+
+| Benchmark | Median |
+|-----------|--------|
+| deserialize_trusted | 264.6 ns |
+| hex_decode_64 | 32.9 ns |
+| hex_encode_32 | 22.4 ns |
+| parse_client_msg | 1.42 us |
+| query_by_author/10000 | 349.36 us |
+| query_by_author/100000 | 354.20 us |
+| query_by_kind/10000 | 395.99 us |
+| query_by_kind/100000 | 4.15 ms |
+| query_by_tag_e/10000 | 362.69 us |
+| query_by_tag_e/100000 | 820.40 us |
+| serialize | 206.7 ns |
+| serialize_fast | 88.3 ns |
+| transcode_vs_deser/deser+json/10000 | 398.38 us |
+| transcode_vs_deser/deser+json/100000 | 4.14 ms |
+| transcode_vs_deser/transcode/10000 | 400.03 us |
+| transcode_vs_deser/transcode/100000 | 4.18 ms |
+| validate_event | 44.41 us |
