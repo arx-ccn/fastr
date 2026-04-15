@@ -162,6 +162,22 @@ fn tag_e_filter(ref_id: &[u8; 32]) -> Filter {
     }
 }
 
+fn empty_filter() -> Filter {
+    Filter {
+        ids: vec![],
+        authors: vec![],
+        kinds: vec![],
+        since: None,
+        until: None,
+        limit: None,
+        tags: std::collections::HashMap::new(),
+    }
+}
+
+fn kind_union_filters() -> Vec<Filter> {
+    vec![kind_filter(&[1]), kind_filter(&[1, 3])]
+}
+
 // Benchmark functions.
 //
 // Each function builds a fixture once then runs the bench loop. Criterion's
@@ -291,11 +307,71 @@ fn bench_transcode_vs_deserialize(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_count_by_kind(c: &mut Criterion) {
+    let mut group = c.benchmark_group("count_by_kind");
+
+    for &n in &[10_000usize, 100_000] {
+        let fixture = build_fixture(n);
+        let f = kind_filter(&[3]);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| fixture.store.count(std::hint::black_box(&f)))
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_count_empty_filter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("count_empty_filter");
+
+    for &n in &[10_000usize, 100_000] {
+        let fixture = build_fixture(n);
+        let f = empty_filter();
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| fixture.store.count(std::hint::black_box(&f)))
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_count_by_tag_e(c: &mut Criterion) {
+    let mut group = c.benchmark_group("count_by_tag_e");
+
+    for &n in &[10_000usize, 100_000] {
+        let fixture = build_fixture(n);
+        let f = tag_e_filter(&fixture.root_id);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| fixture.store.count(std::hint::black_box(&f)))
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_count_filter_union(c: &mut Criterion) {
+    let mut group = c.benchmark_group("count_filter_union");
+
+    for &n in &[10_000usize, 100_000] {
+        let fixture = build_fixture(n);
+        let filters = kind_union_filters();
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| fixture.store.count_filters(std::hint::black_box(&filters), &[]))
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_query_by_kind,
     bench_query_by_author,
     bench_query_by_tag_e,
     bench_transcode_vs_deserialize,
+    bench_count_by_kind,
+    bench_count_empty_filter,
+    bench_count_by_tag_e,
+    bench_count_filter_union,
 );
 criterion_main!(benches);

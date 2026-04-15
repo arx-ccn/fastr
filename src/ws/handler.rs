@@ -270,7 +270,7 @@ where
                             let _ = out_tx.send(Out::Text(notice)).await;
                             continue;
                         }
-                        handle_count(&sub_id, &filters, &store, &out_tx).await;
+                        handle_count(&sub_id, &filters, &store, &out_tx, &auth).await;
                     }
                     Ok(ClientMsg::NegOpen { sub_id, filter, msg }) => {
                         if let Err(reason) = validate_sub_id(&sub_id, config.max_subid_length) {
@@ -544,9 +544,9 @@ async fn handle_req(
     fanout.subscribe(sub_id, filters, live_tx.clone()).await;
 }
 
-/// Sends a NIP-45 `COUNT` response containing the sum of counts for the provided filters.
+/// Sends a NIP-45 `COUNT` response containing the union count for the provided filters.
 ///
-/// The function computes the total by summing `store.count(filter)` for each filter, formats
+/// The function computes the total with OR semantics across all filters, formats
 /// a JSON `["COUNT", <sub_id>, {"count": <total>}]` message (with `sub_id` JSON-escaped),
 /// and sends it as `Out::Text` to `out_tx`. Send errors are ignored.
 ///
@@ -562,8 +562,15 @@ async fn handle_req(
 /// let msg = format!(r#"["COUNT",{},{{"count":{}}}]"#, escaped_id, total);
 /// assert_eq!(msg, r#"["COUNT","s1",{"count":42}]"#);
 /// ```
-async fn handle_count(sub_id: &str, filters: &[Filter], store: &Arc<Store>, out_tx: &mpsc::Sender<Out>) {
-    let total: u64 = filters.iter().map(|f| store.count(f)).sum();
+async fn handle_count(
+    sub_id: &str,
+    filters: &[Filter],
+    store: &Arc<Store>,
+    out_tx: &mpsc::Sender<Out>,
+    auth: &AuthState,
+) {
+    let auth_pks: Vec<[u8; 32]> = auth.authenticated.iter().map(|pk| pk.0).collect();
+    let total = store.count_filters(filters, &auth_pks);
     let escaped_id = serde_json::to_string(sub_id).unwrap_or_else(|_| "\"\"".to_owned());
     let msg = format!(r#"["COUNT",{},{{"count":{}}}]"#, escaped_id, total);
     let _ = out_tx.send(Out::Text(msg)).await;
@@ -1553,6 +1560,119 @@ mod tests {
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("COUNT"), "should be COUNT response: {resp}");
         assert!(resp.contains(r#""count":2"#), "should count 2 events: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_count_response_uses_filter_union() {
+        let (port, _store) = spawn_server().await;
+        let mut ws = connect(port).await;
+
+        let ev1 = make_event(1, 1, 0, vec![]);
+        let ev2 = make_event(2, 2, 0, vec![]);
+        ws.send(event_msg(&ev1).into()).await.unwrap();
+        let _ = recv_text(&mut ws).await;
+        ws.send(event_msg(&ev2).into()).await.unwrap();
+        let _ = recv_text(&mut ws).await;
+
+        ws.send(r#"["COUNT","c2",{"kinds":[1]},{"kinds":[1,2]}]"#.into())
+            .await
+            .unwrap();
+        let resp = recv_text(&mut ws).await;
+        assert!(
+            resp.contains(r#""count":2"#),
+            "should deduplicate overlapping filters: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_empty_filter_skips_tombstoned_events() {
+        let (port, _store) = spawn_server().await;
+        let mut ws = connect(port).await;
+
+        let target = make_event(1, 1, 1_000, vec![]);
+        ws.send(event_msg(&target).into()).await.unwrap();
+        let _ = recv_text(&mut ws).await;
+
+        let k5 = make_event(
+            1,
+            crate::nostr::KIND_DELETION,
+            2_000,
+            vec![Tag {
+                fields: vec!["e".into(), crate::nostr::hex_encode_bytes(&target.id.0)],
+            }],
+        );
+        ws.send(event_msg(&k5).into()).await.unwrap();
+        let _ = recv_text(&mut ws).await;
+
+        ws.send(r#"["COUNT","c3",{}]"#.into()).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        assert!(
+            resp.contains(r#""count":1"#),
+            "empty-filter count should exclude tombstoned target: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_gift_wrap_hidden_from_unauthenticated() {
+        let (port, store) = spawn_server().await;
+        let mut ws = connect(port).await;
+
+        let secp = secp256k1::Secp256k1::new();
+        let mut sk_bytes = [0u8; 32];
+        sk_bytes[31] = 2;
+        let sk = secp256k1::SecretKey::from_byte_array(sk_bytes).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        let recipient_hex = crate::nostr::hex_encode_bytes(&xonly.serialize());
+
+        let ev = make_event(
+            1,
+            crate::nostr::KIND_GIFT_WRAP,
+            1_700_000_000,
+            vec![Tag {
+                fields: vec!["p".into(), recipient_hex],
+            }],
+        );
+        store.append(&ev).unwrap();
+
+        ws.send(r#"["COUNT","c4",{"kinds":[1059]}]"#.into()).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        assert!(
+            resp.contains(r#""count":0"#),
+            "unauthenticated count should hide gift wrap: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_gift_wrap_visible_to_recipient() {
+        let (port, store) = spawn_server().await;
+        let mut ws = connect(port).await;
+
+        let secp = secp256k1::Secp256k1::new();
+        let mut sk_bytes = [0u8; 32];
+        sk_bytes[31] = 2;
+        let sk = secp256k1::SecretKey::from_byte_array(sk_bytes).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        let recipient_hex = crate::nostr::hex_encode_bytes(&xonly.serialize());
+
+        let ev = make_event(
+            1,
+            crate::nostr::KIND_GIFT_WRAP,
+            1_700_000_000,
+            vec![Tag {
+                fields: vec!["p".into(), recipient_hex],
+            }],
+        );
+        store.append(&ev).unwrap();
+
+        let _pk = authenticate(&mut ws, port, 2).await;
+        ws.send(r#"["COUNT","c5",{"kinds":[1059]}]"#.into()).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        assert!(
+            resp.contains(r#""count":1"#),
+            "recipient count should see gift wrap: {resp}"
+        );
     }
 
     // NIP-17 private DM tests
