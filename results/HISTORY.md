@@ -205,3 +205,26 @@ Commit: `805baa3` | Date: 2026-04-14T09:54:51Z
 | transcode_vs_deser/transcode/10000 | 400.03 us |
 | transcode_vs_deser/transcode/100000 | 4.18 ms |
 | validate_event | 44.41 us |
+## Benchmark Results
+
+Commit: `e2de101` | Date: 2026-04-15T10:32:32Z
+
+| Benchmark | Median |
+|-----------|--------|
+| deserialize_trusted | 250.9 ns |
+| hex_decode_64 | 32.4 ns |
+| hex_encode_32 | 21.4 ns |
+| parse_client_msg | 1.38 us |
+| query_by_author/10000 | 350.51 us |
+| query_by_author/100000 | 363.26 us |
+| query_by_kind/10000 | 397.52 us |
+| query_by_kind/100000 | 4.15 ms |
+| query_by_tag_e/10000 | 364.73 us |
+| query_by_tag_e/100000 | 816.38 us |
+| serialize | 203.8 ns |
+| serialize_fast | 88.6 ns |
+| transcode_vs_deser/deser+json/10000 | 402.86 us |
+| transcode_vs_deser/deser+json/100000 | 4.16 ms |
+| transcode_vs_deser/transcode/10000 | 404.94 us |
+| transcode_vs_deser/transcode/100000 | 4.14 ms |
+| validate_event | 44.38 us |
