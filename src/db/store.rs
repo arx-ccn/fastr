@@ -1240,7 +1240,7 @@ impl Store {
             process_deletion_into(ev, &idx, &self.dtags.slice(), &mut ts);
             let mut tombstoned = Vec::new();
             for (id, state) in &ts.map {
-                if matches!(state, None) && !matches!(before.get(id), Some(None)) {
+                if state.is_none() && !matches!(before.get(id), Some(None)) {
                     if let Some((_, entry)) = index::iter_entries(&idx).find(|(_, e)| &e.id == id) {
                         tombstoned.push((entry.kind, entry.pubkey));
                     }
