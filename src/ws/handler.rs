@@ -243,7 +243,7 @@ where
                         let _ = out_tx.send(Out::Text(notice)).await;
                     }
                     Ok(ClientMsg::Event(ev)) => {
-                        handle_event(*ev, &store, &fanout, &out_tx, &auth).await;
+                        handle_event(*ev, &store, &fanout, &out_tx, &auth, &config).await;
                     }
                     Ok(ClientMsg::Req { sub_id, filters }) => {
                         if let Err(reason) = validate_sub_id(&sub_id, config.max_subid_length) {
@@ -349,8 +349,19 @@ async fn handle_event(
     fanout: &Arc<Fanout>,
     out_tx: &mpsc::Sender<Out>,
     auth: &AuthState,
+    config: &Config,
 ) {
     let id = ev.id.clone();
+
+    // Enforce advertised NIP-11 limits before expensive crypto validation.
+    if ev.tags.len() > config.max_event_tags {
+        send_ok(&id, false, "invalid: too many tags", out_tx).await;
+        return;
+    }
+    if ev.content.len() > config.content_limit_for_kind(ev.kind) {
+        send_ok(&id, false, "invalid: content too long", out_tx).await;
+        return;
+    }
 
     if let Err(reason) = validate_event(&ev) {
         send_ok(&id, false, &reason, out_tx).await;
@@ -813,6 +824,10 @@ mod tests {
     }
 
     async fn spawn_server() -> (u16, Arc<Store>) {
+        spawn_server_with_config(|_| {}).await
+    }
+
+    async fn spawn_server_with_config<F: FnOnce(&mut Config)>(configure: F) -> (u16, Arc<Store>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -820,10 +835,12 @@ mod tests {
         // Keep tempdir alive for the life of the server by moving it into the task.
         let store_path = dir.keep();
         let store = Arc::new(Store::open(&store_path).unwrap());
-        let config = Arc::new(Config {
+        let mut cfg = Config {
             relay_url: format!("ws://127.0.0.1:{port}"),
             ..Config::default()
-        });
+        };
+        configure(&mut cfg);
+        let config = Arc::new(cfg);
         let fanout = Fanout::new();
 
         let srv_store = Arc::clone(&store);
@@ -871,6 +888,104 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v[0], "OK");
         assert_eq!(v[2], false, "bad sig must be rejected: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_event_with_too_many_tags_rejected() {
+        let (port, _) = spawn_server_with_config(|c| c.max_event_tags = 2).await;
+        let mut ws = connect(port).await;
+        let tags = vec![
+            Tag {
+                fields: vec!["t".into(), "a".into()],
+            },
+            Tag {
+                fields: vec!["t".into(), "b".into()],
+            },
+            Tag {
+                fields: vec!["t".into(), "c".into()],
+            },
+        ];
+        let ev = make_event(1, 1, 1_700_000_000, tags);
+        ws.send(TMsg::Text(event_msg(&ev).into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "OK");
+        assert_eq!(v[2], false, "event with too many tags must be rejected: {resp}");
+        assert!(
+            v[3].as_str().unwrap().contains("too many tags"),
+            "unexpected reason: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_event_with_oversized_content_rejected() {
+        // make_event's content is "k=<kind> t=<created_at>" which is > 3 bytes.
+        let (port, _) = spawn_server_with_config(|c| c.max_content_length = 3).await;
+        let mut ws = connect(port).await;
+        let ev = make_event(1, 1, 1_700_000_000, vec![]);
+        ws.send(TMsg::Text(event_msg(&ev).into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "OK");
+        assert_eq!(v[2], false, "oversized content must be rejected: {resp}");
+        assert!(
+            v[3].as_str().unwrap().contains("content too long"),
+            "unexpected reason: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_per_kind_content_limit_allows_larger_override() {
+        // Global default is 3 bytes, but kind 1 gets 1000 bytes via per-kind override.
+        let (port, _) = spawn_server_with_config(|c| {
+            c.max_content_length = 3;
+            c.max_content_length_per_kind.insert(1, 1000);
+        })
+        .await;
+        let mut ws = connect(port).await;
+        let ev = make_event(1, 1, 1_700_000_000, vec![]);
+        ws.send(TMsg::Text(event_msg(&ev).into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "OK");
+        assert_eq!(v[2], true, "kind-1 override must allow larger content: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_event_at_max_tag_limit_accepted() {
+        let limit = 3;
+        let (port, _) = spawn_server_with_config(move |c| c.max_event_tags = limit).await;
+        let mut ws = connect(port).await;
+        let tags = vec![
+            Tag {
+                fields: vec!["t".into(), "a".into()],
+            },
+            Tag {
+                fields: vec!["t".into(), "b".into()],
+            },
+            Tag {
+                fields: vec!["t".into(), "c".into()],
+            },
+        ];
+        let ev = make_event(1, 1, 1_700_000_000, tags);
+        ws.send(TMsg::Text(event_msg(&ev).into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "OK");
+        assert_eq!(v[2], true, "event at tag limit must be accepted: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_event_at_max_content_limit_accepted() {
+        let ev = make_event(1, 1, 1_700_000_000, vec![]);
+        let limit = ev.content.len();
+        let (port, _) = spawn_server_with_config(move |c| c.max_content_length = limit).await;
+        let mut ws = connect(port).await;
+        ws.send(TMsg::Text(event_msg(&ev).into())).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v[0], "OK");
+        assert_eq!(v[2], true, "event at content limit must be accepted: {resp}");
     }
 
     #[tokio::test]

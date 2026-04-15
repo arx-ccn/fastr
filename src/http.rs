@@ -64,8 +64,8 @@ impl RelayInfo {
                 max_subscriptions: config.max_subscriptions_per_conn,
                 max_limit: config.max_limit,
                 max_subid_length: config.max_subid_length,
-                max_event_tags: 2000,
-                max_content_length: 8192,
+                max_event_tags: config.max_event_tags,
+                max_content_length: config.content_limit_for_kind(1),
                 created_at_upper_limit: CREATED_AT_WINDOW,
                 auth_required: false,
             },
@@ -299,5 +299,20 @@ mod tests {
     fn test_relay_info_response_content_type() {
         let resp = relay_info_response("{}");
         assert!(resp.contains("Content-Type: application/nostr+json"));
+    }
+
+    #[test]
+    fn test_relay_info_limits_reflect_config() {
+        let cfg = Config::default();
+        let info = RelayInfo::from_config(&cfg);
+        let json = relay_info_json(&info);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let lim = &v["limitation"];
+        assert_eq!(lim["max_message_length"], cfg.max_message_bytes);
+        assert_eq!(lim["max_subscriptions"], cfg.max_subscriptions_per_conn);
+        assert_eq!(lim["max_limit"], cfg.max_limit);
+        assert_eq!(lim["max_subid_length"], cfg.max_subid_length);
+        assert_eq!(lim["max_event_tags"], cfg.max_event_tags);
+        assert_eq!(lim["max_content_length"], cfg.content_limit_for_kind(1));
     }
 }
