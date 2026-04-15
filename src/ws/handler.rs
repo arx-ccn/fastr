@@ -544,9 +544,9 @@ async fn handle_req(
     fanout.subscribe(sub_id, filters, live_tx.clone()).await;
 }
 
-/// Sends a NIP-45 `COUNT` response containing the sum of counts for the provided filters.
+/// Sends a NIP-45 `COUNT` response containing the union count for the provided filters.
 ///
-/// The function computes the total by summing `store.count(filter)` for each filter, formats
+/// The function computes the total with OR semantics across all filters, formats
 /// a JSON `["COUNT", <sub_id>, {"count": <total>}]` message (with `sub_id` JSON-escaped),
 /// and sends it as `Out::Text` to `out_tx`. Send errors are ignored.
 ///
@@ -563,7 +563,7 @@ async fn handle_req(
 /// assert_eq!(msg, r#"["COUNT","s1",{"count":42}]"#);
 /// ```
 async fn handle_count(sub_id: &str, filters: &[Filter], store: &Arc<Store>, out_tx: &mpsc::Sender<Out>) {
-    let total: u64 = filters.iter().map(|f| store.count(f)).sum();
+    let total = store.count_filters(filters);
     let escaped_id = serde_json::to_string(sub_id).unwrap_or_else(|_| "\"\"".to_owned());
     let msg = format!(r#"["COUNT",{},{{"count":{}}}]"#, escaped_id, total);
     let _ = out_tx.send(Out::Text(msg)).await;
@@ -1553,6 +1553,28 @@ mod tests {
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("COUNT"), "should be COUNT response: {resp}");
         assert!(resp.contains(r#""count":2"#), "should count 2 events: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_count_response_uses_filter_union() {
+        let (port, _store) = spawn_server().await;
+        let mut ws = connect(port).await;
+
+        let ev1 = make_event(1, 1, 0, vec![]);
+        let ev2 = make_event(2, 2, 0, vec![]);
+        ws.send(event_msg(&ev1).into()).await.unwrap();
+        let _ = recv_text(&mut ws).await;
+        ws.send(event_msg(&ev2).into()).await.unwrap();
+        let _ = recv_text(&mut ws).await;
+
+        ws.send(r#"["COUNT","c2",{"kinds":[1]},{"kinds":[1,2]}]"#.into())
+            .await
+            .unwrap();
+        let resp = recv_text(&mut ws).await;
+        assert!(
+            resp.contains(r#""count":2"#),
+            "should deduplicate overlapping filters: {resp}"
+        );
     }
 
     // NIP-17 private DM tests

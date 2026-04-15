@@ -801,7 +801,7 @@ pub fn filter_matches(filters: &[Filter], ev: &Event) -> bool {
     filters.iter().any(|f| single_filter_matches(f, ev))
 }
 
-fn single_filter_matches(f: &Filter, ev: &Event) -> bool {
+pub fn single_filter_matches(f: &Filter, ev: &Event) -> bool {
     if !f.ids.is_empty() && !f.ids.iter().any(|id| id.matches(&ev.id.0)) {
         return false;
     }

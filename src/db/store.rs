@@ -428,6 +428,18 @@ fn blob_bounds(idx: &[u8], i: usize, total: usize, data_len: usize, offset: u64)
     }
 }
 
+fn event_bytes_at<'a>(data: &'a [u8], index: &[u8], offset: u64) -> Option<&'a [u8]> {
+    let total = index.len() / INDEX_ENTRY_SIZE;
+    for (i, entry) in index::iter_entries(index) {
+        if entry.offset != offset {
+            continue;
+        }
+        let (start, end) = blob_bounds(index, i, total, data.len(), entry.offset)?;
+        return Some(&data[start..end]);
+    }
+    None
+}
+
 // NIP-09 tombstone helpers
 
 /// Scan all stored kind-5 events and populate the tombstone map.
@@ -749,14 +761,61 @@ impl Store {
         self.vanished.read().map(|s| s.contains(pubkey)).unwrap_or(false)
     }
 
-    /// NIP-45: return approximate count for a filter using in-memory counters.
-    /// Returns 0 for unsupported filter shapes (tags, time ranges, combined kinds+authors).
+    fn decrement_author_counter(map: &mut HashMap<[u8; 32], u64>, key: [u8; 32]) {
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let count = e.get_mut();
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    e.remove();
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(_) => {}
+        }
+    }
+
+    fn decrement_kind_counter(map: &mut HashMap<u16, u64>, key: u16) {
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let count = e.get_mut();
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    e.remove();
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(_) => {}
+        }
+    }
+
+    fn decrement_live_event_count(&self, kind: u16, pubkey: [u8; 32]) {
+        if let Ok(mut kc) = self.kind_counts.write() {
+            Self::decrement_kind_counter(&mut kc, kind);
+        }
+        if let Ok(mut ac) = self.author_counts.write() {
+            Self::decrement_author_counter(&mut ac, pubkey);
+        }
+    }
+
+    fn increment_live_event_count(&self, kind: u16, pubkey: [u8; 32]) {
+        if let Ok(mut kc) = self.kind_counts.write() {
+            *kc.entry(kind).or_insert(0) += 1;
+        }
+        if let Ok(mut ac) = self.author_counts.write() {
+            *ac.entry(pubkey).or_insert(0) += 1;
+        }
+    }
+
+    /// NIP-45: return count for a filter using in-memory counters when possible.
+    /// Falls back to exact scans for unsupported filter shapes.
     pub fn count(&self, filter: &Filter) -> u64 {
         let has_tags = !filter.tags.is_empty();
         let has_time = filter.since.is_some() || filter.until.is_some();
+        let has_ids = !filter.ids.is_empty();
 
-        if has_tags || has_time {
-            return 0; // unsupported filter shape
+        if has_tags || has_time || has_ids {
+            return self.scan_count(std::slice::from_ref(filter));
         }
 
         let has_kinds = !filter.kinds.is_empty();
@@ -792,8 +851,62 @@ impl Store {
                 }
                 matching_keys.iter().map(|k| counts.get(k).copied().unwrap_or(0)).sum()
             }
-            _ => 0, // combined or empty - unsupported
+            (false, false) => self.event_count() as u64,
+            _ => self.scan_count(std::slice::from_ref(filter)),
         }
+    }
+
+    pub fn count_filters(&self, filters: &[Filter]) -> u64 {
+        if filters.is_empty() {
+            return 0;
+        }
+        if filters.len() == 1 {
+            return self.count(&filters[0]);
+        }
+        self.scan_count(filters)
+    }
+
+    fn scan_count(&self, filters: &[Filter]) -> u64 {
+        use crate::nostr::single_filter_matches;
+
+        let idx = self.index.slice();
+        let data = self.data.slice();
+        let now = unix_now();
+        let tombstones = match self.tombstones.read() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        let vanished = match self.vanished.read() {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+
+        let mut total = 0u64;
+        for (_, entry) in index::iter_entries(&idx) {
+            if entry.expiry != 0 && entry.expiry <= now {
+                continue;
+            }
+            if matches!(tombstones.map.get(&entry.id), Some(None)) {
+                continue;
+            }
+            if vanished.contains(&entry.pubkey) {
+                continue;
+            }
+
+            let Some(ev_bytes) = event_bytes_at(&data, &idx, entry.offset) else {
+                continue;
+            };
+            let Ok(ev) = crate::pack::deserialize_trusted(ev_bytes) else {
+                continue;
+            };
+
+            if filters.iter().any(|f| single_filter_matches(f, &ev)) {
+                total += 1;
+            }
+        }
+
+        let _ = data;
+        total
     }
 
     /// NIP-62: Vanish a pubkey - tombstone all their events, ban future events.
@@ -819,6 +932,7 @@ impl Store {
         }
         // 3. Tombstone all events from this pubkey (except kind-62)
         let idx = self.index.slice();
+        let mut tombstoned = Vec::new();
         let mut ts = self
             .tombstones
             .write()
@@ -827,7 +941,12 @@ impl Store {
             // Skip kind-62 events - they must remain queryable per NIP-62 spec
             if entry.pubkey == ev.pubkey.0 && entry.kind != KIND_VANISH {
                 ts.insert_confirmed(entry.id);
+                tombstoned.push((entry.kind, entry.pubkey));
             }
+        }
+        drop(ts);
+        for (kind, pubkey) in tombstoned {
+            self.decrement_live_event_count(kind, pubkey);
         }
         // 4. Clean up in-memory maps
         {
@@ -975,7 +1094,7 @@ impl Store {
         key: K,
         ev: &Event,
         index_offset: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         if let Some(&(old_ts, old_id, _)) = map.get(&key) {
             if Self::is_newer(ev.created_at, &ev.id.0, old_ts, &old_id) {
                 let mut ts = self
@@ -984,17 +1103,17 @@ impl Store {
                     .map_err(|_| std::io::Error::other("tombstone lock poisoned"))?;
                 ts.insert_confirmed(old_id); // Confirmed: replaceable/addressable dedup.
                 map.insert(key, (ev.created_at, ev.id.0, index_offset));
-                Ok(())
+                Ok(true)
             } else {
                 Err(Error::Rejected("duplicate: older version"))
             }
         } else {
             map.insert(key, (ev.created_at, ev.id.0, index_offset));
-            Ok(())
+            Ok(false)
         }
     }
 
-    fn tombstone_replaceable(&self, ev: &Event, index_offset: u64) -> Result<(), Error> {
+    fn tombstone_replaceable(&self, ev: &Event, index_offset: u64) -> Result<bool, Error> {
         let key = (ev.pubkey.0, ev.kind);
         let mut map = self
             .replaceable_live
@@ -1003,7 +1122,7 @@ impl Store {
         self.dedup_upsert(&mut map, key, ev, index_offset)
     }
 
-    fn tombstone_addressable(&self, ev: &Event, d_hash: &[u8; 32], index_offset: u64) -> Result<(), Error> {
+    fn tombstone_addressable(&self, ev: &Event, d_hash: &[u8; 32], index_offset: u64) -> Result<bool, Error> {
         let key = (ev.pubkey.0, ev.kind, *d_hash);
         let mut map = self
             .addressable_live
@@ -1050,15 +1169,11 @@ impl Store {
 
         // Replaceable event dedup - must happen BEFORE disk write
         let projected_index_offset = w.index.offset;
-        match &kind_class {
-            KindClass::Replaceable => {
-                self.tombstone_replaceable(ev, projected_index_offset)?;
-            }
-            KindClass::Addressable { d_hash } => {
-                self.tombstone_addressable(ev, d_hash, projected_index_offset)?;
-            }
-            _ => {}
-        }
+        let replaced_existing = match &kind_class {
+            KindClass::Replaceable => self.tombstone_replaceable(ev, projected_index_offset)?,
+            KindClass::Addressable { d_hash } => self.tombstone_addressable(ev, d_hash, projected_index_offset)?,
+            _ => false,
+        };
 
         // Write BASED blob - use tracked offset, no lseek syscall.
         let data_offset = w.data.offset;
@@ -1112,6 +1227,7 @@ impl Store {
         // This closes the race where a concurrent query could see the kind-5
         // event in the index before its targets are tombstoned.
         if ev.kind == KIND_DELETION {
+            let idx = self.index.slice();
             let mut ts = self
                 .tombstones
                 .write()
@@ -1120,7 +1236,20 @@ impl Store {
             // in the index from earlier appends. The kind-5 event itself is not
             // yet visible to readers (lengths not published), which is fine since
             // process_deletion_into looks up target events, not the deletion event.
-            process_deletion_into(ev, &self.index.slice(), &self.dtags.slice(), &mut ts);
+            let before = ts.map.clone();
+            process_deletion_into(ev, &idx, &self.dtags.slice(), &mut ts);
+            let mut tombstoned = Vec::new();
+            for (id, state) in &ts.map {
+                if matches!(state, None) && !matches!(before.get(id), Some(None)) {
+                    if let Some((_, entry)) = index::iter_entries(&idx).find(|(_, e)| &e.id == id) {
+                        tombstoned.push((entry.kind, entry.pubkey));
+                    }
+                }
+            }
+            drop(ts);
+            for (kind, pubkey) in tombstoned {
+                self.decrement_live_event_count(kind, pubkey);
+            }
         } else {
             // Non-deletion event: check for a preemptive tombstone that needs
             // pubkey verification. If a kind-5 arrived before this event,
@@ -1154,14 +1283,9 @@ impl Store {
         self.tags.publish_len(w.tags.offset);
         self.dtags.publish_len(w.dtags.offset);
 
-        // NIP-45: update approximate counters.
-        {
-            let mut kc = self.kind_counts.write().unwrap();
-            *kc.entry(ev.kind).or_insert(0) += 1;
-        }
-        {
-            let mut ac = self.author_counts.write().unwrap();
-            *ac.entry(ev.pubkey.0).or_insert(0) += 1;
+        // NIP-45: update counters, compensating for replaceable/addressable replacement.
+        if !replaced_existing {
+            self.increment_live_event_count(ev.kind, ev.pubkey.0);
         }
 
         Ok(())
@@ -2765,6 +2889,104 @@ mod tests {
             ..empty_filter()
         };
         assert_eq!(store.count(&filter), 0);
+    }
+
+    #[test]
+    fn test_count_empty_filter_returns_total_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        store.append(&make_event(1, 1, 1000, vec![])).unwrap();
+        store.append(&make_event(2, 7, 2000, vec![])).unwrap();
+        store
+            .append(&make_event(
+                3,
+                30001,
+                3000,
+                vec![Tag {
+                    fields: vec!["d".into(), "x".into()],
+                }],
+            ))
+            .unwrap();
+
+        assert_eq!(store.count(&empty_filter()), 3);
+    }
+
+    #[test]
+    fn test_count_combined_kind_and_author_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let author_event = make_event(1, 1, 1000, vec![]);
+        let author_prefix = crate::nostr::HexPrefix {
+            bytes: author_event.pubkey.0,
+            len: 32,
+        };
+        store.append(&author_event).unwrap();
+        store.append(&make_event(1, 7, 2000, vec![])).unwrap();
+        store.append(&make_event(2, 1, 3000, vec![])).unwrap();
+
+        let filter = Filter {
+            kinds: vec![1],
+            authors: vec![author_prefix],
+            ..empty_filter()
+        };
+
+        assert_eq!(store.count(&filter), 1);
+    }
+
+    #[test]
+    fn test_count_decrements_for_replaceable_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        store.append(&make_event(1, 0, 1000, vec![])).unwrap();
+        store.append(&make_event(1, 0, 2000, vec![])).unwrap();
+
+        let filter = Filter {
+            kinds: vec![0],
+            ..empty_filter()
+        };
+        assert_eq!(store.count(&filter), 1);
+    }
+
+    #[test]
+    fn test_count_decrements_for_kind5_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let target = make_event(1, 1, 1000, vec![]);
+        store.append(&target).unwrap();
+        store.append(&make_kind5_event(1, &target.id.0)).unwrap();
+
+        let filter = Filter {
+            kinds: vec![1],
+            ..empty_filter()
+        };
+        assert_eq!(store.count(&filter), 0);
+    }
+
+    #[test]
+    fn test_count_decrements_for_vanish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let ev1 = make_event(1, 1, 1000, vec![]);
+        let ev2 = make_event(1, 7, 2000, vec![]);
+        let vanish = make_event(1, crate::nostr::KIND_VANISH, 3000, vec![]);
+        store.append(&ev1).unwrap();
+        store.append(&ev2).unwrap();
+        store.append(&vanish).unwrap();
+        store.vanish(&vanish).unwrap();
+
+        let author_filter = Filter {
+            authors: vec![crate::nostr::HexPrefix {
+                bytes: vanish.pubkey.0,
+                len: 32,
+            }],
+            ..empty_filter()
+        };
+        assert_eq!(store.count(&author_filter), 1);
     }
 
     // Boot rebuild (Task 11) tests
