@@ -854,7 +854,8 @@ impl Store {
                 }
                 matching_keys.iter().map(|k| counts.get(k).copied().unwrap_or(0)).sum()
             }
-            (false, false) => self.scan_count(std::slice::from_ref(filter), auth_pubkeys),
+            // Only the combined kind+author shape reaches here without taking
+            // the exact-scan early return above.
             _ => self.scan_count(std::slice::from_ref(filter), auth_pubkeys),
         }
     }
@@ -926,8 +927,6 @@ impl Store {
                 total += 1;
             }
         }
-
-        let _ = data;
         total
     }
 
