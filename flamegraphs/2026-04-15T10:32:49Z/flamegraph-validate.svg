@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="406" onload="init(evt)" viewBox="0 0 1200 406" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="406" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">Flame Graph</text><text id="details" fill="rgb(0,0,0)" x="10" y="389.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="389.00"> </text><svg id="frames" x="10" width="1180" total_samples="41986959749"><g><title>&lt;cargo::sources::registry::index::RegistryIndex&gt;::summaries (8,024,072 samples, 0.02%)</title><rect x="0.0334%" y="325" width="0.0191%" height="15" fill="rgb(227,0,7)" fg:x="14042126" fg:w="8024072"/><text x="0.2834%" y="335.50"></text></g><g><title>std::fs::read::inner (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="309" width="0.0167%" height="15" fill="rgb(217,0,24)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="319.50"></text></g><g><title>std::io::default_read_to_end (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="293" width="0.0167%" height="15" fill="rgb(221,193,54)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="303.50"></text></g><g><title>&lt;std::fs::File as std::io::Read&gt;::read_buf (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="277" width="0.0167%" height="15" fill="rgb(248,212,6)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="287.50"></text></g><g><title>&lt;&amp;std::fs::File as std::io::Read&gt;::read_buf (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="261" width="0.0167%" height="15" fill="rgb(208,68,35)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="271.50"></text></g><g><title>std::sys::fs::unix::File::read_buf (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="245" width="0.0167%" height="15" fill="rgb(232,128,0)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="255.50"></text></g><g><title>std::sys::fd::unix::FileDesc::read_buf (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="229" width="0.0167%" height="15" fill="rgb(207,160,47)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="239.50"></text></g><g><title>read (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="213" width="0.0167%" height="15" fill="rgb(228,23,34)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="223.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="197" width="0.0167%" height="15" fill="rgb(218,30,26)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="207.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="181" width="0.0167%" height="15" fill="rgb(220,122,19)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="191.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="165" width="0.0167%" height="15" fill="rgb(250,228,42)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="175.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="149" width="0.0167%" height="15" fill="rgb(240,193,28)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="159.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="133" width="0.0167%" height="15" fill="rgb(216,20,37)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="143.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="117" width="0.0167%" height="15" fill="rgb(206,188,39)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="127.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="101" width="0.0167%" height="15" fill="rgb(217,207,13)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="111.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="85" width="0.0167%" height="15" fill="rgb(231,73,38)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="95.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="69" width="0.0167%" height="15" fill="rgb(225,20,46)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="79.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="53" width="0.0167%" height="15" fill="rgb(210,31,41)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="63.50"></text></g><g><title>[unknown] (7,021,063 samples, 0.02%)</title><rect x="0.0358%" y="37" width="0.0167%" height="15" fill="rgb(221,200,47)" fg:x="15045135" fg:w="7021063"/><text x="0.2858%" y="47.50"></text></g><g><title>[unknown] (31,093,279 samples, 0.07%)</title><rect x="0.1123%" y="325" width="0.0741%" height="15" fill="rgb(226,26,5)" fg:x="47141423" fg:w="31093279"/><text x="0.3623%" y="335.50"></text></g><g><title>cargo (91,273,819 samples, 0.22%)</title><rect x="0.0000%" y="341" width="0.2174%" height="15" fill="rgb(249,33,26)" fg:x="0" fg:w="91273819"/><text x="0.2500%" y="351.50"></text></g><g><title>&lt;core::iter::adapters::map::Map&lt;I,F&gt; as core::iter::traits::iterator::Iterator&gt;::try_fold (31,093,279 samples, 0.07%)</title><rect x="0.2222%" y="325" width="0.0741%" height="15" fill="rgb(235,183,28)" fg:x="93279837" fg:w="31093279"/><text x="0.4722%" y="335.50"></text></g><g><title>&lt;criterion::routine::Function&lt;M,F,T&gt; as criterion::routine::Routine&lt;M,T&gt;&gt;::warm_up (8,024,072 samples, 0.02%)</title><rect x="0.2962%" y="325" width="0.0191%" height="15" fill="rgb(221,5,38)" fg:x="124373116" fg:w="8024072"/><text x="0.5462%" y="335.50"></text></g><g><title>[unknown] (8,024,072 samples, 0.02%)</title><rect x="0.2962%" y="309" width="0.0191%" height="15" fill="rgb(247,18,42)" fg:x="124373116" fg:w="8024072"/><text x="0.5462%" y="319.50"></text></g><g><title>fastr::nostr::validate_event (8,024,072 samples, 0.02%)</title><rect x="0.2962%" y="293" width="0.0191%" height="15" fill="rgb(241,131,45)" fg:x="124373116" fg:w="8024072"/><text x="0.5462%" y="303.50"></text></g><g><title>criterion::stats::univariate::resamples::Resamples&lt;A&gt;::next (7,021,063 samples, 0.02%)</title><rect x="0.3225%" y="309" width="0.0167%" height="15" fill="rgb(249,31,29)" fg:x="135406215" fg:w="7021063"/><text x="0.5725%" y="319.50"></text></g><g><title>&lt;rayon::iter::map_with::MapWithFolder&lt;C,U,F&gt; as rayon::iter::plumbing::Folder&lt;T&gt;&gt;::consume_iter (13,039,117 samples, 0.03%)</title><rect x="0.3225%" y="325" width="0.0311%" height="15" fill="rgb(225,111,53)" fg:x="135406215" fg:w="13039117"/><text x="0.5725%" y="335.50"></text></g><g><title>criterion::stats::univariate::sample::Sample&lt;A&gt;::percentiles (6,018,054 samples, 0.01%)</title><rect x="0.3392%" y="309" width="0.0143%" height="15" fill="rgb(238,160,17)" fg:x="142427278" fg:w="6018054"/><text x="0.5892%" y="319.50"></text></g><g><title>&lt;serde_json::de::MapAccess&lt;R&gt; as serde_core::de::MapAccess&gt;::next_key_seed::has_next_key (113,340,017 samples, 0.27%)</title><rect x="0.3559%" y="325" width="0.2699%" height="15" fill="rgb(214,148,48)" fg:x="149448341" fg:w="113340017"/><text x="0.6059%" y="335.50"></text></g><g><title>&lt;serde_json::de::MapAccess&lt;R&gt; as serde_core::de::MapAccess&gt;::next_value_seed (20,060,180 samples, 0.05%)</title><rect x="0.6259%" y="325" width="0.0478%" height="15" fill="rgb(232,36,49)" fg:x="262788358" fg:w="20060180"/><text x="0.8759%" y="335.50"></text></g><g><title>&lt;serde_json::read::StrRead as serde_json::read::Read&gt;::parse_str (47,141,423 samples, 0.11%)</title><rect x="0.6737%" y="325" width="0.1123%" height="15" fill="rgb(209,103,24)" fg:x="282848538" fg:w="47141423"/><text x="0.9237%" y="335.50"></text></g><g><title>&lt;core::iter::adapters::map::Map&lt;I,F&gt; as core::iter::traits::iterator::Iterator&gt;::try_fold (11,033,099 samples, 0.03%)</title><rect x="0.8003%" y="309" width="0.0263%" height="15" fill="rgb(229,88,8)" fg:x="336008015" fg:w="11033099"/><text x="1.0503%" y="319.50"></text></g><g><title>&lt;rayon::iter::map_with::MapWithFolder&lt;C,U,F&gt; as rayon::iter::plumbing::Folder&lt;T&gt;&gt;::consume_iter (132,397,188 samples, 0.32%)</title><rect x="0.8385%" y="309" width="0.3153%" height="15" fill="rgb(213,181,19)" fg:x="352056159" fg:w="132397188"/><text x="1.0885%" y="319.50"></text></g><g><title>criterion::stats::univariate::resamples::Resamples&lt;A&gt;::next (132,397,188 samples, 0.32%)</title><rect x="0.8385%" y="293" width="0.3153%" height="15" fill="rgb(254,191,54)" fg:x="352056159" fg:w="132397188"/><text x="1.0885%" y="303.50"></text></g><g><title>&lt;serde_json::read::StrRead as serde_json::read::Read&gt;::parse_str (783,350,029 samples, 1.87%)</title><rect x="1.1634%" y="309" width="1.8657%" height="15" fill="rgb(241,83,37)" fg:x="488465383" fg:w="783350029"/><text x="1.4134%" y="319.50">&lt;..</text></g><g><title>serde_json::read::SliceRead::skip_to_escape (455,366,086 samples, 1.08%)</title><rect x="1.9445%" y="293" width="1.0845%" height="15" fill="rgb(233,36,39)" fg:x="816449326" fg:w="455366086"/><text x="2.1945%" y="303.50"></text></g><g><title>&lt;serde_json::read::StrRead as serde_json::read::Read&gt;::parse_str (59,177,531 samples, 0.14%)</title><rect x="3.0291%" y="293" width="0.1409%" height="15" fill="rgb(226,3,54)" fg:x="1271815412" fg:w="59177531"/><text x="3.2791%" y="303.50"></text></g><g><title>serde_json::read::SliceRead::skip_to_escape (6,018,054 samples, 0.01%)</title><rect x="3.1557%" y="277" width="0.0143%" height="15" fill="rgb(245,192,40)" fg:x="1324974889" fg:w="6018054"/><text x="3.4057%" y="287.50"></text></g><g><title>rayon::slice::sort::recurse (60,180,540 samples, 0.14%)</title><rect x="3.1987%" y="293" width="0.1433%" height="15" fill="rgb(238,167,29)" fg:x="1343029051" fg:w="60180540"/><text x="3.4487%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_ecmult_wnaf.constprop.1 (57,171,513 samples, 0.14%)</title><rect x="3.3420%" y="293" width="0.1362%" height="15" fill="rgb(232,182,51)" fg:x="1403209591" fg:w="57171513"/><text x="3.5920%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_fe_mul_inner (2,093,279,783 samples, 4.99%)</title><rect x="3.4830%" y="293" width="4.9855%" height="15" fill="rgb(231,60,39)" fg:x="1462387122" fg:w="2093279783"/><text x="3.7330%" y="303.50">rustse..</text></g><g><title>rustsecp256k1_v0_11_fe_sqr_inner (1,880,641,875 samples, 4.48%)</title><rect x="8.4685%" y="293" width="4.4791%" height="15" fill="rgb(208,69,12)" fg:x="3555666905" fg:w="1880641875"/><text x="8.7185%" y="303.50">rusts..</text></g><g><title>rustsecp256k1_v0_11_scalar_mul_512 (8,024,072 samples, 0.02%)</title><rect x="12.9548%" y="293" width="0.0191%" height="15" fill="rgb(235,93,37)" fg:x="5439317807" fg:w="8024072"/><text x="13.2048%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_sha256_write (5,015,045 samples, 0.01%)</title><rect x="12.9882%" y="293" width="0.0119%" height="15" fill="rgb(213,116,39)" fg:x="5453359933" fg:w="5015045"/><text x="13.2382%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_sha256_write.constprop.0 (56,168,504 samples, 0.13%)</title><rect x="13.0002%" y="293" width="0.1338%" height="15" fill="rgb(222,207,29)" fg:x="5458374978" fg:w="56168504"/><text x="13.2502%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_sha256_transform (53,159,477 samples, 0.13%)</title><rect x="13.0073%" y="277" width="0.1266%" height="15" fill="rgb(206,96,30)" fg:x="5461384005" fg:w="53159477"/><text x="13.2573%" y="287.50"></text></g><g><title>rustsecp256k1_v0_11_sha256_write (63,189,567 samples, 0.15%)</title><rect x="13.1339%" y="293" width="0.1505%" height="15" fill="rgb(218,138,4)" fg:x="5514543482" fg:w="63189567"/><text x="13.3839%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_sha256_transform (63,189,567 samples, 0.15%)</title><rect x="13.1339%" y="277" width="0.1505%" height="15" fill="rgb(250,191,14)" fg:x="5514543482" fg:w="63189567"/><text x="13.3839%" y="287.50"></text></g><g><title>serde_json::de::Deserializer&lt;R&gt;::parse_integer (11,033,099 samples, 0.03%)</title><rect x="13.2844%" y="293" width="0.0263%" height="15" fill="rgb(239,60,40)" fg:x="5577733049" fg:w="11033099"/><text x="13.5344%" y="303.50"></text></g><g><title>serde_json::read::SliceRead::skip_to_escape (24,072,216 samples, 0.06%)</title><rect x="13.3107%" y="293" width="0.0573%" height="15" fill="rgb(206,27,48)" fg:x="5588766148" fg:w="24072216"/><text x="13.5607%" y="303.50"></text></g><g><title>[unknown] (4,466,399,077 samples, 10.64%)</title><rect x="3.0291%" y="309" width="10.6376%" height="15" fill="rgb(225,35,8)" fg:x="1271815412" fg:w="4466399077"/><text x="3.2791%" y="319.50">[unknown]</text></g><g><title>serde_json::value::de::&lt;impl serde_core::de::Deserialize for serde_json::value::Value&gt;::deserialize (125,376,125 samples, 0.30%)</title><rect x="13.3681%" y="293" width="0.2986%" height="15" fill="rgb(250,213,24)" fg:x="5612838364" fg:w="125376125"/><text x="13.6181%" y="303.50"></text></g><g><title>&lt;serde_json::read::StrRead as serde_json::read::Read&gt;::parse_str (5,015,045 samples, 0.01%)</title><rect x="13.6547%" y="277" width="0.0119%" height="15" fill="rgb(247,123,22)" fg:x="5733199444" fg:w="5015045"/><text x="13.9047%" y="287.50"></text></g><g><title>[validate-a8abd84082a0c3e1] (11,033,099 samples, 0.03%)</title><rect x="13.6667%" y="309" width="0.0263%" height="15" fill="rgb(231,138,38)" fg:x="5738214489" fg:w="11033099"/><text x="13.9167%" y="319.50"></text></g><g><title>rayon::iter::plumbing::bridge_producer_consumer::helper (11,033,099 samples, 0.03%)</title><rect x="13.6667%" y="293" width="0.0263%" height="15" fill="rgb(231,145,46)" fg:x="5738214489" fg:w="11033099"/><text x="13.9167%" y="303.50"></text></g><g><title>__rustc::__rdl_alloc (18,054,162 samples, 0.04%)</title><rect x="13.6929%" y="309" width="0.0430%" height="15" fill="rgb(251,118,11)" fg:x="5749247588" fg:w="18054162"/><text x="13.9429%" y="319.50"></text></g><g><title>__rustc::__rust_alloc (12,036,108 samples, 0.03%)</title><rect x="13.7359%" y="309" width="0.0287%" height="15" fill="rgb(217,147,25)" fg:x="5767301750" fg:w="12036108"/><text x="13.9859%" y="319.50"></text></g><g><title>__rustc::__rust_dealloc (6,018,054 samples, 0.01%)</title><rect x="13.7646%" y="309" width="0.0143%" height="15" fill="rgb(247,81,37)" fg:x="5779337858" fg:w="6018054"/><text x="14.0146%" y="319.50"></text></g><g><title>__rustc::__rust_no_alloc_shim_is_unstable_v2 (25,075,225 samples, 0.06%)</title><rect x="13.7789%" y="309" width="0.0597%" height="15" fill="rgb(209,12,38)" fg:x="5785355912" fg:w="25075225"/><text x="14.0289%" y="319.50"></text></g><g><title>alloc::alloc::exchange_malloc (23,069,207 samples, 0.05%)</title><rect x="13.8387%" y="309" width="0.0549%" height="15" fill="rgb(227,1,9)" fg:x="5810431137" fg:w="23069207"/><text x="14.0887%" y="319.50"></text></g><g><title>malloc (19,057,171 samples, 0.05%)</title><rect x="13.8482%" y="293" width="0.0454%" height="15" fill="rgb(248,47,43)" fg:x="5814443173" fg:w="19057171"/><text x="14.0982%" y="303.50"></text></g><g><title>alloc::collections::btree::map::BTreeMap&lt;K,V,A&gt;::get (461,384,140 samples, 1.10%)</title><rect x="13.8936%" y="309" width="1.0989%" height="15" fill="rgb(221,10,30)" fg:x="5833500344" fg:w="461384140"/><text x="14.1436%" y="319.50"></text></g><g><title>[libc.so.6] (231,695,079 samples, 0.55%)</title><rect x="14.4406%" y="293" width="0.5518%" height="15" fill="rgb(210,229,1)" fg:x="6063189405" fg:w="231695079"/><text x="14.6906%" y="303.50"></text></g><g><title>[libc.so.6] (115,346,035 samples, 0.27%)</title><rect x="15.6781%" y="293" width="0.2747%" height="15" fill="rgb(222,148,37)" fg:x="6582748067" fg:w="115346035"/><text x="15.9281%" y="303.50"></text></g><g><title>malloc (10,030,090 samples, 0.02%)</title><rect x="15.9528%" y="293" width="0.0239%" height="15" fill="rgb(234,67,33)" fg:x="6698094102" fg:w="10030090"/><text x="16.2028%" y="303.50"></text></g><g><title>alloc::collections::btree::map::BTreeMap&lt;K,V,A&gt;::insert (440,320,951 samples, 1.05%)</title><rect x="14.9925%" y="309" width="1.0487%" height="15" fill="rgb(247,98,35)" fg:x="6294884484" fg:w="440320951"/><text x="15.2425%" y="319.50"></text></g><g><title>serde_json::value::de::&lt;impl serde_core::de::Deserialize for serde_json::value::Value&gt;::deserialize (27,081,243 samples, 0.06%)</title><rect x="15.9767%" y="293" width="0.0645%" height="15" fill="rgb(247,138,52)" fg:x="6708124192" fg:w="27081243"/><text x="16.2267%" y="303.50"></text></g><g><title>alloc::collections::btree::map::IntoIter&lt;K,V,A&gt;::dying_next (159,478,431 samples, 0.38%)</title><rect x="16.0412%" y="309" width="0.3798%" height="15" fill="rgb(213,79,30)" fg:x="6735205435" fg:w="159478431"/><text x="16.2912%" y="319.50"></text></g><g><title>cfree (40,120,360 samples, 0.10%)</title><rect x="16.3255%" y="293" width="0.0956%" height="15" fill="rgb(246,177,23)" fg:x="6854563506" fg:w="40120360"/><text x="16.5755%" y="303.50"></text></g><g><title>[libc.so.6] (21,063,189 samples, 0.05%)</title><rect x="16.3708%" y="277" width="0.0502%" height="15" fill="rgb(230,62,27)" fg:x="6873620677" fg:w="21063189"/><text x="16.6208%" y="287.50"></text></g><g><title>alloc::collections::btree::node::Handle&lt;alloc::collections::btree::node::NodeRef&lt;alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf&gt;,alloc::collections::btree::node::marker::Edge&gt;::insert_recursing (24,072,216 samples, 0.06%)</title><rect x="16.4210%" y="309" width="0.0573%" height="15" fill="rgb(216,154,8)" fg:x="6894683866" fg:w="24072216"/><text x="16.6710%" y="319.50"></text></g><g><title>[libc.so.6] (10,030,090 samples, 0.02%)</title><rect x="16.4545%" y="293" width="0.0239%" height="15" fill="rgb(244,35,45)" fg:x="6908725992" fg:w="10030090"/><text x="16.7045%" y="303.50"></text></g><g><title>alloc::raw_vec::RawVec&lt;T,A&gt;::grow_one (7,021,063 samples, 0.02%)</title><rect x="16.4783%" y="309" width="0.0167%" height="15" fill="rgb(251,115,12)" fg:x="6918756082" fg:w="7021063"/><text x="16.7283%" y="319.50"></text></g><g><title>alloc::raw_vec::RawVecInner&lt;A&gt;::try_allocate_in (26,078,234 samples, 0.06%)</title><rect x="16.4998%" y="309" width="0.0621%" height="15" fill="rgb(240,54,50)" fg:x="6927783163" fg:w="26078234"/><text x="16.7498%" y="319.50"></text></g><g><title>core::ops::function::impls::&lt;impl core::ops::function::Fn&lt;A&gt; for &amp;F&gt;::call (11,033,099 samples, 0.03%)</title><rect x="16.5667%" y="309" width="0.0263%" height="15" fill="rgb(233,84,52)" fg:x="6955867415" fg:w="11033099"/><text x="16.8167%" y="319.50"></text></g><g><title>criterion::analysis::compare::estimates::stats (10,030,090 samples, 0.02%)</title><rect x="16.5691%" y="293" width="0.0239%" height="15" fill="rgb(207,117,47)" fg:x="6956870424" fg:w="10030090"/><text x="16.8191%" y="303.50"></text></g><g><title>core::ptr::drop_in_place&lt;alloc::collections::btree::map::IntoIter&lt;alloc::string::String,serde_json::value::Value&gt;&gt; (9,027,081 samples, 0.02%)</title><rect x="16.5930%" y="309" width="0.0215%" height="15" fill="rgb(249,43,39)" fg:x="6966900514" fg:w="9027081"/><text x="16.8430%" y="319.50"></text></g><g><title>cfree (41,123,369 samples, 0.10%)</title><rect x="16.7817%" y="293" width="0.0979%" height="15" fill="rgb(209,38,44)" fg:x="7046138225" fg:w="41123369"/><text x="17.0317%" y="303.50"></text></g><g><title>[libc.so.6] (25,075,225 samples, 0.06%)</title><rect x="16.8200%" y="277" width="0.0597%" height="15" fill="rgb(236,212,23)" fg:x="7062186369" fg:w="25075225"/><text x="17.0700%" y="287.50"></text></g><g><title>core::ptr::drop_in_place&lt;serde_json::value::Value&gt; (111,333,999 samples, 0.27%)</title><rect x="16.6169%" y="309" width="0.2652%" height="15" fill="rgb(242,79,21)" fg:x="6976930604" fg:w="111333999"/><text x="16.8669%" y="319.50"></text></g><g><title>criterion::analysis::compare::estimates::stats (34,102,306 samples, 0.08%)</title><rect x="16.8845%" y="309" width="0.0812%" height="15" fill="rgb(211,96,35)" fg:x="7089267612" fg:w="34102306"/><text x="17.1345%" y="319.50"></text></g><g><title>criterion::analysis::estimates::stats (25,075,225 samples, 0.06%)</title><rect x="16.9657%" y="309" width="0.0597%" height="15" fill="rgb(253,215,40)" fg:x="7123369918" fg:w="25075225"/><text x="17.2157%" y="319.50"></text></g><g><title>[libc.so.6] (18,054,162 samples, 0.04%)</title><rect x="17.0302%" y="293" width="0.0430%" height="15" fill="rgb(211,81,21)" fg:x="7150451161" fg:w="18054162"/><text x="17.2802%" y="303.50"></text></g><g><title>criterion::bencher::Bencher&lt;M&gt;::iter (23,069,207 samples, 0.05%)</title><rect x="17.0278%" y="309" width="0.0549%" height="15" fill="rgb(208,190,38)" fg:x="7149448152" fg:w="23069207"/><text x="17.2778%" y="319.50"></text></g><g><title>criterion::kde::sweep_and_estimate (6,018,054 samples, 0.01%)</title><rect x="17.0875%" y="309" width="0.0143%" height="15" fill="rgb(235,213,38)" fg:x="7174523377" fg:w="6018054"/><text x="17.3375%" y="319.50"></text></g><g><title>criterion::stats::univariate::resamples::Resamples&lt;A&gt;::next (66,198,594 samples, 0.16%)</title><rect x="17.1066%" y="309" width="0.1577%" height="15" fill="rgb(237,122,38)" fg:x="7182547449" fg:w="66198594"/><text x="17.3566%" y="319.50"></text></g><g><title>criterion::stats::univariate::sample::Sample&lt;A&gt;::median_abs_dev (22,066,198 samples, 0.05%)</title><rect x="17.2643%" y="309" width="0.0526%" height="15" fill="rgb(244,218,35)" fg:x="7248746043" fg:w="22066198"/><text x="17.5143%" y="319.50"></text></g><g><title>cfree (5,015,045 samples, 0.01%)</title><rect x="17.3049%" y="293" width="0.0119%" height="15" fill="rgb(240,68,47)" fg:x="7265797196" fg:w="5015045"/><text x="17.5549%" y="303.50"></text></g><g><title>[libc.so.6] (6,018,054 samples, 0.01%)</title><rect x="17.3192%" y="293" width="0.0143%" height="15" fill="rgb(210,16,53)" fg:x="7271815250" fg:w="6018054"/><text x="17.5692%" y="303.50"></text></g><g><title>criterion::stats::univariate::sample::Sample&lt;A&gt;::percentiles (9,027,081 samples, 0.02%)</title><rect x="17.3168%" y="309" width="0.0215%" height="15" fill="rgb(235,124,12)" fg:x="7270812241" fg:w="9027081"/><text x="17.5668%" y="319.50"></text></g><g><title>core::fmt::num::imp::&lt;impl core::fmt::Display for isize&gt;::fmt (6,018,054 samples, 0.01%)</title><rect x="17.3527%" y="277" width="0.0143%" height="15" fill="rgb(224,169,11)" fg:x="7285857376" fg:w="6018054"/><text x="17.6027%" y="287.50"></text></g><g><title>core::fmt::num::imp::&lt;impl u64&gt;::_fmt_inner (5,015,045 samples, 0.01%)</title><rect x="17.3551%" y="261" width="0.0119%" height="15" fill="rgb(250,166,2)" fg:x="7286860385" fg:w="5015045"/><text x="17.6051%" y="271.50"></text></g><g><title>core::fmt::write (10,030,090 samples, 0.02%)</title><rect x="17.3479%" y="293" width="0.0239%" height="15" fill="rgb(242,216,29)" fg:x="7283851358" fg:w="10030090"/><text x="17.5979%" y="303.50"></text></g><g><title>fastr::nostr::canonical_json (15,045,135 samples, 0.04%)</title><rect x="17.3407%" y="309" width="0.0358%" height="15" fill="rgb(230,116,27)" fg:x="7280842331" fg:w="15045135"/><text x="17.5907%" y="319.50"></text></g><g><title>fastr::nostr::decode_hex_exact (2,872,617,776 samples, 6.84%)</title><rect x="17.3766%" y="309" width="6.8417%" height="15" fill="rgb(228,99,48)" fg:x="7295887466" fg:w="2872617776"/><text x="17.6266%" y="319.50">fastr::no..</text></g><g><title>[libc.so.6] (23,069,207 samples, 0.05%)</title><rect x="24.2827%" y="293" width="0.0549%" height="15" fill="rgb(253,11,6)" fg:x="10195586485" fg:w="23069207"/><text x="24.5327%" y="303.50"></text></g><g><title>[libc.so.6] (16,048,144 samples, 0.04%)</title><rect x="24.3640%" y="277" width="0.0382%" height="15" fill="rgb(247,143,39)" fg:x="10229688791" fg:w="16048144"/><text x="24.6140%" y="287.50"></text></g><g><title>cfree (125,376,125 samples, 0.30%)</title><rect x="24.3377%" y="293" width="0.2986%" height="15" fill="rgb(236,97,10)" fg:x="10218655692" fg:w="125376125"/><text x="24.5877%" y="303.50"></text></g><g><title>alloc::collections::btree::map::IntoIter&lt;K,V,A&gt;::dying_next (98,294,882 samples, 0.23%)</title><rect x="24.4022%" y="277" width="0.2341%" height="15" fill="rgb(233,208,19)" fg:x="10245736935" fg:w="98294882"/><text x="24.6522%" y="287.50"></text></g><g><title>serde_json::value::de::&lt;impl serde_core::de::Deserialize for serde_json::value::Value&gt;::deserialize (98,294,882 samples, 0.23%)</title><rect x="24.4022%" y="261" width="0.2341%" height="15" fill="rgb(216,164,2)" fg:x="10245736935" fg:w="98294882"/><text x="24.6522%" y="271.50"></text></g><g><title>core::ptr::drop_in_place&lt;alloc::collections::btree::map::IntoIter&lt;alloc::string::String,serde_json::value::Value&gt;&gt; (369,107,312 samples, 0.88%)</title><rect x="24.6363%" y="293" width="0.8791%" height="15" fill="rgb(220,129,5)" fg:x="10344031817" fg:w="369107312"/><text x="24.8863%" y="303.50"></text></g><g><title>cfree (294,884,646 samples, 0.70%)</title><rect x="24.8131%" y="277" width="0.7023%" height="15" fill="rgb(242,17,10)" fg:x="10418254483" fg:w="294884646"/><text x="25.0631%" y="287.50"></text></g><g><title>[libc.so.6] (172,517,548 samples, 0.41%)</title><rect x="25.1045%" y="261" width="0.4109%" height="15" fill="rgb(242,107,0)" fg:x="10540621581" fg:w="172517548"/><text x="25.3545%" y="271.50"></text></g><g><title>fastr::nostr::parse_client_msg (548,645,923 samples, 1.31%)</title><rect x="24.2182%" y="309" width="1.3067%" height="15" fill="rgb(251,28,31)" fg:x="10168505242" fg:w="548645923"/><text x="24.4682%" y="319.50"></text></g><g><title>fastr::nostr::parse_event_obj (476,429,275 samples, 1.13%)</title><rect x="25.5250%" y="309" width="1.1347%" height="15" fill="rgb(233,223,10)" fg:x="10717151165" fg:w="476429275"/><text x="25.7750%" y="319.50"></text></g><g><title>[libc.so.6] (211,634,899 samples, 0.50%)</title><rect x="26.1556%" y="293" width="0.5040%" height="15" fill="rgb(215,21,27)" fg:x="10981945541" fg:w="211634899"/><text x="26.4056%" y="303.50"></text></g><g><title>[libm.so.6] (1,753,259,732 samples, 4.18%)</title><rect x="36.9795%" y="277" width="4.1757%" height="15" fill="rgb(232,23,21)" fg:x="15526579320" fg:w="1753259732"/><text x="37.2295%" y="287.50">[libm..</text></g><g><title>rayon::iter::plumbing::bridge_producer_consumer::helper (6,205,616,683 samples, 14.78%)</title><rect x="26.6740%" y="309" width="14.7799%" height="15" fill="rgb(244,5,23)" fg:x="11199598494" fg:w="6205616683"/><text x="26.9240%" y="319.50">rayon::iter::plumbing::..</text></g><g><title>exp (2,710,130,318 samples, 6.45%)</title><rect x="34.9992%" y="293" width="6.4547%" height="15" fill="rgb(226,81,46)" fg:x="14695084859" fg:w="2710130318"/><text x="35.2492%" y="303.50">exp</text></g><g><title>__exp_finite@plt (125,376,125 samples, 0.30%)</title><rect x="41.1553%" y="277" width="0.2986%" height="15" fill="rgb(247,70,30)" fg:x="17279839052" fg:w="125376125"/><text x="41.4053%" y="287.50"></text></g><g><title>rayon::slice::sort::insertion_sort_shift_left (715,145,417 samples, 1.70%)</title><rect x="41.4539%" y="309" width="1.7033%" height="15" fill="rgb(212,68,19)" fg:x="17405215177" fg:w="715145417"/><text x="41.7039%" y="319.50"></text></g><g><title>rayon::slice::sort::recurse (363,089,258 samples, 0.86%)</title><rect x="43.1595%" y="309" width="0.8648%" height="15" fill="rgb(240,187,13)" fg:x="18121363603" fg:w="363089258"/><text x="43.4095%" y="319.50"></text></g><g><title>rayon_core::registry::WorkerThread::wait_until_cold (6,018,054 samples, 0.01%)</title><rect x="44.0267%" y="309" width="0.0143%" height="15" fill="rgb(223,113,26)" fg:x="18485455870" fg:w="6018054"/><text x="44.2767%" y="319.50"></text></g><g><title>__sched_yield (6,018,054 samples, 0.01%)</title><rect x="44.0267%" y="293" width="0.0143%" height="15" fill="rgb(206,192,2)" fg:x="18485455870" fg:w="6018054"/><text x="44.2767%" y="303.50"></text></g><g><title>[unknown] (6,018,054 samples, 0.01%)</title><rect x="44.0267%" y="277" width="0.0143%" height="15" fill="rgb(241,108,4)" fg:x="18485455870" fg:w="6018054"/><text x="44.2767%" y="287.50"></text></g><g><title>[unknown] (6,018,054 samples, 0.01%)</title><rect x="44.0267%" y="261" width="0.0143%" height="15" fill="rgb(247,173,49)" fg:x="18485455870" fg:w="6018054"/><text x="44.2767%" y="271.50"></text></g><g><title>rustsecp256k1_v0_11_ecmult_strauss_wnaf.constprop.0 (104,312,936 samples, 0.25%)</title><rect x="44.0434%" y="309" width="0.2484%" height="15" fill="rgb(224,114,35)" fg:x="18492476933" fg:w="104312936"/><text x="44.2934%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_ecmult_wnaf.constprop.0 (24,072,216 samples, 0.06%)</title><rect x="44.2918%" y="309" width="0.0573%" height="15" fill="rgb(245,159,27)" fg:x="18596789869" fg:w="24072216"/><text x="44.5418%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_fe_impl_inv_var (264,794,376 samples, 0.63%)</title><rect x="44.3492%" y="309" width="0.6307%" height="15" fill="rgb(245,172,44)" fg:x="18620862085" fg:w="264794376"/><text x="44.5992%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_modinv64_divsteps_62_var (178,535,602 samples, 0.43%)</title><rect x="44.5546%" y="293" width="0.4252%" height="15" fill="rgb(236,23,11)" fg:x="18707120859" fg:w="178535602"/><text x="44.8046%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_fe_mul_inner (2,408,224,609 samples, 5.74%)</title><rect x="44.9918%" y="309" width="5.7356%" height="15" fill="rgb(205,117,38)" fg:x="18890671506" fg:w="2408224609"/><text x="45.2418%" y="319.50">rustsec..</text></g><g><title>rustsecp256k1_v0_11_fe_sqr_inner (780,341,002 samples, 1.86%)</title><rect x="50.7274%" y="309" width="1.8585%" height="15" fill="rgb(237,72,25)" fg:x="21298896115" fg:w="780341002"/><text x="50.9774%" y="319.50">r..</text></g><g><title>rustsecp256k1_v0_11_fe_sqrt (600,802,391 samples, 1.43%)</title><rect x="52.5859%" y="309" width="1.4309%" height="15" fill="rgb(244,70,9)" fg:x="22079237117" fg:w="600802391"/><text x="52.8359%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_gej_add_ge_var (348,044,123 samples, 0.83%)</title><rect x="54.0193%" y="309" width="0.8289%" height="15" fill="rgb(217,125,39)" fg:x="22681042517" fg:w="348044123"/><text x="54.2693%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_fe_impl_normalizes_to_zero_var (10,030,090 samples, 0.02%)</title><rect x="54.8243%" y="293" width="0.0239%" height="15" fill="rgb(235,36,10)" fg:x="23019056550" fg:w="10030090"/><text x="55.0743%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_gej_add_zinv_var (5,015,045 samples, 0.01%)</title><rect x="54.8482%" y="309" width="0.0119%" height="15" fill="rgb(251,123,47)" fg:x="23029086640" fg:w="5015045"/><text x="55.0982%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_gej_double (656,970,895 samples, 1.56%)</title><rect x="54.8601%" y="309" width="1.5647%" height="15" fill="rgb(221,13,13)" fg:x="23034101685" fg:w="656970895"/><text x="55.1101%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_gej_add_zinv_var (112,337,008 samples, 0.27%)</title><rect x="56.1573%" y="293" width="0.2676%" height="15" fill="rgb(238,131,9)" fg:x="23578735572" fg:w="112337008"/><text x="56.4073%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_scalar_split_lambda (10,030,090 samples, 0.02%)</title><rect x="56.4416%" y="309" width="0.0239%" height="15" fill="rgb(211,50,8)" fg:x="23698093643" fg:w="10030090"/><text x="56.6916%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_scalar_reduce_512 (9,027,081 samples, 0.02%)</title><rect x="56.4439%" y="293" width="0.0215%" height="15" fill="rgb(245,182,24)" fg:x="23699096652" fg:w="9027081"/><text x="56.6939%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_ecmult_strauss_wnaf.constprop.0 (13,039,117 samples, 0.03%)</title><rect x="56.4678%" y="293" width="0.0311%" height="15" fill="rgb(242,14,37)" fg:x="23709126742" fg:w="13039117"/><text x="56.7178%" y="303.50"></text></g><g><title>rustsecp256k1_v0_11_schnorrsig_verify (16,048,144 samples, 0.04%)</title><rect x="56.4654%" y="309" width="0.0382%" height="15" fill="rgb(246,228,12)" fg:x="23708123733" fg:w="16048144"/><text x="56.7154%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_sha256_finalize (9,027,081 samples, 0.02%)</title><rect x="56.5037%" y="309" width="0.0215%" height="15" fill="rgb(213,55,15)" fg:x="23724171877" fg:w="9027081"/><text x="56.7537%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_xonly_pubkey_parse (226,680,034 samples, 0.54%)</title><rect x="56.5347%" y="309" width="0.5399%" height="15" fill="rgb(209,9,3)" fg:x="23737210994" fg:w="226680034"/><text x="56.7847%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_fe_sqrt (223,671,007 samples, 0.53%)</title><rect x="56.5419%" y="293" width="0.5327%" height="15" fill="rgb(230,59,30)" fg:x="23740220021" fg:w="223671007"/><text x="56.7919%" y="303.50"></text></g><g><title>serde_core::de::impls::&lt;impl serde_core::de::Deserialize for alloc::string::String&gt;::deserialize (15,045,135 samples, 0.04%)</title><rect x="57.0746%" y="309" width="0.0358%" height="15" fill="rgb(209,121,21)" fg:x="23963891028" fg:w="15045135"/><text x="57.3246%" y="319.50"></text></g><g><title>serde_json::de::Deserializer&lt;R&gt;::parse_integer (30,090,270 samples, 0.07%)</title><rect x="57.1104%" y="309" width="0.0717%" height="15" fill="rgb(220,109,13)" fg:x="23978936163" fg:w="30090270"/><text x="57.3604%" y="319.50"></text></g><g><title>serde_json::de::from_trait (7,021,063 samples, 0.02%)</title><rect x="57.1845%" y="309" width="0.0167%" height="15" fill="rgb(232,18,1)" fg:x="24010029442" fg:w="7021063"/><text x="57.4345%" y="319.50"></text></g><g><title>serde_json::read::SliceRead::skip_to_escape (88,264,792 samples, 0.21%)</title><rect x="57.2012%" y="309" width="0.2102%" height="15" fill="rgb(215,41,42)" fg:x="24017050505" fg:w="88264792"/><text x="57.4512%" y="319.50"></text></g><g><title>[libc.so.6] (14,042,126 samples, 0.03%)</title><rect x="57.6862%" y="293" width="0.0334%" height="15" fill="rgb(224,123,36)" fg:x="24220661332" fg:w="14042126"/><text x="57.9362%" y="303.50"></text></g><g><title>malloc (399,197,582 samples, 0.95%)</title><rect x="57.7196%" y="293" width="0.9508%" height="15" fill="rgb(240,125,3)" fg:x="24234703458" fg:w="399197582"/><text x="57.9696%" y="303.50"></text></g><g><title>[libc.so.6] (208,625,872 samples, 0.50%)</title><rect x="58.1735%" y="277" width="0.4969%" height="15" fill="rgb(205,98,50)" fg:x="24425275168" fg:w="208625872"/><text x="58.4235%" y="287.50"></text></g><g><title>serde_json::value::de::&lt;impl serde_core::de::Deserialize for serde_json::value::Value&gt;::deserialize (529,588,752 samples, 1.26%)</title><rect x="57.4114%" y="309" width="1.2613%" height="15" fill="rgb(205,185,37)" fg:x="24105315297" fg:w="529588752"/><text x="57.6614%" y="319.50"></text></g><g><title>[unknown] (24,322,968,250 samples, 57.93%)</title><rect x="0.7931%" y="325" width="57.9298%" height="15" fill="rgb(238,207,15)" fg:x="332998988" fg:w="24322968250"/><text x="1.0431%" y="335.50">[unknown]</text></g><g><title>sha2::sha256::x86::digest_blocks (20,060,180 samples, 0.05%)</title><rect x="58.6751%" y="309" width="0.0478%" height="15" fill="rgb(213,199,42)" fg:x="24635907058" fg:w="20060180"/><text x="58.9251%" y="319.50"></text></g><g><title>[libm.so.6] (108,324,972 samples, 0.26%)</title><rect x="59.3010%" y="277" width="0.2580%" height="15" fill="rgb(235,201,11)" fg:x="24898695416" fg:w="108324972"/><text x="59.5510%" y="287.50"></text></g><g><title>rayon::iter::plumbing::bridge_producer_consumer::helper (357,071,204 samples, 0.85%)</title><rect x="58.7277%" y="309" width="0.8504%" height="15" fill="rgb(207,46,11)" fg:x="24657973256" fg:w="357071204"/><text x="58.9777%" y="319.50"></text></g><g><title>exp (155,466,395 samples, 0.37%)</title><rect x="59.2079%" y="293" width="0.3703%" height="15" fill="rgb(241,35,35)" fg:x="24859578065" fg:w="155466395"/><text x="59.4579%" y="303.50"></text></g><g><title>__exp_finite@plt (8,024,072 samples, 0.02%)</title><rect x="59.5590%" y="277" width="0.0191%" height="15" fill="rgb(243,32,47)" fg:x="25007020388" fg:w="8024072"/><text x="59.8090%" y="287.50"></text></g><g><title>[validate-a8abd84082a0c3e1] (360,080,231 samples, 0.86%)</title><rect x="58.7229%" y="325" width="0.8576%" height="15" fill="rgb(247,202,23)" fg:x="24655967238" fg:w="360080231"/><text x="58.9729%" y="335.50"></text></g><g><title>__rustc::__rdl_alloc (17,051,153 samples, 0.04%)</title><rect x="59.5805%" y="325" width="0.0406%" height="15" fill="rgb(219,102,11)" fg:x="25016047469" fg:w="17051153"/><text x="59.8305%" y="335.50"></text></g><g><title>__rustc::__rust_alloc (28,084,252 samples, 0.07%)</title><rect x="59.6307%" y="325" width="0.0669%" height="15" fill="rgb(243,110,44)" fg:x="25037110658" fg:w="28084252"/><text x="59.8807%" y="335.50"></text></g><g><title>__rustc::__rust_no_alloc_shim_is_unstable_v2 (34,102,306 samples, 0.08%)</title><rect x="59.7047%" y="325" width="0.0812%" height="15" fill="rgb(222,74,54)" fg:x="25068203937" fg:w="34102306"/><text x="59.9547%" y="335.50"></text></g><g><title>[libc.so.6] (148,445,332 samples, 0.35%)</title><rect x="60.6651%" y="309" width="0.3536%" height="15" fill="rgb(216,99,12)" fg:x="25471413555" fg:w="148445332"/><text x="60.9151%" y="319.50"></text></g><g><title>malloc (18,054,162 samples, 0.04%)</title><rect x="61.0186%" y="309" width="0.0430%" height="15" fill="rgb(226,22,26)" fg:x="25619858887" fg:w="18054162"/><text x="61.2686%" y="319.50"></text></g><g><title>alloc::collections::btree::map::BTreeMap&lt;K,V,A&gt;::insert (584,754,247 samples, 1.39%)</title><rect x="59.7860%" y="325" width="1.3927%" height="15" fill="rgb(217,163,10)" fg:x="25102306243" fg:w="584754247"/><text x="60.0360%" y="335.50"></text></g><g><title>serde_json::value::de::&lt;impl serde_core::de::Deserialize for serde_json::value::Value&gt;::deserialize (49,147,441 samples, 0.12%)</title><rect x="61.0616%" y="309" width="0.1171%" height="15" fill="rgb(213,25,53)" fg:x="25637913049" fg:w="49147441"/><text x="61.3116%" y="319.50"></text></g><g><title>&lt;serde_json::read::StrRead as serde_json::read::Read&gt;::parse_str (5,015,045 samples, 0.01%)</title><rect x="61.1667%" y="293" width="0.0119%" height="15" fill="rgb(252,105,26)" fg:x="25682045445" fg:w="5015045"/><text x="61.4167%" y="303.50"></text></g><g><title>alloc::collections::btree::map::IntoIter&lt;K,V,A&gt;::dying_next (38,114,342 samples, 0.09%)</title><rect x="61.1787%" y="325" width="0.0908%" height="15" fill="rgb(220,39,43)" fg:x="25687060490" fg:w="38114342"/><text x="61.4287%" y="335.50"></text></g><g><title>alloc::collections::btree::node::Handle&lt;alloc::collections::btree::node::NodeRef&lt;alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf&gt;,alloc::collections::btree::node::marker::Edge&gt;::insert_recursing (452,357,059 samples, 1.08%)</title><rect x="61.2694%" y="325" width="1.0774%" height="15" fill="rgb(229,68,48)" fg:x="25725174832" fg:w="452357059"/><text x="61.5194%" y="335.50"></text></g><g><title>[libc.so.6] (169,508,521 samples, 0.40%)</title><rect x="61.9431%" y="309" width="0.4037%" height="15" fill="rgb(252,8,32)" fg:x="26008023370" fg:w="169508521"/><text x="62.1931%" y="319.50"></text></g><g><title>malloc (22,066,198 samples, 0.05%)</title><rect x="62.3779%" y="309" width="0.0526%" height="15" fill="rgb(223,20,43)" fg:x="26190571008" fg:w="22066198"/><text x="62.6279%" y="319.50"></text></g><g><title>[unknown] (8,024,072 samples, 0.02%)</title><rect x="62.4376%" y="261" width="0.0191%" height="15" fill="rgb(229,81,49)" fg:x="26215646233" fg:w="8024072"/><text x="62.6876%" y="271.50"></text></g><g><title>[unknown] (8,024,072 samples, 0.02%)</title><rect x="62.4376%" y="245" width="0.0191%" height="15" fill="rgb(236,28,36)" fg:x="26215646233" fg:w="8024072"/><text x="62.6876%" y="255.50"></text></g><g><title>[unknown] (8,024,072 samples, 0.02%)</title><rect x="62.4376%" y="229" width="0.0191%" height="15" fill="rgb(249,185,26)" fg:x="26215646233" fg:w="8024072"/><text x="62.6876%" y="239.50"></text></g><g><title>[unknown] (5,015,045 samples, 0.01%)</title><rect x="62.4448%" y="213" width="0.0119%" height="15" fill="rgb(249,174,33)" fg:x="26218655260" fg:w="5015045"/><text x="62.6948%" y="223.50"></text></g><g><title>[unknown] (5,015,045 samples, 0.01%)</title><rect x="62.4448%" y="197" width="0.0119%" height="15" fill="rgb(233,201,37)" fg:x="26218655260" fg:w="5015045"/><text x="62.6948%" y="207.50"></text></g><g><title>[unknown] (5,015,045 samples, 0.01%)</title><rect x="62.4448%" y="181" width="0.0119%" height="15" fill="rgb(221,78,26)" fg:x="26218655260" fg:w="5015045"/><text x="62.6948%" y="191.50"></text></g><g><title>[unknown] (5,015,045 samples, 0.01%)</title><rect x="62.4448%" y="165" width="0.0119%" height="15" fill="rgb(250,127,30)" fg:x="26218655260" fg:w="5015045"/><text x="62.6948%" y="175.50"></text></g><g><title>alloc::raw_vec::RawVecInner&lt;A&gt;::finish_grow (43,129,387 samples, 0.10%)</title><rect x="62.3564%" y="325" width="0.1027%" height="15" fill="rgb(230,49,44)" fg:x="26181543927" fg:w="43129387"/><text x="62.6064%" y="335.50"></text></g><g><title>realloc (12,036,108 samples, 0.03%)</title><rect x="62.4304%" y="309" width="0.0287%" height="15" fill="rgb(229,67,23)" fg:x="26212637206" fg:w="12036108"/><text x="62.6804%" y="319.50"></text></g><g><title>[libc.so.6] (12,036,108 samples, 0.03%)</title><rect x="62.4304%" y="293" width="0.0287%" height="15" fill="rgb(249,83,47)" fg:x="26212637206" fg:w="12036108"/><text x="62.6804%" y="303.50"></text></g><g><title>[libc.so.6] (11,033,099 samples, 0.03%)</title><rect x="62.4328%" y="277" width="0.0263%" height="15" fill="rgb(215,43,3)" fg:x="26213640215" fg:w="11033099"/><text x="62.6828%" y="287.50"></text></g><g><title>alloc::raw_vec::RawVecInner&lt;A&gt;::try_allocate_in (82,246,738 samples, 0.20%)</title><rect x="62.4639%" y="325" width="0.1959%" height="15" fill="rgb(238,154,13)" fg:x="26226679332" fg:w="82246738"/><text x="62.7139%" y="335.50"></text></g><g><title>malloc (46,138,414 samples, 0.11%)</title><rect x="62.5499%" y="309" width="0.1099%" height="15" fill="rgb(219,56,2)" fg:x="26262787656" fg:w="46138414"/><text x="62.7999%" y="319.50"></text></g><g><title>cfree (41,123,369 samples, 0.10%)</title><rect x="62.6669%" y="325" width="0.0979%" height="15" fill="rgb(233,0,4)" fg:x="26311935097" fg:w="41123369"/><text x="62.9169%" y="335.50"></text></g><g><title>serde_json::value::de::&lt;impl serde_core::de::Deserialize for serde_json::value::Value&gt;::deserialize (40,120,360 samples, 0.10%)</title><rect x="62.6693%" y="309" width="0.0956%" height="15" fill="rgb(235,30,7)" fg:x="26312938106" fg:w="40120360"/><text x="62.9193%" y="319.50"></text></g><g><title>core::ops::function::impls::&lt;impl core::ops::function::Fn&lt;A&gt; for &amp;F&gt;::call (109,327,981 samples, 0.26%)</title><rect x="62.7673%" y="325" width="0.2604%" height="15" fill="rgb(250,79,13)" fg:x="26354061475" fg:w="109327981"/><text x="63.0173%" y="335.50"></text></g><g><title>core::ptr::drop_in_place&lt;alloc::boxed::Box&lt;fastr::pack::Event&gt;&gt; (52,156,468 samples, 0.12%)</title><rect x="63.0276%" y="325" width="0.1242%" height="15" fill="rgb(211,146,34)" fg:x="26463389456" fg:w="52156468"/><text x="63.2776%" y="335.50"></text></g><g><title>cfree (42,126,378 samples, 0.10%)</title><rect x="63.0515%" y="309" width="0.1003%" height="15" fill="rgb(228,22,38)" fg:x="26473419546" fg:w="42126378"/><text x="63.3015%" y="319.50"></text></g><g><title>[libc.so.6] (38,114,342 samples, 0.09%)</title><rect x="63.0611%" y="293" width="0.0908%" height="15" fill="rgb(235,168,5)" fg:x="26477431582" fg:w="38114342"/><text x="63.3111%" y="303.50"></text></g><g><title>core::ptr::drop_in_place&lt;alloc::collections::btree::map::IntoIter&lt;alloc::string::String,serde_json::value::Value&gt;&gt; (10,030,090 samples, 0.02%)</title><rect x="63.1519%" y="325" width="0.0239%" height="15" fill="rgb(221,155,16)" fg:x="26515545924" fg:w="10030090"/><text x="63.4019%" y="335.50"></text></g><g><title>core::ptr::drop_in_place&lt;serde_json::value::Value&gt; (82,246,738 samples, 0.20%)</title><rect x="63.1757%" y="325" width="0.1959%" height="15" fill="rgb(215,215,53)" fg:x="26525576014" fg:w="82246738"/><text x="63.4257%" y="335.50"></text></g><g><title>criterion::analysis::estimates::stats (25,075,225 samples, 0.06%)</title><rect x="63.3764%" y="325" width="0.0597%" height="15" fill="rgb(223,4,10)" fg:x="26609828770" fg:w="25075225"/><text x="63.6264%" y="335.50"></text></g><g><title>[libc.so.6] (7,021,063 samples, 0.02%)</title><rect x="63.4409%" y="309" width="0.0167%" height="15" fill="rgb(234,103,6)" fg:x="26636910013" fg:w="7021063"/><text x="63.6909%" y="319.50"></text></g><g><title>criterion::bencher::Bencher&lt;M&gt;::iter (17,051,153 samples, 0.04%)</title><rect x="63.4385%" y="325" width="0.0406%" height="15" fill="rgb(227,97,0)" fg:x="26635907004" fg:w="17051153"/><text x="63.6885%" y="335.50"></text></g><g><title>cfree (9,027,081 samples, 0.02%)</title><rect x="63.4576%" y="309" width="0.0215%" height="15" fill="rgb(234,150,53)" fg:x="26643931076" fg:w="9027081"/><text x="63.7076%" y="319.50"></text></g><g><title>[libc.so.6] (7,021,063 samples, 0.02%)</title><rect x="63.4624%" y="293" width="0.0167%" height="15" fill="rgb(228,201,54)" fg:x="26645937094" fg:w="7021063"/><text x="63.7124%" y="303.50"></text></g><g><title>criterion::kde::sweep_and_estimate (20,060,180 samples, 0.05%)</title><rect x="63.4791%" y="325" width="0.0478%" height="15" fill="rgb(222,22,37)" fg:x="26652958157" fg:w="20060180"/><text x="63.7291%" y="335.50"></text></g><g><title>exp (7,021,063 samples, 0.02%)</title><rect x="63.5102%" y="309" width="0.0167%" height="15" fill="rgb(237,53,32)" fg:x="26665997274" fg:w="7021063"/><text x="63.7602%" y="319.50"></text></g><g><title>[libc.so.6] (30,090,270 samples, 0.07%)</title><rect x="63.5723%" y="261" width="0.0717%" height="15" fill="rgb(233,25,53)" fg:x="26692075508" fg:w="30090270"/><text x="63.8223%" y="271.50"></text></g><g><title>criterion::report::CliReport::print_overwritable (81,243,729 samples, 0.19%)</title><rect x="63.5293%" y="325" width="0.1935%" height="15" fill="rgb(210,40,34)" fg:x="26674021346" fg:w="81243729"/><text x="63.7793%" y="335.50"></text></g><g><title>[unknown] (81,243,729 samples, 0.19%)</title><rect x="63.5293%" y="309" width="0.1935%" height="15" fill="rgb(241,220,44)" fg:x="26674021346" fg:w="81243729"/><text x="63.7793%" y="319.50"></text></g><g><title>[unknown] (81,243,729 samples, 0.19%)</title><rect x="63.5293%" y="293" width="0.1935%" height="15" fill="rgb(235,28,35)" fg:x="26674021346" fg:w="81243729"/><text x="63.7793%" y="303.50"></text></g><g><title>criterion::bencher::Bencher&lt;M&gt;::iter (81,243,729 samples, 0.19%)</title><rect x="63.5293%" y="277" width="0.1935%" height="15" fill="rgb(210,56,17)" fg:x="26674021346" fg:w="81243729"/><text x="63.7793%" y="287.50"></text></g><g><title>cfree (33,099,297 samples, 0.08%)</title><rect x="63.6440%" y="261" width="0.0788%" height="15" fill="rgb(224,130,29)" fg:x="26722165778" fg:w="33099297"/><text x="63.8940%" y="271.50"></text></g><g><title>[libc.so.6] (25,075,225 samples, 0.06%)</title><rect x="63.6631%" y="245" width="0.0597%" height="15" fill="rgb(235,212,8)" fg:x="26730189850" fg:w="25075225"/><text x="63.9131%" y="255.50"></text></g><g><title>criterion::routine::Routine::sample (10,030,090 samples, 0.02%)</title><rect x="63.7228%" y="325" width="0.0239%" height="15" fill="rgb(223,33,50)" fg:x="26755265075" fg:w="10030090"/><text x="63.9728%" y="335.50"></text></g><g><title>criterion::bencher::Bencher&lt;M&gt;::iter (10,030,090 samples, 0.02%)</title><rect x="63.7228%" y="309" width="0.0239%" height="15" fill="rgb(219,149,13)" fg:x="26755265075" fg:w="10030090"/><text x="63.9728%" y="319.50"></text></g><g><title>cfree (5,015,045 samples, 0.01%)</title><rect x="63.7347%" y="293" width="0.0119%" height="15" fill="rgb(250,156,29)" fg:x="26760280120" fg:w="5015045"/><text x="63.9847%" y="303.50"></text></g><g><title>criterion::stats::bivariate::resamples::Resamples&lt;X,Y&gt;::next (103,309,927 samples, 0.25%)</title><rect x="63.7467%" y="325" width="0.2461%" height="15" fill="rgb(216,193,19)" fg:x="26765295165" fg:w="103309927"/><text x="63.9967%" y="335.50"></text></g><g><title>criterion::stats::univariate::resamples::Resamples&lt;A&gt;::next (63,189,567 samples, 0.15%)</title><rect x="63.9927%" y="325" width="0.1505%" height="15" fill="rgb(216,135,14)" fg:x="26868605092" fg:w="63189567"/><text x="64.2427%" y="335.50"></text></g><g><title>criterion::stats::univariate::sample::Sample&lt;A&gt;::percentiles (6,018,054 samples, 0.01%)</title><rect x="64.1432%" y="325" width="0.0143%" height="15" fill="rgb(241,47,5)" fg:x="26931794659" fg:w="6018054"/><text x="64.3932%" y="335.50"></text></g><g><title>[libc.so.6] (17,051,153 samples, 0.04%)</title><rect x="64.2842%" y="309" width="0.0406%" height="15" fill="rgb(233,42,35)" fg:x="26990972190" fg:w="17051153"/><text x="64.5342%" y="319.50"></text></g><g><title>alloc::alloc::exchange_malloc (12,036,108 samples, 0.03%)</title><rect x="64.3248%" y="309" width="0.0287%" height="15" fill="rgb(231,13,6)" fg:x="27008023343" fg:w="12036108"/><text x="64.5748%" y="319.50"></text></g><g><title>malloc (11,033,099 samples, 0.03%)</title><rect x="64.3272%" y="293" width="0.0263%" height="15" fill="rgb(207,181,40)" fg:x="27009026352" fg:w="11033099"/><text x="64.5772%" y="303.50"></text></g><g><title>[libc.so.6] (9,027,081 samples, 0.02%)</title><rect x="64.4060%" y="293" width="0.0215%" height="15" fill="rgb(254,173,49)" fg:x="27042125649" fg:w="9027081"/><text x="64.6560%" y="303.50"></text></g><g><title>cfree (136,409,224 samples, 0.32%)</title><rect x="64.3535%" y="309" width="0.3249%" height="15" fill="rgb(221,1,38)" fg:x="27020059451" fg:w="136409224"/><text x="64.6035%" y="319.50"></text></g><g><title>alloc::collections::btree::map::IntoIter&lt;K,V,A&gt;::dying_next (105,315,945 samples, 0.25%)</title><rect x="64.4275%" y="293" width="0.2508%" height="15" fill="rgb(206,124,46)" fg:x="27051152730" fg:w="105315945"/><text x="64.6775%" y="303.50"></text></g><g><title>serde_json::value::de::&lt;impl serde_core::de::Deserialize for serde_json::value::Value&gt;::deserialize (105,315,945 samples, 0.25%)</title><rect x="64.4275%" y="277" width="0.2508%" height="15" fill="rgb(249,21,11)" fg:x="27051152730" fg:w="105315945"/><text x="64.6775%" y="287.50"></text></g><g><title>core::ptr::drop_in_place&lt;alloc::collections::btree::map::IntoIter&lt;alloc::string::String,serde_json::value::Value&gt;&gt; (421,263,780 samples, 1.00%)</title><rect x="64.6783%" y="309" width="1.0033%" height="15" fill="rgb(222,201,40)" fg:x="27156468675" fg:w="421263780"/><text x="64.9283%" y="319.50"></text></g><g><title>cfree (349,047,132 samples, 0.83%)</title><rect x="64.8503%" y="293" width="0.8313%" height="15" fill="rgb(235,61,29)" fg:x="27228685323" fg:w="349047132"/><text x="65.1003%" y="303.50"></text></g><g><title>[libc.so.6] (204,613,836 samples, 0.49%)</title><rect x="65.1943%" y="277" width="0.4873%" height="15" fill="rgb(219,207,3)" fg:x="27373118619" fg:w="204613836"/><text x="65.4443%" y="287.50"></text></g><g><title>fastr::nostr::parse_client_msg (640,922,751 samples, 1.53%)</title><rect x="64.1600%" y="325" width="1.5265%" height="15" fill="rgb(222,56,46)" fg:x="26938815722" fg:w="640922751"/><text x="64.4100%" y="335.50"></text></g><g><title>fastr::nostr::parse_event_obj (47,141,423 samples, 0.11%)</title><rect x="65.6864%" y="325" width="0.1123%" height="15" fill="rgb(239,76,54)" fg:x="27579738473" fg:w="47141423"/><text x="65.9364%" y="335.50"></text></g><g><title>[libc.so.6] (13,039,117 samples, 0.03%)</title><rect x="65.7677%" y="309" width="0.0311%" height="15" fill="rgb(231,124,27)" fg:x="27613840779" fg:w="13039117"/><text x="66.0177%" y="319.50"></text></g><g><title>fastr::nostr::validate_event (12,036,108 samples, 0.03%)</title><rect x="65.7987%" y="325" width="0.0287%" height="15" fill="rgb(249,195,6)" fg:x="27626879896" fg:w="12036108"/><text x="66.0487%" y="335.50"></text></g><g><title>floor (5,015,045 samples, 0.01%)</title><rect x="65.8298%" y="325" width="0.0119%" height="15" fill="rgb(237,174,47)" fg:x="27639919013" fg:w="5015045"/><text x="66.0798%" y="335.50"></text></g><g><title>[libm.so.6] (2,919,759,199 samples, 6.95%)</title><rect x="84.4915%" y="293" width="6.9540%" height="15" fill="rgb(206,201,31)" fg:x="35475425321" fg:w="2919759199"/><text x="84.7415%" y="303.50">[libm.so...</text></g><g><title>rayon::iter::plumbing::bridge_producer_consumer::helper (10,949,849,253 samples, 26.08%)</title><rect x="65.8465%" y="325" width="26.0792%" height="15" fill="rgb(231,57,52)" fg:x="27646940076" fg:w="10949849253"/><text x="66.0965%" y="335.50">rayon::iter::plumbing::bridge_producer_con..</text></g><g><title>exp (4,568,705,995 samples, 10.88%)</title><rect x="81.0444%" y="309" width="10.8812%" height="15" fill="rgb(248,177,22)" fg:x="34028083334" fg:w="4568705995"/><text x="81.2944%" y="319.50">exp</text></g><g><title>__exp_finite@plt (199,598,791 samples, 0.48%)</title><rect x="91.4503%" y="293" width="0.4754%" height="15" fill="rgb(215,211,37)" fg:x="38397190538" fg:w="199598791"/><text x="91.7003%" y="303.50"></text></g><g><title>rayon::slice::sort::insertion_sort_shift_left (149,448,341 samples, 0.36%)</title><rect x="91.9304%" y="325" width="0.3559%" height="15" fill="rgb(241,128,51)" fg:x="38598795347" fg:w="149448341"/><text x="92.1804%" y="335.50"></text></g><g><title>rayon::slice::sort::recurse (511,534,590 samples, 1.22%)</title><rect x="92.2888%" y="325" width="1.2183%" height="15" fill="rgb(227,165,31)" fg:x="38749246697" fg:w="511534590"/><text x="92.5388%" y="335.50"></text></g><g><title>serde_json::de::from_trait (55,165,495 samples, 0.13%)</title><rect x="93.3757%" y="309" width="0.1314%" height="15" fill="rgb(228,167,24)" fg:x="39205615792" fg:w="55165495"/><text x="93.6257%" y="319.50"></text></g><g><title>rayon_core::join::join_context::{{closure}} (13,039,117 samples, 0.03%)</title><rect x="93.5071%" y="325" width="0.0311%" height="15" fill="rgb(228,143,12)" fg:x="39260781287" fg:w="13039117"/><text x="93.7571%" y="335.50"></text></g><g><title>rayon::iter::plumbing::bridge_producer_consumer::helper (13,039,117 samples, 0.03%)</title><rect x="93.5071%" y="309" width="0.0311%" height="15" fill="rgb(249,149,8)" fg:x="39260781287" fg:w="13039117"/><text x="93.7571%" y="319.50"></text></g><g><title>rayon_core::registry::WorkerThread::wait_until_cold (5,015,045 samples, 0.01%)</title><rect x="93.5381%" y="325" width="0.0119%" height="15" fill="rgb(243,35,44)" fg:x="39273820404" fg:w="5015045"/><text x="93.7881%" y="335.50"></text></g><g><title>__sched_yield (5,015,045 samples, 0.01%)</title><rect x="93.5381%" y="309" width="0.0119%" height="15" fill="rgb(246,89,9)" fg:x="39273820404" fg:w="5015045"/><text x="93.7881%" y="319.50"></text></g><g><title>[unknown] (5,015,045 samples, 0.01%)</title><rect x="93.5381%" y="293" width="0.0119%" height="15" fill="rgb(233,213,13)" fg:x="39273820404" fg:w="5015045"/><text x="93.7881%" y="303.50"></text></g><g><title>[unknown] (5,015,045 samples, 0.01%)</title><rect x="93.5381%" y="277" width="0.0119%" height="15" fill="rgb(233,141,41)" fg:x="39273820404" fg:w="5015045"/><text x="93.7881%" y="287.50"></text></g><g><title>rustsecp256k1_v0_11_ecmult_strauss_wnaf.constprop.0 (77,231,693 samples, 0.18%)</title><rect x="93.5525%" y="325" width="0.1839%" height="15" fill="rgb(239,167,4)" fg:x="39279838458" fg:w="77231693"/><text x="93.8025%" y="335.50"></text></g><g><title>rustsecp256k1_v0_11_gej_double (6,018,054 samples, 0.01%)</title><rect x="93.7221%" y="309" width="0.0143%" height="15" fill="rgb(209,217,16)" fg:x="39351052097" fg:w="6018054"/><text x="93.9721%" y="319.50"></text></g><g><title>rustsecp256k1_v0_11_fe_impl_normalize_var (7,021,063 samples, 0.02%)</title><rect x="93.7412%" y="325" width="0.0167%" height="15" fill="rgb(219,88,35)" fg:x="39359076169" fg:w="7021063"/><text x="93.9912%" y="335.50"></text></g><g><title>rustsecp256k1_v0_11_fe_mul_inner (731,193,561 samples, 1.74%)</title><rect x="93.7579%" y="325" width="1.7415%" height="15" fill="rgb(220,193,23)" fg:x="39366097232" fg:w="731193561"/><text x="94.0079%" y="335.50"></text></g><g><title>rustsecp256k1_v0_11_fe_sqr_inner (185,556,665 samples, 0.44%)</title><rect x="95.4994%" y="325" width="0.4419%" height="15" fill="rgb(230,90,52)" fg:x="40097290793" fg:w="185556665"/><text x="95.7494%" y="335.50"></text></g><g><title>rustsecp256k1_v0_11_fe_sqrt (145,436,305 samples, 0.35%)</title><rect x="95.9413%" y="325" width="0.3464%" height="15" fill="rgb(252,106,19)" fg:x="40282847458" fg:w="145436305"/><text x="96.1913%" y="335.50"></text></g><g><title>rustsecp256k1_v0_11_gej_double (8,024,072 samples, 0.02%)</title><rect x="96.2973%" y="325" width="0.0191%" height="15" fill="rgb(206,74,20)" fg:x="40432295799" fg:w="8024072"/><text x="96.5473%" y="335.50"></text></g><g><title>rustsecp256k1_v0_11_scalar_reduce_512 (7,021,063 samples, 0.02%)</title><rect x="96.3212%" y="325" width="0.0167%" height="15" fill="rgb(230,138,44)" fg:x="40442325889" fg:w="7021063"/><text x="96.5712%" y="335.50"></text></g><g><title>rustsecp256k1_v0_11_sha256_transform (33,099,297 samples, 0.08%)</title><rect x="96.3546%" y="325" width="0.0788%" height="15" fill="rgb(235,182,43)" fg:x="40456368015" fg:w="33099297"/><text x="96.6046%" y="335.50"></text></g><g><title>serde_core::de::impls::&lt;impl serde_core::de::Deserialize for alloc::string::String&gt;::deserialize (25,075,225 samples, 0.06%)</title><rect x="96.4382%" y="325" width="0.0597%" height="15" fill="rgb(242,16,51)" fg:x="40491473330" fg:w="25075225"/><text x="96.6882%" y="335.50"></text></g><g><title>serde_json::de::Deserializer&lt;R&gt;::parse_integer (25,075,225 samples, 0.06%)</title><rect x="96.4979%" y="325" width="0.0597%" height="15" fill="rgb(248,9,4)" fg:x="40516548555" fg:w="25075225"/><text x="96.7479%" y="335.50"></text></g><g><title>serde_json::de::Deserializer&lt;R&gt;::parse_number (19,057,171 samples, 0.05%)</title><rect x="96.5577%" y="325" width="0.0454%" height="15" fill="rgb(210,31,22)" fg:x="40541623780" fg:w="19057171"/><text x="96.8077%" y="335.50"></text></g><g><title>serde_json::de::from_trait (51,153,459 samples, 0.12%)</title><rect x="96.6030%" y="325" width="0.1218%" height="15" fill="rgb(239,54,39)" fg:x="40560680951" fg:w="51153459"/><text x="96.8530%" y="335.50"></text></g><g><title>serde_json::read::SliceRead::skip_to_escape (61,183,549 samples, 0.15%)</title><rect x="96.7249%" y="325" width="0.1457%" height="15" fill="rgb(230,99,41)" fg:x="40611834410" fg:w="61183549"/><text x="96.9749%" y="335.50"></text></g><g><title>[libc.so.6] (81,243,729 samples, 0.19%)</title><rect x="99.1209%" y="309" width="0.1935%" height="15" fill="rgb(253,106,12)" fg:x="41617852437" fg:w="81243729"/><text x="99.3709%" y="319.50"></text></g><g><title>malloc (23,069,207 samples, 0.05%)</title><rect x="99.3144%" y="309" width="0.0549%" height="15" fill="rgb(213,46,41)" fg:x="41699096166" fg:w="23069207"/><text x="99.5644%" y="319.50"></text></g><g><title>&lt;serde_json::read::StrRead as serde_json::read::Read&gt;::parse_str (12,036,108 samples, 0.03%)</title><rect x="99.5628%" y="293" width="0.0287%" height="15" fill="rgb(215,133,35)" fg:x="41803409102" fg:w="12036108"/><text x="99.8128%" y="303.50"></text></g><g><title>[libc.so.6] (52,156,468 samples, 0.12%)</title><rect x="99.5915%" y="293" width="0.1242%" height="15" fill="rgb(213,28,5)" fg:x="41815445210" fg:w="52156468"/><text x="99.8415%" y="303.50"></text></g><g><title>serde_core::de::impls::&lt;impl serde_core::de::Deserialize for alloc::string::String&gt;::deserialize (249,749,241 samples, 0.59%)</title><rect x="99.3693%" y="309" width="0.5948%" height="15" fill="rgb(215,77,49)" fg:x="41722165373" fg:w="249749241"/><text x="99.6193%" y="319.50"></text></g><g><title>malloc (104,312,936 samples, 0.25%)</title><rect x="99.7157%" y="293" width="0.2484%" height="15" fill="rgb(248,100,22)" fg:x="41867601678" fg:w="104312936"/><text x="99.9657%" y="303.50"></text></g><g><title>serde_json::value::de::&lt;impl serde_core::de::Deserialize for serde_json::value::Value&gt;::deserialize (1,301,905,682 samples, 3.10%)</title><rect x="96.8706%" y="325" width="3.1007%" height="15" fill="rgb(208,67,9)" fg:x="40673017959" fg:w="1301905682"/><text x="97.1206%" y="335.50">ser..</text></g><g><title>all (41,986,959,749 samples, 100%)</title><rect x="0.0000%" y="357" width="100.0000%" height="15" fill="rgb(219,133,21)" fg:x="0" fg:w="41986959749"/><text x="0.2500%" y="367.50"></text></g><g><title>validate-a8abd8 (41,895,685,930 samples, 99.78%)</title><rect x="0.2174%" y="341" width="99.7826%" height="15" fill="rgb(246,46,29)" fg:x="91273819" fg:w="41895685930"/><text x="0.4674%" y="351.50">validate-a8abd8</text></g><g><title>std::sys::pal::unix::time::Timespec::now (10,030,090 samples, 0.02%)</title><rect x="99.9761%" y="325" width="0.0239%" height="15" fill="rgb(246,185,52)" fg:x="41976929659" fg:w="10030090"/><text x="100.2261%" y="335.50"></text></g><g><title>rustsecp256k1_v0_11_ge_to_bytes (10,030,090 samples, 0.02%)</title><rect x="99.9761%" y="309" width="0.0239%" height="15" fill="rgb(252,136,11)" fg:x="41976929659" fg:w="10030090"/><text x="100.2261%" y="319.50"></text></g></svg></svg>
