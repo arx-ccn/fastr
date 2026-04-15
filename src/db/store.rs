@@ -428,18 +428,6 @@ fn blob_bounds(idx: &[u8], i: usize, total: usize, data_len: usize, offset: u64)
     }
 }
 
-fn event_bytes_at<'a>(data: &'a [u8], index: &[u8], offset: u64) -> Option<&'a [u8]> {
-    let total = index.len() / INDEX_ENTRY_SIZE;
-    for (i, entry) in index::iter_entries(index) {
-        if entry.offset != offset {
-            continue;
-        }
-        let (start, end) = blob_bounds(index, i, total, data.len(), entry.offset)?;
-        return Some(&data[start..end]);
-    }
-    None
-}
-
 // NIP-09 tombstone helpers
 
 /// Scan all stored kind-5 events and populate the tombstone map.
@@ -810,12 +798,27 @@ impl Store {
     /// NIP-45: return count for a filter using in-memory counters when possible.
     /// Falls back to exact scans for unsupported filter shapes.
     pub fn count(&self, filter: &Filter) -> u64 {
+        self.count_authors(filter, &[])
+    }
+
+    pub fn count_filters(&self, filters: &[Filter], auth_pubkeys: &[[u8; 32]]) -> u64 {
+        if filters.is_empty() {
+            return 0;
+        }
+        if filters.len() == 1 {
+            return self.count_authors(&filters[0], auth_pubkeys);
+        }
+        self.scan_count(filters, auth_pubkeys)
+    }
+
+    fn count_authors(&self, filter: &Filter, auth_pubkeys: &[[u8; 32]]) -> u64 {
         let has_tags = !filter.tags.is_empty();
         let has_time = filter.since.is_some() || filter.until.is_some();
         let has_ids = !filter.ids.is_empty();
+        let needs_nip17_filtering = filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP);
 
-        if has_tags || has_time || has_ids {
-            return self.scan_count(std::slice::from_ref(filter));
+        if has_tags || has_time || has_ids || needs_nip17_filtering {
+            return self.scan_count(std::slice::from_ref(filter), auth_pubkeys);
         }
 
         let has_kinds = !filter.kinds.is_empty();
@@ -851,26 +854,18 @@ impl Store {
                 }
                 matching_keys.iter().map(|k| counts.get(k).copied().unwrap_or(0)).sum()
             }
-            (false, false) => self.event_count() as u64,
-            _ => self.scan_count(std::slice::from_ref(filter)),
+            (false, false) => self.scan_count(std::slice::from_ref(filter), auth_pubkeys),
+            _ => self.scan_count(std::slice::from_ref(filter), auth_pubkeys),
         }
     }
 
-    pub fn count_filters(&self, filters: &[Filter]) -> u64 {
-        if filters.is_empty() {
-            return 0;
-        }
-        if filters.len() == 1 {
-            return self.count(&filters[0]);
-        }
-        self.scan_count(filters)
-    }
-
-    fn scan_count(&self, filters: &[Filter]) -> u64 {
+    fn scan_count(&self, filters: &[Filter], auth_pubkeys: &[[u8; 32]]) -> u64 {
         use crate::nostr::single_filter_matches;
 
         let idx = self.index.slice();
         let data = self.data.slice();
+        let tags_slice = self.tags.slice();
+        let total_entries = idx.len() / INDEX_ENTRY_SIZE;
         let now = unix_now();
         let tombstones = match self.tombstones.read() {
             Ok(t) => t,
@@ -881,8 +876,23 @@ impl Store {
             Err(_) => return 0,
         };
 
+        let needs_nip17_filtering = filters
+            .iter()
+            .any(|f| f.kinds.is_empty() || f.kinds.contains(&crate::nostr::KIND_GIFT_WRAP));
+        let nip17_allowed: Option<HashSet<u64>> = if !needs_nip17_filtering {
+            Some(HashSet::new())
+        } else if auth_pubkeys.is_empty() {
+            None
+        } else {
+            let mut set = HashSet::new();
+            for pk in auth_pubkeys {
+                set.extend(tags::matching_offsets(&tags_slice, b'p', pk));
+            }
+            Some(set)
+        };
+
         let mut total = 0u64;
-        for (_, entry) in index::iter_entries(&idx) {
+        for (i, entry) in index::iter_entries(&idx) {
             if entry.expiry != 0 && entry.expiry <= now {
                 continue;
             }
@@ -893,9 +903,21 @@ impl Store {
                 continue;
             }
 
-            let Some(ev_bytes) = event_bytes_at(&data, &idx, entry.offset) else {
+            if entry.kind == crate::nostr::KIND_GIFT_WRAP {
+                match &nip17_allowed {
+                    None => continue,
+                    Some(set) => {
+                        if !set.contains(&entry.offset) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let Some((start, end)) = blob_bounds(&idx, i, total_entries, data.len(), entry.offset) else {
                 continue;
             };
+            let ev_bytes = &data[start..end];
             let Ok(ev) = crate::pack::deserialize_trusted(ev_bytes) else {
                 continue;
             };
@@ -1226,7 +1248,7 @@ impl Store {
         // NIP-09: update tombstone map BEFORE publishing lengths to readers.
         // This closes the race where a concurrent query could see the kind-5
         // event in the index before its targets are tombstoned.
-        if ev.kind == KIND_DELETION {
+        let immediately_tombstoned = if ev.kind == KIND_DELETION {
             let idx = self.index.slice();
             let mut ts = self
                 .tombstones
@@ -1250,6 +1272,7 @@ impl Store {
             for (kind, pubkey) in tombstoned {
                 self.decrement_live_event_count(kind, pubkey);
             }
+            false
         } else {
             // Non-deletion event: check for a preemptive tombstone that needs
             // pubkey verification. If a kind-5 arrived before this event,
@@ -1262,12 +1285,16 @@ impl Store {
                 if candidates.contains(&ev.pubkey.0) {
                     // At least one candidate pubkey matches: promote to confirmed tombstone.
                     ts.insert_confirmed(ev.id.0);
+                    true
                 } else {
                     // No candidate matches this event's author: discard the preemptive entry.
                     ts.remove(&ev.id.0);
+                    false
                 }
+            } else {
+                false
             }
-        }
+        };
 
         // Register this event ID for future dedup checks.
         {
@@ -1284,7 +1311,7 @@ impl Store {
         self.dtags.publish_len(w.dtags.offset);
 
         // NIP-45: update counters, compensating for replaceable/addressable replacement.
-        if !replaced_existing {
+        if !replaced_existing && !immediately_tombstoned {
             self.increment_live_event_count(ev.kind, ev.pubkey.0);
         }
 
@@ -2967,6 +2994,23 @@ mod tests {
     }
 
     #[test]
+    fn test_count_skips_immediately_tombstoned_preemptive_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let target = make_event(1, 1, 1000, vec![]);
+        let deletion = make_kind5_event(1, &target.id.0);
+        store.append(&deletion).unwrap();
+        store.append(&target).unwrap();
+
+        let filter = Filter {
+            kinds: vec![1],
+            ..empty_filter()
+        };
+        assert_eq!(store.count(&filter), 0);
+    }
+
+    #[test]
     fn test_count_decrements_for_vanish() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -2979,6 +3023,12 @@ mod tests {
         store.append(&vanish).unwrap();
         store.vanish(&vanish).unwrap();
 
+        let kind_filter = Filter {
+            kinds: vec![crate::nostr::KIND_VANISH],
+            ..empty_filter()
+        };
+        assert_eq!(store.count(&kind_filter), 1);
+
         let author_filter = Filter {
             authors: vec![crate::nostr::HexPrefix {
                 bytes: vanish.pubkey.0,
@@ -2986,7 +3036,7 @@ mod tests {
             }],
             ..empty_filter()
         };
-        assert_eq!(store.count(&author_filter), 1);
+        assert_eq!(store.count(&author_filter), 0);
     }
 
     // Boot rebuild (Task 11) tests
