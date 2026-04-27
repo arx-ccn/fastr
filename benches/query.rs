@@ -125,9 +125,9 @@ fn build_fixture(n: usize) -> Fixture {
 
 fn kind_filter(kinds: &[u16]) -> Filter {
     Filter {
-        ids: vec![],
-        authors: vec![],
-        kinds: kinds.to_vec(),
+        ids: None,
+        authors: None,
+        kinds: Some(kinds.to_vec()),
         since: None,
         until: None,
         limit: Some(500),
@@ -137,9 +137,9 @@ fn kind_filter(kinds: &[u16]) -> Filter {
 
 fn author_filter(pk: &[u8; 32]) -> Filter {
     Filter {
-        ids: vec![],
-        authors: vec![HexPrefix { bytes: *pk, len: 32 }],
-        kinds: vec![],
+        ids: None,
+        authors: Some(vec![HexPrefix { bytes: *pk, len: 32 }]),
+        kinds: None,
         since: None,
         until: None,
         limit: Some(500),
@@ -152,9 +152,9 @@ fn tag_e_filter(ref_id: &[u8; 32]) -> Filter {
     let mut tags = std::collections::HashMap::new();
     tags.insert('e', vec![ref_hex]);
     Filter {
-        ids: vec![],
-        authors: vec![],
-        kinds: vec![],
+        ids: None,
+        authors: None,
+        kinds: None,
         since: None,
         until: None,
         limit: Some(500),
@@ -164,9 +164,9 @@ fn tag_e_filter(ref_id: &[u8; 32]) -> Filter {
 
 fn empty_filter() -> Filter {
     Filter {
-        ids: vec![],
-        authors: vec![],
-        kinds: vec![],
+        ids: None,
+        authors: None,
+        kinds: None,
         since: None,
         until: None,
         limit: None,

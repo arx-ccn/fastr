@@ -812,22 +812,34 @@ impl Store {
     }
 
     fn count_authors(&self, filter: &Filter, auth_pubkeys: &[[u8; 32]]) -> u64 {
+        // Empty array on any of ids/authors/kinds is impossible per NIP-01.
+        if matches!(&filter.ids, Some(v) if v.is_empty())
+            || matches!(&filter.authors, Some(v) if v.is_empty())
+            || matches!(&filter.kinds, Some(v) if v.is_empty())
+        {
+            return 0;
+        }
+
         let has_tags = !filter.tags.is_empty();
         let has_time = filter.since.is_some() || filter.until.is_some();
-        let has_ids = !filter.ids.is_empty();
-        let needs_nip17_filtering = filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP);
+        let has_ids = filter.ids.is_some();
+        let needs_nip17_filtering = filter
+            .kinds
+            .as_ref()
+            .is_none_or(|k| k.contains(&crate::nostr::KIND_GIFT_WRAP));
 
         if has_tags || has_time || has_ids || needs_nip17_filtering {
             return self.scan_count(std::slice::from_ref(filter), auth_pubkeys);
         }
 
-        let has_kinds = !filter.kinds.is_empty();
-        let has_authors = !filter.authors.is_empty();
+        let has_kinds = filter.kinds.is_some();
+        let has_authors = filter.authors.is_some();
 
         match (has_kinds, has_authors) {
             (true, false) => {
                 let Ok(counts) = self.kind_counts.read() else { return 0 };
-                filter.kinds.iter().map(|k| counts.get(k).copied().unwrap_or(0)).sum()
+                let kinds = filter.kinds.as_deref().unwrap_or(&[]);
+                kinds.iter().map(|k| counts.get(k).copied().unwrap_or(0)).sum()
             }
             (false, true) => {
                 let Ok(counts) = self.author_counts.read() else {
@@ -837,7 +849,8 @@ impl Store {
                 // once per unique key. This prevents double-counting when filter
                 // prefixes overlap (e.g. ["ab", "abcd"] both match "abcd...").
                 let mut matching_keys: HashSet<[u8; 32]> = HashSet::new();
-                for a in &filter.authors {
+                let authors = filter.authors.as_deref().unwrap_or(&[]);
+                for a in authors {
                     if a.len == 32 {
                         // Exact pubkey - O(1) check.
                         if counts.contains_key(&a.bytes) {
@@ -877,9 +890,11 @@ impl Store {
             Err(_) => return 0,
         };
 
-        let needs_nip17_filtering = filters
-            .iter()
-            .any(|f| f.kinds.is_empty() || f.kinds.contains(&crate::nostr::KIND_GIFT_WRAP));
+        let needs_nip17_filtering = filters.iter().any(|f| {
+            f.kinds
+                .as_ref()
+                .is_none_or(|k| k.contains(&crate::nostr::KIND_GIFT_WRAP))
+        });
         let nip17_allowed: Option<HashSet<u64>> = if !needs_nip17_filtering {
             Some(HashSet::new())
         } else if auth_pubkeys.is_empty() {
@@ -1352,7 +1367,7 @@ impl Store {
     /// use fastr::db::Store;
     /// use fastr::nostr::Filter;
     /// let store = Store::open(Path::new("/tmp/store"))?;
-    /// let filter = Filter { kinds: vec![], authors: vec![], ids: vec![], since: None, until: None, limit: None, tags: std::collections::HashMap::new() };
+    /// let filter = Filter { kinds: None, authors: None, ids: None, since: None, until: None, limit: None, tags: std::collections::HashMap::new() };
     /// store.query_authed(&filter, &[], |ev_bytes| {
     ///     println!("event {} bytes", ev_bytes.len());
     ///     Ok(())
@@ -1375,7 +1390,11 @@ impl Store {
         // Only scan tags.s when the filter could actually match kind-1059 events.
         let nip17_allowed: Option<HashSet<u64>> = if auth_pubkeys.is_empty() {
             None
-        } else if filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP) {
+        } else if filter
+            .kinds
+            .as_ref()
+            .is_none_or(|k| k.contains(&crate::nostr::KIND_GIFT_WRAP))
+        {
             let mut set = HashSet::new();
             for pk in auth_pubkeys {
                 set.extend(tags::matching_offsets(&tags_slice, b'p', pk));
@@ -1503,7 +1522,11 @@ impl Store {
         // NIP-17: pre-compute set of data_offsets where a p-tag matches any auth pubkey.
         let nip17_allowed: Option<HashSet<u64>> = if auth_pubkeys.is_empty() {
             None
-        } else if filter.kinds.is_empty() || filter.kinds.contains(&crate::nostr::KIND_GIFT_WRAP) {
+        } else if filter
+            .kinds
+            .as_ref()
+            .is_none_or(|k| k.contains(&crate::nostr::KIND_GIFT_WRAP))
+        {
             let mut set = HashSet::new();
             for pk in auth_pubkeys {
                 set.extend(tags::matching_offsets(&tags_slice, b'p', pk));
@@ -2076,7 +2099,7 @@ mod tests {
             store.append(&make_event(i as u8 + 1, kind, i as i64, vec![])).unwrap();
         }
         let f = Filter {
-            kinds: vec![1],
+            kinds: Some(vec![1]),
             ..empty_filter()
         };
         let mut count = 0;
@@ -2364,7 +2387,7 @@ mod tests {
         store.append(&k5).unwrap();
 
         let f = Filter {
-            kinds: vec![5],
+            kinds: Some(vec![5]),
             ..empty_filter()
         };
         let mut count = 0;
@@ -2684,7 +2707,7 @@ mod tests {
         store
             .query(
                 &Filter {
-                    kinds: vec![0],
+                    kinds: Some(vec![0]),
                     ..empty_filter()
                 },
                 |bytes| {
@@ -2726,7 +2749,7 @@ mod tests {
         store
             .query(
                 &Filter {
-                    kinds: vec![0],
+                    kinds: Some(vec![0]),
                     ..empty_filter()
                 },
                 |bytes| {
@@ -2789,7 +2812,7 @@ mod tests {
         store
             .query(
                 &Filter {
-                    kinds: vec![30001],
+                    kinds: Some(vec![30001]),
                     ..empty_filter()
                 },
                 |bytes| {
@@ -2832,7 +2855,7 @@ mod tests {
         store
             .query(
                 &Filter {
-                    kinds: vec![30001],
+                    kinds: Some(vec![30001]),
                     ..empty_filter()
                 },
                 |bytes| {
@@ -2884,19 +2907,19 @@ mod tests {
         store.append(&make_event(1, 7, 3000, vec![])).unwrap();
 
         let filter = Filter {
-            kinds: vec![1],
+            kinds: Some(vec![1]),
             ..empty_filter()
         };
         assert_eq!(store.count(&filter), 2);
 
         let filter = Filter {
-            kinds: vec![7],
+            kinds: Some(vec![7]),
             ..empty_filter()
         };
         assert_eq!(store.count(&filter), 1);
 
         let filter = Filter {
-            kinds: vec![1, 7],
+            kinds: Some(vec![1, 7]),
             ..empty_filter()
         };
         assert_eq!(store.count(&filter), 3);
@@ -2953,8 +2976,8 @@ mod tests {
         store.append(&make_event(2, 1, 3000, vec![])).unwrap();
 
         let filter = Filter {
-            kinds: vec![1],
-            authors: vec![author_prefix],
+            kinds: Some(vec![1]),
+            authors: Some(vec![author_prefix]),
             ..empty_filter()
         };
 
@@ -2970,7 +2993,7 @@ mod tests {
         store.append(&make_event(1, 0, 2000, vec![])).unwrap();
 
         let filter = Filter {
-            kinds: vec![0],
+            kinds: Some(vec![0]),
             ..empty_filter()
         };
         assert_eq!(store.count(&filter), 1);
@@ -2986,7 +3009,7 @@ mod tests {
         store.append(&make_kind5_event(1, &target.id.0)).unwrap();
 
         let filter = Filter {
-            kinds: vec![1],
+            kinds: Some(vec![1]),
             ..empty_filter()
         };
         assert_eq!(store.count(&filter), 0);
@@ -3003,7 +3026,7 @@ mod tests {
         store.append(&target).unwrap();
 
         let filter = Filter {
-            kinds: vec![1],
+            kinds: Some(vec![1]),
             ..empty_filter()
         };
         assert_eq!(store.count(&filter), 0);
@@ -3023,16 +3046,16 @@ mod tests {
         store.vanish(&vanish).unwrap();
 
         let kind_filter = Filter {
-            kinds: vec![crate::nostr::KIND_VANISH],
+            kinds: Some(vec![crate::nostr::KIND_VANISH]),
             ..empty_filter()
         };
         assert_eq!(store.count(&kind_filter), 1);
 
         let author_filter = Filter {
-            authors: vec![crate::nostr::HexPrefix {
+            authors: Some(vec![crate::nostr::HexPrefix {
                 bytes: vanish.pubkey.0,
                 len: 32,
-            }],
+            }]),
             ..empty_filter()
         };
         assert_eq!(store.count(&author_filter), 0);
@@ -3112,7 +3135,7 @@ mod tests {
         {
             let store = Store::open(dir.path()).unwrap();
             let filter = Filter {
-                kinds: vec![1],
+                kinds: Some(vec![1]),
                 ..empty_filter()
             };
             assert_eq!(store.count(&filter), 3);
@@ -3134,7 +3157,7 @@ mod tests {
             let store = Store::open(dir.path()).unwrap();
             // kind-1 was tombstoned, so count should be 0 for kind 1
             let filter = Filter {
-                kinds: vec![1],
+                kinds: Some(vec![1]),
                 ..empty_filter()
             };
             assert_eq!(store.count(&filter), 0);
@@ -3152,7 +3175,7 @@ mod tests {
             let store = Store::open(dir.path()).unwrap();
             assert_eq!(store.event_count(), 0);
             let filter = Filter {
-                kinds: vec![1],
+                kinds: Some(vec![1]),
                 ..empty_filter()
             };
             assert_eq!(store.count(&filter), 0);
@@ -3302,7 +3325,7 @@ mod tests {
         store.compact().unwrap();
 
         let filter = Filter {
-            kinds: vec![1],
+            kinds: Some(vec![1]),
             ..empty_filter()
         };
         assert_eq!(store.count(&filter), 2, "count should reflect compacted state");
@@ -3339,7 +3362,7 @@ mod tests {
         store
             .query(
                 &Filter {
-                    kinds: vec![30001],
+                    kinds: Some(vec![30001]),
                     ..empty_filter()
                 },
                 |bytes| {

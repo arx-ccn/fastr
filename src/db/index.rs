@@ -103,31 +103,43 @@ pub fn matches(entry: &IndexEntry, filter: &Filter) -> bool {
             return false;
         }
     }
-    if !filter.kinds.is_empty() {
-        if filter.kinds.len() == 1 {
-            if entry.kind != filter.kinds[0] {
+    match &filter.kinds {
+        None => {}
+        Some(kinds) if kinds.is_empty() => return false,
+        Some(kinds) => {
+            if kinds.len() == 1 {
+                if entry.kind != kinds[0] {
+                    return false;
+                }
+            } else if !kinds.contains(&entry.kind) {
                 return false;
             }
-        } else if !filter.kinds.contains(&entry.kind) {
-            return false;
         }
     }
-    if !filter.authors.is_empty() {
-        if filter.authors.len() == 1 {
-            if !filter.authors[0].matches(&entry.pubkey) {
+    match &filter.authors {
+        None => {}
+        Some(authors) if authors.is_empty() => return false,
+        Some(authors) => {
+            if authors.len() == 1 {
+                if !authors[0].matches(&entry.pubkey) {
+                    return false;
+                }
+            } else if !authors.iter().any(|pk| pk.matches(&entry.pubkey)) {
                 return false;
             }
-        } else if !filter.authors.iter().any(|pk| pk.matches(&entry.pubkey)) {
-            return false;
         }
     }
-    if !filter.ids.is_empty() {
-        if filter.ids.len() == 1 {
-            if !filter.ids[0].matches(&entry.id) {
+    match &filter.ids {
+        None => {}
+        Some(ids) if ids.is_empty() => return false,
+        Some(ids) => {
+            if ids.len() == 1 {
+                if !ids[0].matches(&entry.id) {
+                    return false;
+                }
+            } else if !ids.iter().any(|id| id.matches(&entry.id)) {
                 return false;
             }
-        } else if !filter.ids.iter().any(|id| id.matches(&entry.id)) {
-            return false;
         }
     }
     true
@@ -177,9 +189,9 @@ mod tests {
     fn test_matches_kinds() {
         let e = entry(1, 0, [0u8; 32], [0u8; 32]);
         let mut f = empty_filter();
-        f.kinds = vec![1];
+        f.kinds = Some(vec![1]);
         assert!(matches(&e, &f));
-        f.kinds = vec![2];
+        f.kinds = Some(vec![2]);
         assert!(!matches(&e, &f));
     }
 
@@ -203,12 +215,12 @@ mod tests {
         let pk = [0xAA; 32];
         let e = entry(1, 0, [0u8; 32], pk);
         let mut f = empty_filter();
-        f.authors = vec![HexPrefix { bytes: pk, len: 32 }];
+        f.authors = Some(vec![HexPrefix { bytes: pk, len: 32 }]);
         assert!(matches(&e, &f));
-        f.authors = vec![HexPrefix {
+        f.authors = Some(vec![HexPrefix {
             bytes: [0xBB; 32],
             len: 32,
-        }];
+        }]);
         assert!(!matches(&e, &f));
     }
 
@@ -217,12 +229,12 @@ mod tests {
         let id = [0x11; 32];
         let e = entry(1, 0, id, [0u8; 32]);
         let mut f = empty_filter();
-        f.ids = vec![HexPrefix { bytes: id, len: 32 }];
+        f.ids = Some(vec![HexPrefix { bytes: id, len: 32 }]);
         assert!(matches(&e, &f));
-        f.ids = vec![HexPrefix {
+        f.ids = Some(vec![HexPrefix {
             bytes: [0x22; 32],
             len: 32,
-        }];
+        }]);
         assert!(!matches(&e, &f));
     }
 
@@ -234,17 +246,17 @@ mod tests {
         // 1-byte prefix 0xab should match
         let mut prefix_bytes = [0u8; 32];
         prefix_bytes[0] = 0xab;
-        f.ids = vec![HexPrefix {
+        f.ids = Some(vec![HexPrefix {
             bytes: prefix_bytes,
             len: 1,
-        }];
+        }]);
         assert!(matches(&e, &f));
         // 1-byte prefix 0xac should not match
         prefix_bytes[0] = 0xac;
-        f.ids = vec![HexPrefix {
+        f.ids = Some(vec![HexPrefix {
             bytes: prefix_bytes,
             len: 1,
-        }];
+        }]);
         assert!(!matches(&e, &f));
     }
 
@@ -257,17 +269,50 @@ mod tests {
         let mut prefix_bytes = [0u8; 32];
         prefix_bytes[0] = 0xcd;
         prefix_bytes[1] = 0xcd;
-        f.authors = vec![HexPrefix {
+        f.authors = Some(vec![HexPrefix {
             bytes: prefix_bytes,
             len: 2,
-        }];
+        }]);
         assert!(matches(&e, &f));
         // Wrong second byte
         prefix_bytes[1] = 0xce;
-        f.authors = vec![HexPrefix {
+        f.authors = Some(vec![HexPrefix {
             bytes: prefix_bytes,
             len: 2,
-        }];
+        }]);
         assert!(!matches(&e, &f));
+    }
+
+    // NIP-01: empty arrays in a filter mean "impossible" — match nothing.
+    #[test]
+    fn test_matches_empty_ids_matches_nothing() {
+        let e = entry(1, 0, [0xAA; 32], [0xBB; 32]);
+        let mut f = empty_filter();
+        f.ids = Some(vec![]);
+        assert!(!matches(&e, &f));
+    }
+
+    #[test]
+    fn test_matches_empty_authors_matches_nothing() {
+        let e = entry(1, 0, [0xAA; 32], [0xBB; 32]);
+        let mut f = empty_filter();
+        f.authors = Some(vec![]);
+        assert!(!matches(&e, &f));
+    }
+
+    #[test]
+    fn test_matches_empty_kinds_matches_nothing() {
+        let e = entry(1, 0, [0xAA; 32], [0xBB; 32]);
+        let mut f = empty_filter();
+        f.kinds = Some(vec![]);
+        assert!(!matches(&e, &f));
+    }
+
+    #[test]
+    fn test_matches_none_imposes_no_constraint() {
+        let e = entry(42, 0, [0xAA; 32], [0xBB; 32]);
+        let f = empty_filter();
+        // Default filter has all fields as None; entry should match.
+        assert!(matches(&e, &f));
     }
 }

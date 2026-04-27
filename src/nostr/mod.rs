@@ -101,9 +101,11 @@ impl HexPrefix {
 
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
-    pub ids: Vec<HexPrefix>,
-    pub authors: Vec<HexPrefix>,
-    pub kinds: Vec<u16>,
+    /// `None` means the field was absent (no constraint); `Some(vec![])`
+    /// means the field was present-but-empty (impossible to satisfy per NIP-01).
+    pub ids: Option<Vec<HexPrefix>>,
+    pub authors: Option<Vec<HexPrefix>>,
+    pub kinds: Option<Vec<u16>>,
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub limit: Option<usize>,
@@ -393,9 +395,9 @@ fn parse_event_obj(obj: &serde_json::Map<String, Value>) -> Result<Event, String
 fn parse_filter(val: &Value, max_values: usize) -> Result<Filter, String> {
     let obj = val.as_object().ok_or("invalid: filter not an object")?;
 
-    let mut ids: Vec<HexPrefix> = Vec::new();
-    let mut authors: Vec<HexPrefix> = Vec::new();
-    let mut kinds: Vec<u16> = Vec::new();
+    let mut ids: Option<Vec<HexPrefix>> = None;
+    let mut authors: Option<Vec<HexPrefix>> = None;
+    let mut kinds: Option<Vec<u16>> = None;
     let mut since: Option<i64> = None;
     let mut until: Option<i64> = None;
     let mut limit: Option<usize> = None;
@@ -408,30 +410,36 @@ fn parse_filter(val: &Value, max_values: usize) -> Result<Filter, String> {
                 if arr.len() > max_values {
                     return Err("invalid: too many values in ids".to_owned());
                 }
-                for v in arr {
-                    let s = v.as_str().ok_or("invalid: id in ids not a string")?;
-                    ids.push(decode_hex_prefix(s, "ids entry")?);
+                let mut v = Vec::with_capacity(arr.len());
+                for entry in arr {
+                    let s = entry.as_str().ok_or("invalid: id in ids not a string")?;
+                    v.push(decode_hex_prefix(s, "ids entry")?);
                 }
+                ids = Some(v);
             }
             "authors" => {
                 let arr = value.as_array().ok_or("invalid: authors not an array")?;
                 if arr.len() > max_values {
                     return Err("invalid: too many values in authors".to_owned());
                 }
-                for v in arr {
-                    let s = v.as_str().ok_or("invalid: pubkey in authors not a string")?;
-                    authors.push(decode_hex_prefix(s, "authors entry")?);
+                let mut v = Vec::with_capacity(arr.len());
+                for entry in arr {
+                    let s = entry.as_str().ok_or("invalid: pubkey in authors not a string")?;
+                    v.push(decode_hex_prefix(s, "authors entry")?);
                 }
+                authors = Some(v);
             }
             "kinds" => {
                 let arr = value.as_array().ok_or("invalid: kinds not an array")?;
                 if arr.len() > max_values {
                     return Err("invalid: too many values in kinds".to_owned());
                 }
-                for v in arr {
-                    let k = v.as_u64().ok_or("invalid: kind not a non-negative integer")?;
-                    kinds.push(u16::try_from(k).map_err(|_| "invalid: kind out of range for u16")?);
+                let mut v = Vec::with_capacity(arr.len());
+                for entry in arr {
+                    let k = entry.as_u64().ok_or("invalid: kind not a non-negative integer")?;
+                    v.push(u16::try_from(k).map_err(|_| "invalid: kind out of range for u16")?);
                 }
+                kinds = Some(v);
             }
             "since" => {
                 since = Some(value.as_i64().ok_or("invalid: since not an integer")?);
@@ -802,14 +810,32 @@ pub fn filter_matches(filters: &[Filter], ev: &Event) -> bool {
 }
 
 pub(crate) fn single_filter_matches(f: &Filter, ev: &Event) -> bool {
-    if !f.ids.is_empty() && !f.ids.iter().any(|id| id.matches(&ev.id.0)) {
-        return false;
+    match &f.ids {
+        None => {}
+        Some(ids) if ids.is_empty() => return false,
+        Some(ids) => {
+            if !ids.iter().any(|id| id.matches(&ev.id.0)) {
+                return false;
+            }
+        }
     }
-    if !f.authors.is_empty() && !f.authors.iter().any(|pk| pk.matches(&ev.pubkey.0)) {
-        return false;
+    match &f.authors {
+        None => {}
+        Some(authors) if authors.is_empty() => return false,
+        Some(authors) => {
+            if !authors.iter().any(|pk| pk.matches(&ev.pubkey.0)) {
+                return false;
+            }
+        }
     }
-    if !f.kinds.is_empty() && !f.kinds.contains(&ev.kind) {
-        return false;
+    match &f.kinds {
+        None => {}
+        Some(kinds) if kinds.is_empty() => return false,
+        Some(kinds) => {
+            if !kinds.contains(&ev.kind) {
+                return false;
+            }
+        }
     }
     if let Some(since) = f.since {
         if ev.created_at < since {
@@ -914,7 +940,7 @@ mod tests {
             ClientMsg::Req { sub_id, filters } => {
                 assert_eq!(sub_id, "sub1");
                 assert_eq!(filters.len(), 1);
-                assert_eq!(filters[0].kinds, vec![1u16]);
+                assert_eq!(filters[0].kinds, Some(vec![1u16]));
             }
             _ => panic!("expected Req"),
         }
@@ -1308,7 +1334,7 @@ mod tests {
             ClientMsg::Count { sub_id, filters } => {
                 assert_eq!(sub_id, "sub1");
                 assert_eq!(filters.len(), 1);
-                assert_eq!(filters[0].kinds, vec![1]);
+                assert_eq!(filters[0].kinds, Some(vec![1u16]));
             }
             other => panic!("expected Count, got {:?}", other),
         }
@@ -1364,10 +1390,11 @@ mod tests {
         let msg = r#"["REQ","s1",{"ids":["aabb"]}]"#;
         match parse_client_msg(msg, 256).unwrap() {
             ClientMsg::Req { filters, .. } => {
-                assert_eq!(filters[0].ids.len(), 1);
-                assert_eq!(filters[0].ids[0].len, 2);
-                assert_eq!(filters[0].ids[0].bytes[0], 0xaa);
-                assert_eq!(filters[0].ids[0].bytes[1], 0xbb);
+                let ids = filters[0].ids.as_ref().expect("ids should be Some");
+                assert_eq!(ids.len(), 1);
+                assert_eq!(ids[0].len, 2);
+                assert_eq!(ids[0].bytes[0], 0xaa);
+                assert_eq!(ids[0].bytes[1], 0xbb);
             }
             other => panic!("expected Req, got {:?}", other),
         }
@@ -1379,8 +1406,9 @@ mod tests {
         let msg = format!(r#"["REQ","s1",{{"ids":["{}"]}}]"#, hex64);
         match parse_client_msg(&msg, 256).unwrap() {
             ClientMsg::Req { filters, .. } => {
-                assert_eq!(filters[0].ids[0].len, 32);
-                assert_eq!(filters[0].ids[0].bytes, [0xaa; 32]);
+                let ids = filters[0].ids.as_ref().expect("ids should be Some");
+                assert_eq!(ids[0].len, 32);
+                assert_eq!(ids[0].bytes, [0xaa; 32]);
             }
             other => panic!("expected Req, got {:?}", other),
         }
@@ -1391,9 +1419,10 @@ mod tests {
         let msg = r#"["REQ","s1",{"authors":["ab"]}]"#;
         match parse_client_msg(msg, 256).unwrap() {
             ClientMsg::Req { filters, .. } => {
-                assert_eq!(filters[0].authors.len(), 1);
-                assert_eq!(filters[0].authors[0].len, 1);
-                assert_eq!(filters[0].authors[0].bytes[0], 0xab);
+                let authors = filters[0].authors.as_ref().expect("authors should be Some");
+                assert_eq!(authors.len(), 1);
+                assert_eq!(authors[0].len, 1);
+                assert_eq!(authors[0].bytes[0], 0xab);
             }
             other => panic!("expected Req, got {:?}", other),
         }
@@ -1512,7 +1541,7 @@ mod tests {
         };
 
         let f = Filter {
-            ids: vec![prefix],
+            ids: Some(vec![prefix]),
             ..Filter::default()
         };
         assert!(filter_matches(&[f], &ev));
@@ -1529,7 +1558,7 @@ mod tests {
         };
 
         let f = Filter {
-            authors: vec![prefix],
+            authors: Some(vec![prefix]),
             ..Filter::default()
         };
         assert!(filter_matches(&[f], &ev));
@@ -1547,7 +1576,98 @@ mod tests {
         };
 
         let f = Filter {
-            ids: vec![prefix],
+            ids: Some(vec![prefix]),
+            ..Filter::default()
+        };
+        assert!(!filter_matches(&[f], &ev));
+    }
+
+    // NIP-01: a filter with an empty `ids`/`authors`/`kinds` array means
+    // "match nothing" — distinct from the field being absent (no constraint).
+    // Issue #84.
+    #[test]
+    fn test_parse_filter_present_empty_vs_absent() {
+        // Present but empty → Some(vec![]).
+        let msg = r#"["REQ","s",{"ids":[]}]"#;
+        match parse_client_msg(msg, 256).unwrap() {
+            ClientMsg::Req { filters, .. } => {
+                assert_eq!(filters[0].ids.as_deref(), Some(&[][..]));
+                assert!(filters[0].authors.is_none());
+                assert!(filters[0].kinds.is_none());
+            }
+            other => panic!("expected Req, got {:?}", other),
+        }
+
+        // Absent → None.
+        let msg = r#"["REQ","s",{}]"#;
+        match parse_client_msg(msg, 256).unwrap() {
+            ClientMsg::Req { filters, .. } => {
+                assert!(filters[0].ids.is_none());
+                assert!(filters[0].authors.is_none());
+                assert!(filters[0].kinds.is_none());
+            }
+            other => panic!("expected Req, got {:?}", other),
+        }
+
+        // Mixed — empty `ids`, populated `authors`.
+        let hex64 = "ab".repeat(32);
+        let msg = format!(r#"["REQ","s",{{"ids":[],"authors":["{}"]}}]"#, hex64);
+        match parse_client_msg(&msg, 256).unwrap() {
+            ClientMsg::Req { filters, .. } => {
+                assert_eq!(filters[0].ids.as_deref(), Some(&[][..]));
+                assert_eq!(filters[0].authors.as_ref().map(|v| v.len()), Some(1));
+            }
+            other => panic!("expected Req, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_live_filter_empty_ids_matches_nothing() {
+        let ev = make_golden_event();
+        let f = Filter {
+            ids: Some(vec![]),
+            ..Filter::default()
+        };
+        assert!(!filter_matches(&[f], &ev));
+    }
+
+    #[test]
+    fn test_live_filter_empty_authors_matches_nothing() {
+        let ev = make_golden_event();
+        let f = Filter {
+            authors: Some(vec![]),
+            ..Filter::default()
+        };
+        assert!(!filter_matches(&[f], &ev));
+    }
+
+    #[test]
+    fn test_live_filter_empty_kinds_matches_nothing() {
+        let ev = make_golden_event();
+        let f = Filter {
+            kinds: Some(vec![]),
+            ..Filter::default()
+        };
+        assert!(!filter_matches(&[f], &ev));
+    }
+
+    #[test]
+    fn test_live_filter_none_imposes_no_constraint() {
+        let ev = make_golden_event();
+        let f = Filter::default();
+        assert!(filter_matches(&[f], &ev));
+    }
+
+    #[test]
+    fn test_live_filter_empty_field_overrides_other_matches() {
+        // Even when `authors` matches, an empty `ids` means impossible.
+        let ev = make_golden_event();
+        let f = Filter {
+            ids: Some(vec![]),
+            authors: Some(vec![HexPrefix {
+                bytes: ev.pubkey.0,
+                len: 32,
+            }]),
             ..Filter::default()
         };
         assert!(!filter_matches(&[f], &ev));

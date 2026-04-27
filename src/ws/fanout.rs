@@ -131,9 +131,9 @@ mod tests {
 
     fn kind_filter(kind: u16) -> Filter {
         Filter {
-            ids: vec![],
-            authors: vec![],
-            kinds: vec![kind],
+            ids: None,
+            authors: None,
+            kinds: Some(vec![kind]),
             since: None,
             until: None,
             limit: None,
@@ -143,9 +143,9 @@ mod tests {
 
     fn any_filter() -> Filter {
         Filter {
-            ids: vec![],
-            authors: vec![],
-            kinds: vec![],
+            ids: None,
+            authors: None,
+            kinds: None,
             since: None,
             until: None,
             limit: None,
