@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -194,6 +195,28 @@ pub enum ServerMsg<'a> {
 fn secp() -> &'static Secp256k1<secp256k1::VerifyOnly> {
     static CTX: OnceLock<Secp256k1<secp256k1::VerifyOnly>> = OnceLock::new();
     CTX.get_or_init(Secp256k1::verification_only)
+}
+
+// Per-thread cache of parsed XOnlyPublicKey: avoids redundant on-curve sqrt
+// when the same author signs many events back-to-back on the same worker.
+thread_local! {
+    static PUBKEY_CACHE: RefCell<HashMap<[u8; 32], XOnlyPublicKey>> =
+        RefCell::new(HashMap::with_capacity(1024));
+}
+
+fn parse_pubkey_cached(bytes: &[u8; 32]) -> Result<XOnlyPublicKey, secp256k1::Error> {
+    PUBKEY_CACHE.with(|c| {
+        if let Some(pk) = c.borrow().get(bytes).copied() {
+            return Ok(pk);
+        }
+        let pk = XOnlyPublicKey::from_byte_array(*bytes)?;
+        let mut cache = c.borrow_mut();
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        cache.insert(*bytes, pk);
+        Ok(pk)
+    })
 }
 
 // --- Helpers ---
@@ -652,7 +675,7 @@ pub fn validate_event(ev: &Event) -> Result<(), String> {
     }
 
     // Step 4: schnorr signature
-    let pubkey = XOnlyPublicKey::from_byte_array(ev.pubkey.0).map_err(|_| "invalid: bad signature".to_owned())?;
+    let pubkey = parse_pubkey_cached(&ev.pubkey.0).map_err(|_| "invalid: bad signature".to_owned())?;
     let sig = Signature::from_byte_array(ev.sig.0);
     secp()
         .verify_schnorr(&sig, &ev.id.0, &pubkey)
