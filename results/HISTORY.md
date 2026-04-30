@@ -321,3 +321,34 @@ Commit: `cc38930` | Date: 2026-04-27T21:27:26Z
 | transcode_vs_deser/transcode/10000 | 401.97 us |
 | transcode_vs_deser/transcode/100000 | 4.22 ms |
 | validate_event | 44.41 us |
+## Benchmark Results
+
+Commit: `e23f952` | Date: 2026-04-30T13:37:17Z
+
+| Benchmark | Median |
+|-----------|--------|
+| count_by_kind/10000 | 23.3 ns |
+| count_by_kind/100000 | 23.3 ns |
+| count_by_tag_e/10000 | 1.12 ms |
+| count_by_tag_e/100000 | 11.44 ms |
+| count_empty_filter/10000 | 1.12 ms |
+| count_empty_filter/100000 | 11.40 ms |
+| count_filter_union/10000 | 1.12 ms |
+| count_filter_union/100000 | 11.46 ms |
+| deserialize_trusted | 271.7 ns |
+| hex_decode_64 | 33.0 ns |
+| hex_encode_32 | 24.6 ns |
+| parse_client_msg | 1.48 us |
+| query_by_author/10000 | 345.52 us |
+| query_by_author/100000 | 357.21 us |
+| query_by_kind/10000 | 414.12 us |
+| query_by_kind/100000 | 4.41 ms |
+| query_by_tag_e/10000 | 439.69 us |
+| query_by_tag_e/100000 | 950.47 us |
+| serialize | 192.9 ns |
+| serialize_fast | 91.2 ns |
+| transcode_vs_deser/deser+json/10000 | 408.72 us |
+| transcode_vs_deser/deser+json/100000 | 4.46 ms |
+| transcode_vs_deser/transcode/10000 | 413.89 us |
+| transcode_vs_deser/transcode/100000 | 4.45 ms |
+| validate_event | 44.25 us |
