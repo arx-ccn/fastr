@@ -948,7 +948,7 @@ impl Store {
     /// NIP-62: Vanish a pubkey - tombstone all their events, ban future events.
     /// The kind-62 event itself should already be stored via append() before calling this.
     pub fn vanish(&self, ev: &Event) -> Result<(), Error> {
-        use crate::nostr::KIND_VANISH;
+        use crate::nostr::{KIND_GIFT_WRAP, KIND_VANISH};
 
         // 1. Add to in-memory set
         {
@@ -966,8 +966,11 @@ impl Store {
                 .map_err(|_| std::io::Error::other("vanish file lock poisoned"))?;
             vanish::append(&mut f, &ev.pubkey.0)?;
         }
-        // 3. Tombstone all events from this pubkey (except kind-62)
+        // 3. Tombstone all events from this pubkey (except kind-62), plus all
+        //    kind-1059 gift wraps p-tagged to this pubkey (per NIP-62 SHOULD).
         let idx = self.index.slice();
+        let tags_slice = self.tags.slice();
+        let giftwrap_offsets = tags::matching_offsets(&tags_slice, b'p', &ev.pubkey.0);
         let mut tombstoned = Vec::new();
         let mut ts = self
             .tombstones
@@ -976,6 +979,11 @@ impl Store {
         for (_, entry) in index::iter_entries(&idx) {
             // Skip kind-62 events - they must remain queryable per NIP-62 spec
             if entry.pubkey == ev.pubkey.0 && entry.kind != KIND_VANISH {
+                ts.insert_confirmed(entry.id);
+                tombstoned.push((entry.kind, entry.pubkey));
+                continue;
+            }
+            if entry.kind == KIND_GIFT_WRAP && giftwrap_offsets.contains(&entry.offset) {
                 ts.insert_confirmed(entry.id);
                 tombstoned.push((entry.kind, entry.pubkey));
             }
@@ -3060,6 +3068,52 @@ mod tests {
             ..empty_filter()
         };
         assert_eq!(store.count(&author_filter), 0);
+    }
+
+    #[test]
+    fn test_vanish_tombstones_gift_wraps_p_tagged_to_pubkey() {
+        // NIP-62: relays SHOULD delete kind-1059 gift wraps p-tagged to the
+        // vanishing pubkey when the vanish targets this relay.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // Author A is the vanish target.
+        let vanish = make_event(1, crate::nostr::KIND_VANISH, 3000, vec![]);
+        let a_pk_hex = crate::nostr::hex_encode_bytes(&vanish.pubkey.0);
+
+        // Author B sends a gift wrap p-tagged to A.
+        let gw_to_a = make_event(
+            2,
+            crate::nostr::KIND_GIFT_WRAP,
+            1000,
+            vec![Tag {
+                fields: vec!["p".to_owned(), a_pk_hex],
+            }],
+        );
+        // Author B sends an unrelated gift wrap (p-tagged to author C) — must NOT be tombstoned.
+        let other_pk_hex = crate::nostr::hex_encode_bytes(&[0x42u8; 32]);
+        let gw_to_other = make_event(
+            2,
+            crate::nostr::KIND_GIFT_WRAP,
+            1100,
+            vec![Tag {
+                fields: vec!["p".to_owned(), other_pk_hex],
+            }],
+        );
+
+        store.append(&gw_to_a).unwrap();
+        store.append(&gw_to_other).unwrap();
+        store.append(&vanish).unwrap();
+        store.vanish(&vanish).unwrap();
+
+        assert!(
+            store.is_tombstoned(&gw_to_a.id.0),
+            "gift wrap p-tagged to vanishing pubkey must be tombstoned",
+        );
+        assert!(
+            !store.is_tombstoned(&gw_to_other.id.0),
+            "gift wrap p-tagged to unrelated pubkey must NOT be tombstoned",
+        );
     }
 
     // Boot rebuild (Task 11) tests
