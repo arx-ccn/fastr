@@ -2005,6 +2005,7 @@ impl Store {
             let vanish_path = self.dir.join("vanished.r");
             let tmp_vanish = self.dir.join("vanished.r.tmp");
             let mut f = File::create(&tmp_vanish)?;
+            f.write_all(&FILE_HEADER)?;
             for pk in &vanished_set {
                 f.write_all(pk)?;
             }
@@ -2012,7 +2013,7 @@ impl Store {
             drop(f);
             std::fs::rename(&tmp_vanish, &vanish_path)?;
             // Reopen vanish file for appending.
-            let new_vf = OpenOptions::new().create(true).append(true).open(&vanish_path)?;
+            let new_vf = vanish::open_append(&vanish_path)?;
             let mut vf = self
                 .vanish_file
                 .lock()
@@ -3384,6 +3385,47 @@ mod tests {
             }],
         );
         assert!(store.append(&ev3).is_err());
+    }
+
+    #[test]
+    fn test_compact_vanished_file_keeps_header_on_rewrite() {
+        // Regression for #30: compaction must prepend FILE_HEADER when rewriting
+        // vanished.r, otherwise a vanished pubkey whose first 4 bytes happen to
+        // equal the magic bytes is misidentified as a header and lost on the
+        // next restart.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let mut collision_pk = [0u8; 32];
+        collision_pk[..HEADER_SIZE].copy_from_slice(&FILE_HEADER);
+        for (i, b) in collision_pk.iter_mut().enumerate().skip(HEADER_SIZE) {
+            *b = i as u8;
+        }
+
+        // compact() short-circuits on an empty index, so make sure there is at
+        // least one stored event to drive the rewrite path.
+        store.append(&make_event(1, 1, 1000, vec![])).unwrap();
+
+        // Inject directly into the in-memory set — crafting a real kind-62
+        // event with this exact pubkey would require the matching secret key.
+        // compact() rewrites vanished.r from the in-memory set, so this is the
+        // path under test. Only one entry so HashSet iteration order can't
+        // mask the bug by putting a non-collision pubkey first.
+        store.vanished.write().unwrap().insert(collision_pk);
+
+        store.compact().unwrap();
+        drop(store);
+
+        let store2 = Store::open(dir.path()).unwrap();
+        assert!(
+            store2.is_vanished(&collision_pk),
+            "collision-prefix vanished pubkey must survive compact+restart"
+        );
+
+        // File must start with the header (4 magic bytes + 32 pubkey bytes).
+        let raw = std::fs::read(dir.path().join("vanished.r")).unwrap();
+        assert_eq!(&raw[..HEADER_SIZE], &FILE_HEADER);
+        assert_eq!(raw.len(), HEADER_SIZE + 32);
     }
 
     // NIP-09 a-tag deletion tests
