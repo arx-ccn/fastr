@@ -1475,7 +1475,10 @@ mod tests {
         let ev = make_event(1, 1, 1, vec![]);
         ws.send(event_msg(&ev).into()).await.unwrap();
         let resp = recv_text(&mut ws).await;
-        assert!(resp.contains("true"), "post-non-targeting-vanish event should be accepted: {resp}");
+        assert!(
+            resp.contains("true"),
+            "post-non-targeting-vanish event should be accepted: {resp}"
+        );
         assert!(!resp.contains("vanished"), "should not mention vanished: {resp}");
     }
 
