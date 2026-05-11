@@ -17,7 +17,7 @@ use crate::nostr::{
     ServerMsg, KIND_AUTH,
 };
 use crate::pack::{self, Event, EventId};
-use crate::ws::auth::{verify_auth_event, AuthState};
+use crate::ws::auth::{url_domain, verify_auth_event, AuthState};
 use crate::ws::fanout::{Fanout, LiveEvent};
 
 /// Maximum number of pubkeys a single connection can authenticate as.
@@ -343,6 +343,25 @@ where
     Ok(())
 }
 
+/// NIP-62: a vanish request applies to this relay only if it carries a `relay`
+/// tag whose value matches our `relay_url` (domain comparison, same rules as
+/// NIP-42 AUTH) or equals the literal `ALL_RELAYS`.
+fn vanish_targets_relay(ev: &Event, relay_url: &str) -> bool {
+    let our_domain = url_domain(relay_url);
+    for tag in &ev.tags {
+        if tag.fields.first().map(String::as_str) != Some("relay") {
+            continue;
+        }
+        let Some(value) = tag.fields.get(1) else {
+            continue;
+        };
+        if value == "ALL_RELAYS" || url_domain(value) == our_domain {
+            return true;
+        }
+    }
+    false
+}
+
 async fn handle_event(
     ev: Event,
     store: &Arc<Store>,
@@ -394,10 +413,13 @@ async fn handle_event(
 
     // NIP-62: handle vanish requests
     if matches!(&kind_class, KindClass::Vanish) {
+        let targets_us = vanish_targets_relay(&ev, &config.relay_url);
         match store.append_classified(&ev, kind_class) {
             Ok(()) => {
-                if let Err(e) = store.vanish(&ev) {
-                    warn!("vanish error: {e}");
+                if targets_us {
+                    if let Err(e) = store.vanish(&ev) {
+                        warn!("vanish error: {e}");
+                    }
                 }
                 let ev = Arc::new(ev);
                 fanout.broadcast(Arc::clone(&ev)).await;
@@ -1402,8 +1424,15 @@ mod tests {
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("true"));
 
-        // Send vanish (kind 62) from author 1
-        let vanish = make_event(1, 62, 0, vec![]);
+        // Send vanish (kind 62) from author 1, targeting ALL_RELAYS
+        let vanish = make_event(
+            1,
+            62,
+            0,
+            vec![Tag {
+                fields: vec!["relay".into(), "ALL_RELAYS".into()],
+            }],
+        );
         ws.send(event_msg(&vanish).into()).await.unwrap();
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("true"), "vanish should be accepted: {resp}");
@@ -1418,6 +1447,60 @@ mod tests {
             }],
         );
         ws.send(event_msg(&ev2).into()).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        assert!(resp.contains("false"), "post-vanish event should be rejected: {resp}");
+        assert!(resp.contains("vanished"), "should mention vanished: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_vanish_ignored_when_targeting_other_relay() {
+        // NIP-62: a kind-62 whose `relay` tag points at a different relay must
+        // be stored but NOT processed — the author can still post afterward.
+        let (port, _store) = spawn_server().await;
+        let mut ws = connect(port).await;
+
+        let vanish = make_event(
+            1,
+            62,
+            0,
+            vec![Tag {
+                fields: vec!["relay".into(), "wss://some-other-relay.example.com".into()],
+            }],
+        );
+        ws.send(event_msg(&vanish).into()).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        assert!(resp.contains("true"), "vanish event should be accepted: {resp}");
+
+        // Author should still be able to post — the vanish did not target us.
+        let ev = make_event(1, 1, 1, vec![]);
+        ws.send(event_msg(&ev).into()).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        assert!(resp.contains("true"), "post-non-targeting-vanish event should be accepted: {resp}");
+        assert!(!resp.contains("vanished"), "should not mention vanished: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_vanish_processed_when_relay_tag_matches_us() {
+        // NIP-62: a kind-62 whose `relay` tag matches our own URL must be processed.
+        let (port, _store) = spawn_server().await;
+        let mut ws = connect(port).await;
+
+        let our_url = format!("ws://127.0.0.1:{port}");
+        let vanish = make_event(
+            1,
+            62,
+            0,
+            vec![Tag {
+                fields: vec!["relay".into(), our_url],
+            }],
+        );
+        ws.send(event_msg(&vanish).into()).await.unwrap();
+        let resp = recv_text(&mut ws).await;
+        assert!(resp.contains("true"), "vanish should be accepted: {resp}");
+
+        // Author should be vanished — subsequent events rejected.
+        let ev = make_event(1, 1, 1, vec![]);
+        ws.send(event_msg(&ev).into()).await.unwrap();
         let resp = recv_text(&mut ws).await;
         assert!(resp.contains("false"), "post-vanish event should be rejected: {resp}");
         assert!(resp.contains("vanished"), "should mention vanished: {resp}");

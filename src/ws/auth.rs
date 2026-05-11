@@ -101,7 +101,7 @@ pub fn verify_auth_event(ev: &Event, expected_challenge: &str, relay_url: &str) 
 /// For `ws://example.com/path` -> `example.com`.
 /// If parsing fails, returns the original string so comparison still works
 /// for exact-match cases (e.g. `ws://127.0.0.1:8080`).
-fn url_domain(url: &str) -> &str {
+pub(crate) fn url_domain(url: &str) -> &str {
     // Strip scheme.
     let after_scheme = if let Some(s) = url.find("://") {
         &url[s + 3..]
