@@ -528,7 +528,7 @@ async fn handle_req(
     }
 
     // Sort by created_at descending (NIP-01).
-    unsorted.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    unsorted.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
     let mut batch: Vec<String> = Vec::with_capacity(unsorted.len() + 1);
     batch.extend(unsorted.into_iter().map(|(_, json)| json));
 

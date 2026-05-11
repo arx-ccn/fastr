@@ -836,29 +836,20 @@ pub(crate) fn single_filter_matches(f: &Filter, ev: &Event) -> bool {
     match &f.ids {
         None => {}
         Some(ids) if ids.is_empty() => return false,
-        Some(ids) => {
-            if !ids.iter().any(|id| id.matches(&ev.id.0)) {
-                return false;
-            }
-        }
+        Some(ids) if !ids.iter().any(|id| id.matches(&ev.id.0)) => return false,
+        Some(_) => {}
     }
     match &f.authors {
         None => {}
         Some(authors) if authors.is_empty() => return false,
-        Some(authors) => {
-            if !authors.iter().any(|pk| pk.matches(&ev.pubkey.0)) {
-                return false;
-            }
-        }
+        Some(authors) if !authors.iter().any(|pk| pk.matches(&ev.pubkey.0)) => return false,
+        Some(_) => {}
     }
     match &f.kinds {
         None => {}
         Some(kinds) if kinds.is_empty() => return false,
-        Some(kinds) => {
-            if !kinds.contains(&ev.kind) {
-                return false;
-            }
-        }
+        Some(kinds) if !kinds.contains(&ev.kind) => return false,
+        Some(_) => {}
     }
     if let Some(since) = f.since {
         if ev.created_at < since {
