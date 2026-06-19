@@ -1,0 +1,39 @@
+[Unit]
+Description=fastr Nostr relay
+Documentation=https://github.com/arx-ccn/fastr
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=fastr
+Group=fastr
+ExecStart=/usr/local/bin/fastr
+WorkingDirectory=/var/lib/fastr
+Restart=on-failure
+RestartSec=5
+
+# Data directory
+Environment=FASTR_DATA_DIR=/var/lib/fastr/data
+
+# Bind on localhost only; TLS termination is handled by your reverse proxy
+Environment=FASTR_ADDR=127.0.0.1
+Environment=FASTR_PORT=8080
+
+# Tune these to your workload
+#Environment=FASTR_MAX_CONNECTIONS=1024
+#Environment=FASTR_MAX_SUBSCRIPTIONS=20
+#Environment=FASTR_MAX_FILTERS=10
+#Environment=FASTR_MAX_LIMIT=500
+#Environment=FASTR_MAX_MESSAGE_BYTES=131072
+#Environment=FASTR_COMPACT_INTERVAL=21600
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/fastr
+
+[Install]
+WantedBy=multi-user.target

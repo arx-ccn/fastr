@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+
+description="fastr Nostr relay"
+
+name="fastr"
+command="/usr/local/bin/fastr"
+command_user="fastr:fastr"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/fastr/fastr.log"
+error_log="/var/log/fastr/fastr.log"
+
+: ${fastr_addr:="127.0.0.1"}
+: ${fastr_port:="8080"}
+: ${fastr_data_dir:="/var/lib/fastr/data"}
+
+export FASTR_ADDR="${fastr_addr}"
+export FASTR_PORT="${fastr_port}"
+export FASTR_DATA_DIR="${fastr_data_dir}"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -o fastr:fastr -m 0750 /var/lib/fastr/data
+    checkpath -d -o fastr:fastr -m 0750 /var/log/fastr
+}

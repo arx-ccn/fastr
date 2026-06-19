@@ -1,0 +1,9 @@
+data/
+trees/
+
+# Odin build artifacts
+/fastr
+/fastr-debug
+fastr-smoke
+# vendored libsecp256k1 (cloned + built by `just vendor`)
+vendor/

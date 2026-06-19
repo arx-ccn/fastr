@@ -1,0 +1,7 @@
+# worktrunk project configuration
+# https://worktrunk.dev/
+
+# Refresh origin/master before creating a new worktree so `wt switch --create
+# --base origin/master` always picks up the freshest tip. Use `origin/master`
+# (not `master`) as the base to bypass any lag on the local `master` ref.
+pre-start = "git fetch origin master"

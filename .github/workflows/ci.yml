@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  ODIN_RELEASE: dev-2026-05
+
+jobs:
+  test:
+    name: Check + Test + Build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Odin toolchain
+        run: |
+          curl -fsSL -o /tmp/odin.tar.gz \
+            "https://github.com/odin-lang/Odin/releases/download/${ODIN_RELEASE}/odin-linux-amd64-${ODIN_RELEASE}.tar.gz"
+          sudo mkdir -p /opt/odin
+          sudo tar -xzf /tmp/odin.tar.gz -C /opt/odin --strip-components=1
+          sudo ln -s /opt/odin/odin /usr/local/bin/odin
+          odin version
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang llvm just
+
+      - name: Cache vendored libsecp256k1
+        id: secp-cache
+        uses: useblacksmith/cache@v5
+        with:
+          path: vendor/secp256k1
+          key: secp256k1-v0.7.0-${{ runner.os }}
+
+      - name: Build vendored libsecp256k1
+        if: steps.secp-cache.outputs.cache-hit != 'true'
+        run: just vendor
+
+      - name: Check (vet + strict-style)
+        run: just check
+
+      - name: Test
+        run: just test
+
+      - name: Build (release)
+        run: just build
+
+      - name: Smoke test
+        run: |
+          FASTR_PORT=18080 FASTR_DATA_DIR=$(mktemp -d) ./fastr &
+          sleep 1
+          odin build smoke -out:fastr-smoke -o:speed
+          FASTR_PORT=18080 ./fastr-smoke
