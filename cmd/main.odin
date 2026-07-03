@@ -104,6 +104,15 @@ serve :: proc() {
 		thread.create_and_start_with_poly_data(comp_ctx, compaction_loop, self_cleanup = true)
 	}
 
+	// Periodic store-stats log: once per interval, report the live event count
+	// and how it changed since the previous line.
+	if cfg.stats_interval > 0 {
+		stats_ctx := new(Stats_Ctx)
+		stats_ctx.store = st
+		stats_ctx.interval = cfg.stats_interval
+		thread.create_and_start_with_poly_data(stats_ctx, stats_loop, self_cleanup = true)
+	}
+
 	active := new(int)
 	next_conn_id: u64 = 0
 
@@ -153,6 +162,48 @@ compaction_loop :: proc(ctx: ^Compact_Ctx) {
 				fmt.eprintfln("compaction failed: %v", err)
 			}
 		}
+		free_all(context.temp_allocator)
+	}
+}
+
+@(private = "file")
+Stats_Ctx :: struct {
+	store:    ^store.Store,
+	interval: u64,
+}
+
+// Periodic store-stats logger. Logs a baseline line at startup, then one line
+// per interval reporting the live event count, its net change since the
+// previous line, deletions confirmed in that window, and the current pending
+// (preemptive) tombstone count. Runs on its own thread.
+//
+// `events` is the index length, which shrinks when compaction runs, so the
+// net delta can be negative in a window where compaction fired — it is a net
+// change, not a raw append count.
+@(private = "file")
+stats_loop :: proc(ctx: ^Stats_Ctx) {
+	prev_events := store.event_count(ctx.store)
+	prev_tombstones := store.tombstone_count(ctx.store)
+	fmt.eprintfln(
+		"fastr stats: events=%d  tombstones=%d  pending=%d",
+		prev_events,
+		prev_tombstones,
+		store.pending_tombstone_count(ctx.store),
+	)
+	for {
+		time.sleep(time.Duration(ctx.interval) * time.Second)
+		events := store.event_count(ctx.store)
+		tombstones := store.tombstone_count(ctx.store)
+		fmt.eprintfln(
+			"fastr stats: events=%d (%+d)  deleted=%+d  tombstones=%d  pending=%d",
+			events,
+			events - prev_events,
+			tombstones - prev_tombstones,
+			tombstones,
+			store.pending_tombstone_count(ctx.store),
+		)
+		prev_events = events
+		prev_tombstones = tombstones
 		free_all(context.temp_allocator)
 	}
 }

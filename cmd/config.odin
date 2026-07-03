@@ -34,6 +34,8 @@ Config :: struct {
 	relay_url:                   string,
 	// Seconds between background compaction runs. 0 = disabled. Default: 21600 (6h).
 	compact_interval:            u64,
+	// Seconds between periodic store-stats log lines. 0 = disabled. Default: 3600 (1h).
+	stats_interval:              u64,
 	// Maximum records in a single negentropy session. Default: 500_000.
 	max_neg_records:             int,
 	// Maximum number of tags allowed on an incoming event. Default: 2000.
@@ -98,6 +100,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		data_dir                    = data_dir,
 		relay_url                   = relay_url,
 		compact_interval            = env_u64("FASTR_COMPACT_INTERVAL", 21600),
+		stats_interval              = env_u64("FASTR_STATS_INTERVAL", 3600),
 		max_neg_records             = env_int("FASTR_MAX_NEG_RECORDS", 500_000),
 		max_event_tags              = env_int("FASTR_MAX_EVENT_TAGS", 2000),
 		max_content_length          = env_int("FASTR_MAX_CONTENT_LENGTH", 50 * 1024),
