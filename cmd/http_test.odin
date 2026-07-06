@@ -124,6 +124,92 @@ test_config_subid_clamp_and_kind_limits :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_config_pubkey_npub :: proc(t: ^testing.T) {
+	// NIP-19 test vector.
+	os.set_env("FASTR_PUBKEY", "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg")
+	cfg := load_config(context.temp_allocator)
+	testing.expect_value(
+		t,
+		cfg.pubkey,
+		"7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e",
+	)
+
+	os.set_env("FASTR_PUBKEY", "3BF0C63FCB93463407AF97A5E5EE64FA883D107EF9E558472C4EB9AAAEFA459D")
+	cfg = load_config(context.temp_allocator)
+	testing.expect_value(
+		t,
+		cfg.pubkey,
+		"3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d",
+	)
+	os.unset_env("FASTR_PUBKEY")
+}
+
+@(test)
+test_relay_info_icon_and_pubkey :: proc(t: ^testing.T) {
+	os.set_env("FASTR_PUBKEY", "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg")
+	os.set_env("FASTR_ICON", "https://example.com/icon.png")
+	cfg, info := default_info()
+	_ = cfg
+	obj := parse_info(t, relay_info_json(&info, context.temp_allocator))
+	pubkey, _ := obj["pubkey"].(string)
+	testing.expect_value(
+		t,
+		pubkey,
+		"7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e",
+	)
+	icon, _ := obj["icon"].(string)
+	testing.expect_value(t, icon, "https://example.com/icon.png")
+	os.unset_env("FASTR_PUBKEY")
+	os.unset_env("FASTR_ICON")
+
+	// Unset: pubkey is absent; icon falls back to the relay's own /icon.png.
+	cfg2, info2 := default_info()
+	_ = cfg2
+	obj2 := parse_info(t, relay_info_json(&info2, context.temp_allocator))
+	_, has_pubkey := obj2["pubkey"]
+	testing.expect(t, !has_pubkey, "pubkey must be absent when FASTR_PUBKEY is unset")
+	icon2, has_icon := obj2["icon"].(string)
+	testing.expect(t, has_icon, "icon must default when FASTR_ICON is unset")
+	testing.expect(
+		t,
+		len(icon2) > len("/icon.png") && icon2[len(icon2) - len("/icon.png"):] == "/icon.png",
+		"default icon must point at the relay's /icon.png",
+	)
+
+	// Explicit empty FASTR_ICON omits the field.
+	os.set_env("FASTR_ICON", "")
+	cfg3, info3 := default_info()
+	_ = cfg3
+	obj3 := parse_info(t, relay_info_json(&info3, context.temp_allocator))
+	_, has_icon3 := obj3["icon"]
+	testing.expect(t, !has_icon3, "icon must be absent when FASTR_ICON is empty")
+	os.unset_env("FASTR_ICON")
+}
+
+@(test)
+test_config_default_icon_url_schemes :: proc(t: ^testing.T) {
+	os.set_env("FASTR_URL", "wss://relay.example.com")
+	cfg := load_config(context.temp_allocator)
+	testing.expect_value(t, cfg.icon, "https://relay.example.com/icon.png")
+	os.set_env("FASTR_URL", "ws://relay.example.com:8080/")
+	cfg = load_config(context.temp_allocator)
+	testing.expect_value(t, cfg.icon, "http://relay.example.com:8080/icon.png")
+	os.unset_env("FASTR_URL")
+}
+
+@(test)
+test_icon_response_serves_png :: proc(t: ^testing.T) {
+	png: []u8 = ICON_PNG
+	resp := icon_response(context.temp_allocator)
+	body_at := len(resp) - len(png)
+	testing.expect(t, body_at > 0, "response must have headers before the body")
+	testing.expect_value(t, resp[body_at:], string(png))
+	// PNG magic bytes.
+	testing.expect(t, len(png) > 8, "embedded icon must not be empty")
+	testing.expect_value(t, string(png[:4]), "\x89PNG")
+}
+
+@(test)
 test_config_port_override :: proc(t: ^testing.T) {
 	os.set_env("FASTR_PORT", "9000")
 	cfg := load_config(context.temp_allocator)

@@ -152,6 +152,8 @@ Accepts bare event objects or `["EVENT", {...}]` envelopes, because the world is
 | `FASTR_MAX_LIMIT` | `500` | Max events returned per REQ |
 | `FASTR_MAX_MESSAGE_BYTES` | `131072` | Max WebSocket message size |
 | `FASTR_COMPACT_INTERVAL` | `21600` | Compaction interval in seconds |
+| `FASTR_PUBKEY` | unset | NIP-11 admin contact pubkey, as `npub1...` or 64-char hex |
+| `FASTR_ICON` | `<relay url>/icon.png` | NIP-11 icon URL; the relay serves a built-in icon at `/icon.png`. Set to empty to omit |
 
 ---
 
@@ -164,7 +166,7 @@ just vendor && just build
 sudo ./deploy/install.sh
 ```
 
-Auto-detects systemd, OpenRC, runit, FreeBSD rc.d, or macOS launchd.
+Auto-detects systemd, OpenRC, dinit, runit, FreeBSD rc.d, or macOS launchd.
 
 ---
 
@@ -188,6 +190,17 @@ install -d -o fastr -g fastr /var/lib/fastr/data
 install -m 755 deploy/fastr.openrc /etc/init.d/fastr
 rc-update add fastr default
 rc-service fastr start
+```
+
+### dinit (Artix, Chimera Linux)
+
+```sh
+install -m 755 fastr /usr/local/bin/fastr
+useradd -r -s /usr/sbin/nologin fastr
+install -d -o fastr -g fastr /var/lib/fastr/data
+install -m 644 deploy/fastr.dinit /etc/dinit.d/fastr
+install -m 644 deploy/fastr.env /etc/dinit.d/fastr.env
+dinitctl enable fastr
 ```
 
 ### runit (Void Linux)

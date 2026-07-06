@@ -45,6 +45,8 @@ detect_init() {
         echo "systemd"
     elif command -v rc-update >/dev/null 2>&1; then
         echo "openrc"
+    elif [ -d /run/dinit ] || command -v dinitctl >/dev/null 2>&1; then
+        echo "dinit"
     elif command -v sv >/dev/null 2>&1; then
         echo "runit"
     else
@@ -92,6 +94,15 @@ install_runit() {
     fi
 }
 
+install_dinit() {
+    id fastr >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin fastr
+    install -d -o fastr -g fastr /var/lib/fastr/data
+    install -m 644 "$SCRIPT_DIR/fastr.dinit" /etc/dinit.d/fastr
+    install -m 644 "$SCRIPT_DIR/fastr.env" /etc/dinit.d/fastr.env
+    dinitctl enable fastr
+    info "Installed dinit service. Start with: dinitctl start fastr"
+}
+
 install_rcd() {
     pw useradd fastr -s /usr/sbin/nologin -d /nonexistent -c "fastr nostr relay" 2>/dev/null || true
     install -d -o fastr -g fastr /var/db/fastr/data
@@ -127,6 +138,7 @@ install_binary
 case "$INIT" in
     systemd) install_systemd ;;
     openrc)  install_openrc  ;;
+    dinit)   install_dinit   ;;
     runit)   install_runit   ;;
     rc.d)    install_rcd     ;;
     launchd) install_launchd ;;

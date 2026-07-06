@@ -43,6 +43,7 @@ Conn_Ctx :: struct {
 	conn_id: u64,
 	nip11:   string, // pre-rendered NIP-11 HTTP response
 	index:   string, // pre-rendered index page HTTP response
+	icon:    string, // pre-rendered /icon.png HTTP response (binary body)
 }
 
 @(private = "file")
@@ -94,6 +95,7 @@ serve :: proc() {
 	info := relay_info_from_config(&cfg)
 	nip11_resp := relay_info_response(relay_info_json(&info))
 	index_resp := index_page_response(INDEX_PAGE_HTML)
+	icon_resp := icon_response()
 
 	// Background compaction: periodically rewrite store files omitting
 	// tombstoned/expired entries.
@@ -143,6 +145,7 @@ serve :: proc() {
 		ctx.conn_id = next_conn_id
 		ctx.nip11 = nip11_resp
 		ctx.index = index_resp
+		ctx.icon = icon_resp
 		thread.create_and_start_with_poly_data(ctx, conn_entry, self_cleanup = true)
 	}
 }
@@ -236,6 +239,10 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 	}
 
 	if !ws.is_websocket_upgrade(&req) {
+		if req.path == "/icon.png" {
+			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.icon)
+			return
+		}
 		// Plain browser visit / probe.
 		_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.index)
 		return

@@ -32,6 +32,7 @@ Relay_Info :: struct {
 	description:    string,
 	pubkey:         string, // "" = absent
 	contact:        string, // "" = absent
+	icon:           string, // "" = absent
 	supported_nips: []u16,
 	software:       string,
 	version:        string,
@@ -44,8 +45,9 @@ relay_info_from_config :: proc(cfg: ^Config) -> Relay_Info {
 	return Relay_Info {
 		name = "fastr",
 		description = "A high-performance Nostr relay",
-		pubkey = "",
+		pubkey = cfg.pubkey,
 		contact = "",
+		icon = cfg.icon,
 		supported_nips = SUPPORTED_NIPS[:],
 		software = "https://github.com/arx-ccn/fastr",
 		version = VERSION,
@@ -108,6 +110,10 @@ relay_info_json :: proc(info: ^Relay_Info, allocator := context.allocator) -> st
 	if info.contact != "" {
 		strings.write_string(&b, `,"contact":`)
 		write_json_string(&b, info.contact)
+	}
+	if info.icon != "" {
+		strings.write_string(&b, `,"icon":`)
+		write_json_string(&b, info.icon)
 	}
 	strings.write_string(&b, `,"supported_nips":[`)
 	for nip, i in info.supported_nips {
@@ -219,6 +225,27 @@ index_page_response :: proc(body: string, allocator := context.allocator) -> str
 		body,
 		allocator = allocator,
 	)
+}
+
+// Embedded default relay icon, served at /icon.png.
+ICON_PNG :: #load("icon.png")
+
+// Build a complete HTTP/1.1 200 response with the embedded PNG icon.
+icon_response :: proc(allocator := context.allocator) -> string {
+	b := strings.builder_make(allocator)
+	fmt.sbprintf(
+		&b,
+		"HTTP/1.1 200 OK\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-Length: %d\r\n" +
+		"Access-Control-Allow-Origin: *\r\n" +
+		"Cache-Control: public, max-age=86400\r\n" +
+		"Connection: close\r\n" +
+		"\r\n",
+		len(ICON_PNG),
+	)
+	strings.write_bytes(&b, ICON_PNG)
+	return strings.to_string(b)
 }
 
 // Build a complete HTTP/1.1 200 response with the NIP-11 JSON body and CORS headers.

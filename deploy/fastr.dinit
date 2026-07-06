@@ -1,0 +1,20 @@
+# dinit service for fastr (Artix, Chimera Linux)
+# Install: install -m 644 deploy/fastr.dinit /etc/dinit.d/fastr
+#          install -m 644 deploy/fastr.env   /etc/dinit.d/fastr.env
+#          dinitctl enable fastr
+
+type = process
+command = /usr/local/bin/fastr
+working-dir = /var/lib/fastr
+run-as = fastr
+
+# Environment lives in a separate file; path is relative to this file
+env-file = fastr.env
+
+restart = true
+restart-delay = 5
+
+logfile = /var/log/fastr.log
+
+# Uncomment if your distro provides a network service (e.g. dinit-chimera)
+#waits-for = network

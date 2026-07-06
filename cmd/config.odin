@@ -45,6 +45,11 @@ Config :: struct {
 	max_content_length_per_kind: map[u16]int,
 	// Global default content length limit in bytes. Default: 50 KiB.
 	max_content_length:          int,
+	// NIP-11 administrative contact pubkey as 64-char lowercase hex.
+	// FASTR_PUBKEY accepts npub or hex. "" = absent from the info document.
+	pubkey:                      string,
+	// NIP-11 icon URL. FASTR_ICON. "" = absent from the info document.
+	icon:                        string,
 }
 
 @(private = "file")
@@ -87,6 +92,18 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		data_dir = "./data"
 	}
 
+	pubkey := ""
+	if raw, found := os.lookup_env("FASTR_PUBKEY", context.temp_allocator); found && raw != "" {
+		pubkey = parse_pubkey(raw, allocator)
+	}
+
+	// FASTR_ICON overrides the icon URL; set it to "" to omit the field.
+	// Default: the embedded icon the relay serves itself at /icon.png.
+	icon, icon_found := os.lookup_env("FASTR_ICON", allocator)
+	if !icon_found {
+		icon = default_icon_url(relay_url, allocator)
+	}
+
 	return Config {
 		listen_host                 = host,
 		listen_port                 = u16(port),
@@ -105,7 +122,138 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		max_event_tags              = env_int("FASTR_MAX_EVENT_TAGS", 2000),
 		max_content_length          = env_int("FASTR_MAX_CONTENT_LENGTH", 50 * 1024),
 		max_content_length_per_kind = parse_kind_limits("FASTR_MAX_CONTENT_LENGTH_PER_KIND", allocator),
+		pubkey                      = pubkey,
+		icon                        = icon,
 	}
+}
+
+// Default icon URL: the relay serves its embedded icon at /icon.png, so
+// derive the HTTP URL from the relay's WebSocket URL (ws -> http, wss -> https).
+@(private = "file")
+default_icon_url :: proc(relay_url: string, allocator := context.allocator) -> string {
+	url := relay_url
+	scheme := "http"
+	switch {
+	case strings.has_prefix(url, "wss://"):
+		scheme = "https"
+		url = url[6:]
+	case strings.has_prefix(url, "ws://"):
+		url = url[5:]
+	case strings.has_prefix(url, "https://"):
+		scheme = "https"
+		url = url[8:]
+	case strings.has_prefix(url, "http://"):
+		url = url[7:]
+	}
+	url = strings.trim_suffix(url, "/")
+	return fmt.aprintf("%s://%s/icon.png", scheme, url, allocator = allocator)
+}
+
+// Parse FASTR_PUBKEY: either an `npub1...` bech32 string or 64 hex chars.
+// Returns 64-char lowercase hex. Panics at startup on malformed input so
+// configuration mistakes surface immediately.
+@(private = "file")
+parse_pubkey :: proc(raw: string, allocator := context.allocator) -> string {
+	if strings.has_prefix(raw, "npub1") {
+		hex, ok := npub_to_hex(raw, allocator)
+		if !ok {
+			fmt.panicf("FASTR_PUBKEY: invalid npub %q", raw)
+		}
+		return hex
+	}
+	if len(raw) != 64 {
+		fmt.panicf("FASTR_PUBKEY: expected npub or 64 hex chars, got %q", raw)
+	}
+	for i in 0 ..< len(raw) {
+		c := raw[i]
+		switch c {
+		case '0' ..= '9', 'a' ..= 'f':
+		// ok
+		case 'A' ..= 'F':
+		// lowercased below
+		case:
+			fmt.panicf("FASTR_PUBKEY: bad hex character %q in %q", rune(c), raw)
+		}
+	}
+	return strings.to_lower(raw, allocator)
+}
+
+@(private = "file")
+BECH32_CHARSET :: "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+@(private = "file")
+bech32_polymod_step :: proc(chk: u32, v: u32) -> u32 {
+	GEN := [5]u32{0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3}
+	b := chk >> 25
+	out := (chk & 0x1ffffff) << 5 ~ v
+	for g, i in GEN {
+		if (b >> uint(i)) & 1 == 1 {
+			out ~= g
+		}
+	}
+	return out
+}
+
+// Decode a lowercase bech32 `npub1...` string (NIP-19) into 64-char hex.
+@(private = "file")
+npub_to_hex :: proc(npub: string, allocator := context.allocator) -> (hex: string, ok: bool) {
+	// hrp "npub" + "1" + 52 data chars (32 bytes) + 6 checksum chars.
+	if len(npub) != 63 {
+		return "", false
+	}
+	data := npub[5:]
+
+	// Checksum over expanded hrp then data values (BIP-173).
+	chk: u32 = 1
+	hrp := "npub"
+	for i in 0 ..< len(hrp) {
+		chk = bech32_polymod_step(chk, u32(hrp[i]) >> 5)
+	}
+	chk = bech32_polymod_step(chk, 0)
+	for i in 0 ..< len(hrp) {
+		chk = bech32_polymod_step(chk, u32(hrp[i]) & 31)
+	}
+
+	values: [58]u8
+	for i in 0 ..< len(data) {
+		idx := strings.index_byte(BECH32_CHARSET, data[i])
+		if idx < 0 {
+			return "", false
+		}
+		values[i] = u8(idx)
+		chk = bech32_polymod_step(chk, u32(idx))
+	}
+	if chk != 1 {
+		return "", false
+	}
+
+	// Convert the 52 data values (5-bit groups) to 32 bytes, dropping the
+	// 6 checksum values and the 4 zero padding bits.
+	bytes: [32]u8
+	acc: u32 = 0
+	bits: uint = 0
+	n := 0
+	for v in values[:52] {
+		acc = acc << 5 | u32(v)
+		bits += 5
+		for bits >= 8 {
+			bits -= 8
+			if n >= 32 {
+				return "", false
+			}
+			bytes[n] = u8(acc >> bits)
+			n += 1
+		}
+	}
+	if n != 32 || acc & ((1 << bits) - 1) != 0 {
+		return "", false
+	}
+
+	b := strings.builder_make(allocator)
+	for byte_val in bytes {
+		fmt.sbprintf(&b, "%02x", byte_val)
+	}
+	return strings.to_string(b), true
 }
 
 // Return the effective max content length for a given event kind.
