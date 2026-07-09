@@ -153,6 +153,7 @@ Accepts bare event objects or `["EVENT", {...}]` envelopes, because the world is
 | `FASTR_MAX_MESSAGE_BYTES` | `131072` | Max WebSocket message size |
 | `FASTR_COMPACT_INTERVAL` | `21600` | Compaction interval in seconds |
 | `FASTR_PUBKEY` | unset | NIP-11 admin contact pubkey, as `npub1...` or 64-char hex |
+| `FASTR_CONTACT` | admin npub | NIP-11 `contact` (e.g. `mailto:`, URL, npub). Defaults to `FASTR_PUBKEY` encoded as an `npub1...`; set to empty to omit |
 | `FASTR_ICON` | `<relay url>/icon.png` | NIP-11 icon URL; the relay serves a built-in icon at `/icon.png`. Set to empty to omit |
 
 ---

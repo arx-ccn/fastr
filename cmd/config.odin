@@ -48,6 +48,10 @@ Config :: struct {
 	// NIP-11 administrative contact pubkey as 64-char lowercase hex.
 	// FASTR_PUBKEY accepts npub or hex. "" = absent from the info document.
 	pubkey:                      string,
+	// NIP-11 contact string (e.g. mailto:, https://, npub). FASTR_CONTACT
+	// overrides it verbatim; when unset it defaults to `pubkey` as an npub.
+	// "" = absent.
+	contact:                     string,
 	// NIP-11 icon URL. FASTR_ICON. "" = absent from the info document.
 	icon:                        string,
 	// NIP-11 banner URL. FASTR_BANNER. "" = absent from the info document.
@@ -109,6 +113,20 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		pubkey = parse_pubkey(raw, allocator)
 	}
 
+	// FASTR_CONTACT overrides the NIP-11 contact verbatim (set it to "" to omit
+	// the field). When unset it defaults to the admin pubkey encoded as an npub.
+	contact, contact_found := os.lookup_env("FASTR_CONTACT", allocator)
+	if !contact_found {
+		contact = ""
+		if pubkey != "" {
+			if npub, ok := hex_to_npub(pubkey, allocator); ok {
+				contact = npub
+			} else {
+				contact = pubkey
+			}
+		}
+	}
+
 	// FASTR_ICON overrides the icon URL; set it to "" to omit the field.
 	// Default: the embedded icon the relay serves itself at /icon.png.
 	icon, icon_found := os.lookup_env("FASTR_ICON", allocator)
@@ -167,6 +185,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		max_content_length          = env_int("FASTR_MAX_CONTENT_LENGTH", 50 * 1024),
 		max_content_length_per_kind = parse_kind_limits("FASTR_MAX_CONTENT_LENGTH_PER_KIND", allocator),
 		pubkey                      = pubkey,
+		contact                     = contact,
 		icon                        = icon,
 		banner                      = banner,
 		tos_url                     = tos_url,
@@ -260,6 +279,88 @@ bech32_polymod_step :: proc(chk: u32, v: u32) -> u32 {
 		}
 	}
 	return out
+}
+
+// Encode 64-char hex (a 32-byte pubkey) as a lowercase bech32 `npub1...`
+// string (NIP-19). Returns ok=false on malformed hex input.
+@(private = "file")
+hex_to_npub :: proc(hex: string, allocator := context.allocator) -> (npub: string, ok: bool) {
+	if len(hex) != 64 {
+		return "", false
+	}
+
+	// hex -> 32 bytes.
+	bytes: [32]u8
+	for i in 0 ..< 32 {
+		hi := hex_nibble(hex[i * 2])
+		lo := hex_nibble(hex[i * 2 + 1])
+		if hi < 0 || lo < 0 {
+			return "", false
+		}
+		bytes[i] = u8(hi) << 4 | u8(lo)
+	}
+
+	// 8-bit bytes -> 5-bit groups (32 bytes -> 52 values, last padded).
+	data: [52]u8
+	acc: u32 = 0
+	bits: uint = 0
+	n := 0
+	for b in bytes {
+		acc = acc << 8 | u32(b)
+		bits += 8
+		for bits >= 5 {
+			bits -= 5
+			data[n] = u8(acc >> bits) & 31
+			n += 1
+		}
+	}
+	if bits > 0 {
+		data[n] = u8(acc << (5 - bits)) & 31
+		n += 1
+	}
+
+	// Checksum over expanded hrp, data values, then 6 zero placeholders.
+	hrp := "npub"
+	chk: u32 = 1
+	for i in 0 ..< len(hrp) {
+		chk = bech32_polymod_step(chk, u32(hrp[i]) >> 5)
+	}
+	chk = bech32_polymod_step(chk, 0)
+	for i in 0 ..< len(hrp) {
+		chk = bech32_polymod_step(chk, u32(hrp[i]) & 31)
+	}
+	for i in 0 ..< n {
+		chk = bech32_polymod_step(chk, u32(data[i]))
+	}
+	for _ in 0 ..< 6 {
+		chk = bech32_polymod_step(chk, 0)
+	}
+	chk ~= 1
+
+	charset := BECH32_CHARSET
+	b := strings.builder_make(allocator)
+	strings.write_string(&b, "npub1")
+	for i in 0 ..< n {
+		strings.write_byte(&b, charset[data[i]])
+	}
+	for i in 0 ..< 6 {
+		strings.write_byte(&b, charset[(chk >> uint(5 * (5 - i))) & 31])
+	}
+	return strings.to_string(b), true
+}
+
+// Value of a lowercase/uppercase hex digit, or -1 if not a hex digit.
+@(private = "file")
+hex_nibble :: proc(c: u8) -> int {
+	switch c {
+	case '0' ..= '9':
+		return int(c - '0')
+	case 'a' ..= 'f':
+		return int(c - 'a') + 10
+	case 'A' ..= 'F':
+		return int(c - 'A') + 10
+	}
+	return -1
 }
 
 // Decode a lowercase bech32 `npub1...` string (NIP-19) into 64-char hex.

@@ -193,6 +193,55 @@ test_relay_info_icon_and_pubkey :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_relay_info_contact :: proc(t: ^testing.T) {
+	// Unset FASTR_CONTACT: contact is the admin pubkey encoded as an npub, while
+	// the pubkey field stays hex. FASTR_PUBKEY here is given as hex to prove the
+	// npub round-trip happens on our side, not just an echo of the input form.
+	os.set_env("FASTR_PUBKEY", "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e")
+	os.unset_env("FASTR_CONTACT")
+	cfg, info := default_info()
+	_ = cfg
+	obj := parse_info(t, relay_info_json(&info, context.temp_allocator))
+	contact, _ := obj["contact"].(string)
+	testing.expect_value(
+		t,
+		contact,
+		"npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg",
+	)
+	pubkey, _ := obj["pubkey"].(string)
+	testing.expect_value(
+		t,
+		pubkey,
+		"7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e",
+	)
+
+	// FASTR_CONTACT overrides verbatim, independent of the pubkey.
+	os.set_env("FASTR_CONTACT", "mailto:admin@example.com")
+	cfg2, info2 := default_info()
+	_ = cfg2
+	obj2 := parse_info(t, relay_info_json(&info2, context.temp_allocator))
+	contact2, _ := obj2["contact"].(string)
+	testing.expect_value(t, contact2, "mailto:admin@example.com")
+
+	// Explicit empty FASTR_CONTACT omits the field even when a pubkey is set.
+	os.set_env("FASTR_CONTACT", "")
+	cfg3, info3 := default_info()
+	_ = cfg3
+	obj3 := parse_info(t, relay_info_json(&info3, context.temp_allocator))
+	_, has_contact := obj3["contact"]
+	testing.expect(t, !has_contact, "contact must be absent when FASTR_CONTACT is empty")
+
+	// No pubkey and no FASTR_CONTACT: contact is absent.
+	os.unset_env("FASTR_PUBKEY")
+	os.unset_env("FASTR_CONTACT")
+	cfg4, info4 := default_info()
+	_ = cfg4
+	obj4 := parse_info(t, relay_info_json(&info4, context.temp_allocator))
+	_, has_contact4 := obj4["contact"]
+	testing.expect(t, !has_contact4, "contact must be absent with no pubkey and no FASTR_CONTACT")
+}
+
+@(test)
 test_config_default_icon_url_schemes :: proc(t: ^testing.T) {
 	os.set_env("FASTR_URL", "wss://relay.example.com")
 	cfg := load_config(context.temp_allocator)
