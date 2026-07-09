@@ -18,6 +18,7 @@ package ws
 import "core:encoding/endian"
 import "core:net"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
@@ -457,6 +458,16 @@ handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 		return
 	}
 
+	// NIP-13: enforce minimum proof-of-work. Cheap bit-count on the claimed id;
+	// validate_event's event_id_hash check below prevents a forged low-work id
+	// from claiming a higher difficulty than it actually has.
+	if cfg.min_pow_difficulty > 0 {
+		if pow := nostr.leading_zero_bits(&ev.id); pow < cfg.min_pow_difficulty {
+			send_ok(cs, &id, false, pow_reject_reason(pow, cfg.min_pow_difficulty))
+			return
+		}
+	}
+
 	if reason, valid := nostr.validate_event(ev); !valid {
 		send_ok(cs, &id, false, reason)
 		return
@@ -538,6 +549,18 @@ prefixed :: proc(cs: ^Conn_State, prefix: string, reason: string) -> string {
 	buf := make([dynamic]u8, 0, len(prefix) + len(reason), context.temp_allocator)
 	append(&buf, prefix)
 	append(&buf, reason)
+	return string(buf[:])
+}
+
+// NIP-13 rejection reason, hand-built to keep core:fmt out of this file.
+@(private)
+pow_reject_reason :: proc(got, want: int) -> string {
+	nbuf: [20]u8
+	buf := make([dynamic]u8, 0, 48, context.temp_allocator)
+	append(&buf, "pow: difficulty ")
+	append(&buf, strconv.write_int(nbuf[:], i64(got), 10))
+	append(&buf, " below minimum ")
+	append(&buf, strconv.write_int(nbuf[:], i64(want), 10))
 	return string(buf[:])
 }
 

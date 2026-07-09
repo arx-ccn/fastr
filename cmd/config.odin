@@ -50,6 +50,18 @@ Config :: struct {
 	pubkey:                      string,
 	// NIP-11 icon URL. FASTR_ICON. "" = absent from the info document.
 	icon:                        string,
+	// NIP-11 banner URL. FASTR_BANNER. "" = absent from the info document.
+	// Default: the embedded banner the relay serves itself at /banner.png.
+	banner:                      string,
+	// NIP-11 terms_of_service URL. FASTR_TOS_URL. "" = absent.
+	// Default: the ToS the relay serves itself at /tos.txt.
+	tos_url:                     string,
+	// Terms-of-service text served verbatim at /tos.txt. Defaults to the
+	// embedded DEFAULT_TOS; FASTR_TOS_FILE points at a file to override it.
+	tos_text:                    string,
+	// NIP-13 minimum proof-of-work difficulty (leading zero bits) required on
+	// incoming events. FASTR_MIN_POW. 0 = disabled. Also reported in NIP-11.
+	min_pow_difficulty:          int,
 }
 
 @(private = "file")
@@ -101,7 +113,39 @@ load_config :: proc(allocator := context.allocator) -> Config {
 	// Default: the embedded icon the relay serves itself at /icon.png.
 	icon, icon_found := os.lookup_env("FASTR_ICON", allocator)
 	if !icon_found {
-		icon = default_icon_url(relay_url, allocator)
+		icon = default_asset_url(relay_url, "/icon.png", allocator)
+	}
+
+	// FASTR_BANNER overrides the banner URL; set it to "" to omit the field.
+	// Default: the embedded banner the relay serves itself at /banner.png.
+	banner, banner_found := os.lookup_env("FASTR_BANNER", allocator)
+	if !banner_found {
+		banner = default_asset_url(relay_url, "/banner.png", allocator)
+	}
+
+	// FASTR_TOS_URL overrides the terms_of_service URL; set it to "" to omit.
+	// Default: the ToS the relay serves itself at /tos.txt.
+	tos_url, tos_url_found := os.lookup_env("FASTR_TOS_URL", allocator)
+	if !tos_url_found {
+		tos_url = default_asset_url(relay_url, "/tos.txt", allocator)
+	}
+
+	// FASTR_TOS_FILE points at a text file whose contents replace the default
+	// ToS served at /tos.txt. Panics at startup if the path is unreadable so
+	// configuration mistakes surface immediately.
+	tos_text := DEFAULT_TOS
+	if path, found := os.lookup_env("FASTR_TOS_FILE", context.temp_allocator);
+	   found && path != "" {
+		data, read_err := os.read_entire_file_from_path(path, allocator)
+		if read_err != nil {
+			fmt.panicf("FASTR_TOS_FILE: cannot read %q: %v", path, read_err)
+		}
+		tos_text = string(data)
+	}
+
+	min_pow := env_int("FASTR_MIN_POW", 0)
+	if min_pow < 0 {
+		min_pow = 0
 	}
 
 	return Config {
@@ -124,13 +168,37 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		max_content_length_per_kind = parse_kind_limits("FASTR_MAX_CONTENT_LENGTH_PER_KIND", allocator),
 		pubkey                      = pubkey,
 		icon                        = icon,
+		banner                      = banner,
+		tos_url                     = tos_url,
+		tos_text                    = tos_text,
+		min_pow_difficulty          = min_pow,
 	}
 }
 
-// Default icon URL: the relay serves its embedded icon at /icon.png, so
-// derive the HTTP URL from the relay's WebSocket URL (ws -> http, wss -> https).
+// Default terms-of-service text served at /tos.txt when FASTR_TOS_FILE is unset.
+DEFAULT_TOS :: `fastr relay - Terms of Service
+
+Do whatever you want. Seriously.
+
+This relay is provided as-is, with no warranty of any kind. We are not
+responsible for what you publish, fetch, or do with it - that's on you, and
+whatever laws apply to you.
+
+That said: this is our relay, and we reserve the right to remove any content we
+consider immoral, illegal, or otherwise unwelcome, and to block any pubkey, at
+our sole discretion and without notice.
+
+Don't like it? Run your own relay. It's free software and it goes brrr.`
+
+// Default URL for an asset the relay serves itself (e.g. "/icon.png",
+// "/banner.png", "/tos.txt"): derive the HTTP URL from the relay's WebSocket
+// URL (ws -> http, wss -> https). `path` must start with '/'.
 @(private = "file")
-default_icon_url :: proc(relay_url: string, allocator := context.allocator) -> string {
+default_asset_url :: proc(
+	relay_url: string,
+	path: string,
+	allocator := context.allocator,
+) -> string {
 	url := relay_url
 	scheme := "http"
 	switch {
@@ -146,7 +214,7 @@ default_icon_url :: proc(relay_url: string, allocator := context.allocator) -> s
 		url = url[7:]
 	}
 	url = strings.trim_suffix(url, "/")
-	return fmt.aprintf("%s://%s/icon.png", scheme, url, allocator = allocator)
+	return fmt.aprintf("%s://%s%s", scheme, url, path, allocator = allocator)
 }
 
 // Parse FASTR_PUBKEY: either an `npub1...` bech32 string or 64 hex chars.

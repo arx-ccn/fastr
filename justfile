@@ -14,7 +14,9 @@ test:
     odin test nostr
     odin test store
     odin test ws
-    odin test cmd
+    # cmd tests mutate process env (FASTR_*) via os.set_env; serialize them so
+    # parallel load_config() calls don't race on shared environment state.
+    odin test cmd -define:ODIN_TEST_THREADS=1
 
 # Type-check every package
 check:

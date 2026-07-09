@@ -593,6 +593,26 @@ event_id_hash :: proc(ev: ^pack.Event) -> (hash: [32]u8) {
 	return
 }
 
+// NIP-13 proof-of-work difficulty: the number of leading zero BITS in the
+// event id. Counts across the 32-byte id, stopping at the first set bit.
+leading_zero_bits :: proc(id: ^[32]u8) -> int {
+	bits := 0
+	for b in id {
+		if b == 0 {
+			bits += 8
+			continue
+		}
+		// Leading zeros within this byte, then stop.
+		v := b
+		for v & 0x80 == 0 {
+			bits += 1
+			v <<= 1
+		}
+		break
+	}
+	return bits
+}
+
 // Full NIP-01 cryptographic validation.
 // Returns ok, or a reason string suitable for ["OK", id, false, reason].
 // No per-thread parsed-pubkey cache (#97) yet — every validation parses the

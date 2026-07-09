@@ -7,7 +7,7 @@ import "core:testing"
 @(private = "file")
 default_info :: proc() -> (Config, Relay_Info) {
 	cfg := load_config(context.temp_allocator)
-	return cfg, relay_info_from_config(&cfg)
+	return cfg, relay_info_from_config(&cfg, context.temp_allocator)
 }
 
 @(private = "file")
@@ -57,6 +57,12 @@ test_relay_info_limitation_fields :: proc(t: ^testing.T) {
 
 	caul, _ := lim["created_at_upper_limit"].(json.Float)
 	testing.expect_value(t, caul, 172_800)
+	call, has_call := lim["created_at_lower_limit"].(json.Float)
+	testing.expect(t, has_call, "created_at_lower_limit must be present")
+	testing.expect_value(t, call, 0)
+	mpd, has_mpd := lim["min_pow_difficulty"].(json.Float)
+	testing.expect(t, has_mpd, "min_pow_difficulty must be present")
+	testing.expect_value(t, mpd, 0)
 	ar, _ := lim["auth_required"].(json.Boolean)
 	testing.expect_value(t, ar, false)
 	mml, _ := lim["max_message_length"].(json.Float)
@@ -215,4 +221,92 @@ test_config_port_override :: proc(t: ^testing.T) {
 	cfg := load_config(context.temp_allocator)
 	testing.expect_value(t, cfg.listen_port, u16(9000))
 	os.unset_env("FASTR_PORT")
+}
+
+@(test)
+test_relay_info_banner_and_tos :: proc(t: ^testing.T) {
+	// Defaults: both point at the relay's own served assets.
+	cfg, info := default_info()
+	_ = cfg
+	obj := parse_info(t, relay_info_json(&info, context.temp_allocator))
+	banner, has_banner := obj["banner"].(string)
+	testing.expect(t, has_banner, "banner must default to the relay's /banner.png")
+	testing.expect(
+		t,
+		len(banner) >= len("/banner.png") &&
+		banner[len(banner) - len("/banner.png"):] == "/banner.png",
+		"default banner must point at /banner.png",
+	)
+	tos, has_tos := obj["terms_of_service"].(string)
+	testing.expect(t, has_tos, "terms_of_service must default to the relay's /tos.txt")
+	testing.expect(
+		t,
+		len(tos) >= len("/tos.txt") && tos[len(tos) - len("/tos.txt"):] == "/tos.txt",
+		"default terms_of_service must point at /tos.txt",
+	)
+
+	// Explicit empty env omits the fields.
+	os.set_env("FASTR_BANNER", "")
+	os.set_env("FASTR_TOS_URL", "")
+	cfg2, info2 := default_info()
+	_ = cfg2
+	obj2 := parse_info(t, relay_info_json(&info2, context.temp_allocator))
+	_, has_banner2 := obj2["banner"]
+	testing.expect(t, !has_banner2, "banner must be absent when FASTR_BANNER is empty")
+	_, has_tos2 := obj2["terms_of_service"]
+	testing.expect(t, !has_tos2, "terms_of_service must be absent when FASTR_TOS_URL is empty")
+	os.unset_env("FASTR_BANNER")
+	os.unset_env("FASTR_TOS_URL")
+}
+
+@(test)
+test_relay_info_min_pow :: proc(t: ^testing.T) {
+	// Default: no PoW floor, NIP-13 not advertised.
+	cfg, info := default_info()
+	_ = cfg
+	obj := parse_info(t, relay_info_json(&info, context.temp_allocator))
+	testing.expect(t, !has_nip(obj, 13), "NIP-13 must not be advertised at floor 0")
+
+	// With a floor: min_pow_difficulty reported and NIP-13 advertised.
+	os.set_env("FASTR_MIN_POW", "16")
+	cfg2, info2 := default_info()
+	testing.expect_value(t, cfg2.min_pow_difficulty, 16)
+	obj2 := parse_info(t, relay_info_json(&info2, context.temp_allocator))
+	lim, _ := obj2["limitation"].(json.Object)
+	mpd, _ := lim["min_pow_difficulty"].(json.Float)
+	testing.expect_value(t, int(mpd), 16)
+	testing.expect(t, has_nip(obj2, 13), "NIP-13 must be advertised when a floor is enforced")
+	os.unset_env("FASTR_MIN_POW")
+}
+
+@(private = "file")
+has_nip :: proc(obj: json.Object, nip: f64) -> bool {
+	nips, ok := obj["supported_nips"].(json.Array)
+	if !ok {
+		return false
+	}
+	for n in nips {
+		if f, is_f := n.(json.Float); is_f && f == nip {
+			return true
+		}
+	}
+	return false
+}
+
+@(test)
+test_tos_response_serves_text :: proc(t: ^testing.T) {
+	resp := tos_response(DEFAULT_TOS, context.temp_allocator)
+	testing.expect(t, len(resp) > len(DEFAULT_TOS), "response must have headers before the body")
+	testing.expect(
+		t,
+		resp[len(resp) - len(DEFAULT_TOS):] == DEFAULT_TOS,
+		"body must be the ToS text verbatim",
+	)
+}
+
+@(test)
+test_banner_response_serves_png :: proc(t: ^testing.T) {
+	png: []u8 = BANNER_PNG
+	testing.expect(t, len(png) > 8, "embedded banner must not be empty")
+	testing.expect_value(t, string(png[:4]), "\x89PNG")
 }

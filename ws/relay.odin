@@ -20,6 +20,9 @@ Relay_Config :: struct {
 	max_content_length:          int,
 	max_content_length_per_kind: map[u16]int,
 	relay_url:                   string,
+	// NIP-13: minimum proof-of-work difficulty (leading zero bits) required
+	// on incoming event ids. 0 = disabled (no PoW required).
+	min_pow_difficulty:          int,
 }
 
 // Effective max content length for a given event kind.

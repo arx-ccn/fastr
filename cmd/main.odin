@@ -44,6 +44,8 @@ Conn_Ctx :: struct {
 	nip11:   string, // pre-rendered NIP-11 HTTP response
 	index:   string, // pre-rendered index page HTTP response
 	icon:    string, // pre-rendered /icon.png HTTP response (binary body)
+	banner:  string, // pre-rendered /banner.png HTTP response (binary body)
+	tos:     string, // pre-rendered /tos.txt HTTP response
 }
 
 @(private = "file")
@@ -89,6 +91,7 @@ serve :: proc() {
 		max_content_length          = cfg.max_content_length,
 		max_content_length_per_kind = cfg.max_content_length_per_kind,
 		relay_url                   = cfg.relay_url,
+		min_pow_difficulty          = cfg.min_pow_difficulty,
 	}
 
 	// Pre-render the cold-path HTTP responses once.
@@ -96,6 +99,8 @@ serve :: proc() {
 	nip11_resp := relay_info_response(relay_info_json(&info))
 	index_resp := index_page_response(INDEX_PAGE_HTML)
 	icon_resp := icon_response()
+	banner_resp := banner_response()
+	tos_resp := tos_response(cfg.tos_text)
 
 	// Background compaction: periodically rewrite store files omitting
 	// tombstoned/expired entries.
@@ -146,6 +151,8 @@ serve :: proc() {
 		ctx.nip11 = nip11_resp
 		ctx.index = index_resp
 		ctx.icon = icon_resp
+		ctx.banner = banner_resp
+		ctx.tos = tos_resp
 		thread.create_and_start_with_poly_data(ctx, conn_entry, self_cleanup = true)
 	}
 }
@@ -241,6 +248,14 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 	if !ws.is_websocket_upgrade(&req) {
 		if req.path == "/icon.png" {
 			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.icon)
+			return
+		}
+		if req.path == "/banner.png" {
+			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.banner)
+			return
+		}
+		if req.path == "/tos.txt" {
+			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.tos)
 			return
 		}
 		// Plain browser visit / probe.

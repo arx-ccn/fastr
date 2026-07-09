@@ -163,6 +163,34 @@ test_extract_id_negative_cases :: proc(t: ^testing.T) {
 	}
 }
 
+// --- NIP-13 proof-of-work ---
+
+@(test)
+test_leading_zero_bits :: proc(t: ^testing.T) {
+	id: [32]u8
+	testing.expect_value(t, leading_zero_bits(&id), 256) // all zero
+
+	id = {}
+	id[0] = 0x80 // 1000_0000 -> 0 leading zeros
+	testing.expect_value(t, leading_zero_bits(&id), 0)
+
+	id = {}
+	id[0] = 0x01 // 0000_0001 -> 7 leading zeros
+	testing.expect_value(t, leading_zero_bits(&id), 7)
+
+	id = {}
+	id[0] = 0x0F // 0000_1111 -> 4 leading zeros
+	testing.expect_value(t, leading_zero_bits(&id), 4)
+
+	id = {}
+	id[1] = 0x20 // byte0 all zero (8) + 0010_0000 -> 2 => 10
+	testing.expect_value(t, leading_zero_bits(&id), 10)
+
+	id = {}
+	id[2] = 0xFF // 16 zero bits then a set bit
+	testing.expect_value(t, leading_zero_bits(&id), 16)
+}
+
 // --- validate_event ---
 
 @(test)

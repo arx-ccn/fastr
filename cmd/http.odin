@@ -24,6 +24,10 @@ Limitation :: struct {
 	default_limit:          int,
 	// NIP-01 / NIP-17 window: 48 hours in seconds.
 	created_at_upper_limit: i64,
+	// Oldest accepted created_at. The relay only rejects negatives, so 0.
+	created_at_lower_limit: i64,
+	// NIP-13 minimum proof-of-work difficulty (leading zero bits). 0 = none.
+	min_pow_difficulty:     int,
 	auth_required:          bool,
 }
 
@@ -33,22 +37,38 @@ Relay_Info :: struct {
 	pubkey:         string, // "" = absent
 	contact:        string, // "" = absent
 	icon:           string, // "" = absent
+	banner:         string, // "" = absent
+	tos:            string, // terms_of_service URL; "" = absent
 	supported_nips: []u16,
 	software:       string,
 	version:        string,
 	limitation:     Limitation,
 }
 
-SUPPORTED_NIPS := [?]u16{1, 9, 11, 17, 40, 42, 45, 62, 70, 77}
+// NIPs always implemented. NIP-13 (11 -> position) is added conditionally when
+// a proof-of-work floor is enforced; see relay_info_from_config.
+BASE_NIPS := [?]u16{1, 9, 11, 17, 40, 42, 45, 62, 70, 77}
 
-relay_info_from_config :: proc(cfg: ^Config) -> Relay_Info {
+relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> Relay_Info {
+	// Advertise NIP-13 only when we actually enforce a PoW floor.
+	nips: []u16 = BASE_NIPS[:]
+	if cfg.min_pow_difficulty > 0 {
+		merged := make([]u16, len(BASE_NIPS) + 1, allocator)
+		// BASE_NIPS is sorted; 13 belongs between 11 and 17 (index 3).
+		copy(merged[:3], BASE_NIPS[:3])
+		merged[3] = 13
+		copy(merged[4:], BASE_NIPS[3:])
+		nips = merged
+	}
 	return Relay_Info {
 		name = "fastr",
 		description = "A high-performance Nostr relay",
 		pubkey = cfg.pubkey,
 		contact = "",
 		icon = cfg.icon,
-		supported_nips = SUPPORTED_NIPS[:],
+		banner = cfg.banner,
+		tos = cfg.tos_url,
+		supported_nips = nips,
 		software = "https://github.com/arx-ccn/fastr",
 		version = VERSION,
 		limitation = Limitation {
@@ -63,6 +83,8 @@ relay_info_from_config :: proc(cfg: ^Config) -> Relay_Info {
 			// max_limit (see ws handler clamp_filter), so default_limit == max_limit.
 			default_limit = cfg.max_limit,
 			created_at_upper_limit = nostr.CREATED_AT_WINDOW,
+			created_at_lower_limit = 0,
+			min_pow_difficulty = cfg.min_pow_difficulty,
 			auth_required = false,
 		},
 	}
@@ -115,6 +137,14 @@ relay_info_json :: proc(info: ^Relay_Info, allocator := context.allocator) -> st
 		strings.write_string(&b, `,"icon":`)
 		write_json_string(&b, info.icon)
 	}
+	if info.banner != "" {
+		strings.write_string(&b, `,"banner":`)
+		write_json_string(&b, info.banner)
+	}
+	if info.tos != "" {
+		strings.write_string(&b, `,"terms_of_service":`)
+		write_json_string(&b, info.tos)
+	}
 	strings.write_string(&b, `,"supported_nips":[`)
 	for nip, i in info.supported_nips {
 		if i > 0 {
@@ -132,7 +162,7 @@ relay_info_json :: proc(info: ^Relay_Info, allocator := context.allocator) -> st
 		`,"limitation":{{"max_message_length":%d,"max_subscriptions":%d,` +
 		`"max_filters":%d,"max_limit":%d,"max_subid_length":%d,"max_event_tags":%d,` +
 		`"max_content_length":%d,"default_limit":%d,"created_at_upper_limit":%d,` +
-		`"auth_required":%v}}`,
+		`"created_at_lower_limit":%d,"min_pow_difficulty":%d,"auth_required":%v}}`,
 		lim.max_message_length,
 		lim.max_subscriptions,
 		lim.max_filters,
@@ -142,6 +172,8 @@ relay_info_json :: proc(info: ^Relay_Info, allocator := context.allocator) -> st
 		lim.max_content_length,
 		lim.default_limit,
 		lim.created_at_upper_limit,
+		lim.created_at_lower_limit,
+		lim.min_pow_difficulty,
 		lim.auth_required,
 	)
 	strings.write_byte(&b, '}')
@@ -246,6 +278,44 @@ icon_response :: proc(allocator := context.allocator) -> string {
 	)
 	strings.write_bytes(&b, ICON_PNG)
 	return strings.to_string(b)
+}
+
+// Embedded default relay banner, served at /banner.png.
+BANNER_PNG :: #load("banner.png")
+
+// Build a complete HTTP/1.1 200 response with the embedded PNG banner.
+banner_response :: proc(allocator := context.allocator) -> string {
+	b := strings.builder_make(allocator)
+	fmt.sbprintf(
+		&b,
+		"HTTP/1.1 200 OK\r\n" +
+		"Content-Type: image/png\r\n" +
+		"Content-Length: %d\r\n" +
+		"Access-Control-Allow-Origin: *\r\n" +
+		"Cache-Control: public, max-age=86400\r\n" +
+		"Connection: close\r\n" +
+		"\r\n",
+		len(BANNER_PNG),
+	)
+	strings.write_bytes(&b, BANNER_PNG)
+	return strings.to_string(b)
+}
+
+// Build a complete HTTP/1.1 200 response with the terms-of-service text.
+tos_response :: proc(body: string, allocator := context.allocator) -> string {
+	return fmt.aprintf(
+		"HTTP/1.1 200 OK\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"Content-Length: %d\r\n" +
+		"Access-Control-Allow-Origin: *\r\n" +
+		"Cache-Control: public, max-age=86400\r\n" +
+		"Connection: close\r\n" +
+		"\r\n" +
+		"%s",
+		len(body),
+		body,
+		allocator = allocator,
+	)
 }
 
 // Build a complete HTTP/1.1 200 response with the NIP-11 JSON body and CORS headers.
