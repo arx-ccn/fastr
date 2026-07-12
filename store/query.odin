@@ -5,6 +5,7 @@ package store
 import pq "core:container/priority_queue"
 import "core:encoding/endian"
 import "core:slice"
+import "core:strings"
 import "core:sync"
 
 import "../nostr"
@@ -125,6 +126,9 @@ event_matches_filter :: proc(f: ^nostr.Filter, ev: ^pack.Event) -> bool {
 	if until, ok := f.until.?; ok && ev.created_at > until {
 		return false
 	}
+	if search, ok := f.search.?; ok && !strings.contains(ev.content, search) {
+		return false
+	}
 	for ch, values in f.tags {
 		matched := false
 		for tag in ev.tags {
@@ -230,6 +234,7 @@ query_authed :: proc(
 	fids, has_ids := filter.ids.?
 	fsince, has_since := filter.since.?
 	funtil, has_until := filter.until.?
+	fsearch, has_search := filter.search.?
 
 	// Resolved-ids fast path: when every requested id is full-length, the
 	// known_ids map pins each present id to its index slot and the scan
@@ -428,15 +433,23 @@ query_authed :: proc(
 			}
 		}
 
-		// 13. NIP-70: protected events only served to the author. Checked
-		//     BEFORE the heap push so a protected event cannot evict a
-		//     serveable one from the top-N.
-		if !pk_in(auth_pks, pubkey^) {
+		// 13. Blob-level checks — the only rejections that must read the data
+		//     file, so they run after every index-only rejection and BEFORE
+		//     the heap push (a rejected event must not evict a serveable one
+		//     from the top-N).
+		//     - NIP-50: content substring match.
+		//     - NIP-70: protected events only served to the author.
+		authed := pk_in(auth_pks, pubkey^)
+		if has_search || !authed {
 			start, end, bok := blob_bounds(idx, i, total, len(data), offset)
 			if !bok {
 				return .Io
 			}
-			if pack.dp_has_protected_tag(data[start:end]) {
+			dp := data[start:end]
+			if has_search && !pack.dp_content_contains(dp, fsearch) {
+				continue
+			}
+			if !authed && pack.dp_has_protected_tag(dp) {
 				continue
 			}
 		}
@@ -504,9 +517,10 @@ count_authors :: proc(s: ^Store, filter: ^nostr.Filter, auth_pks: [][32]u8, now:
 	_, has_until := filter.until.?
 	has_time := has_since || has_until
 	_, has_ids := filter.ids.?
+	_, has_search := filter.search.?
 	needs_nip17 := filter_may_match_giftwrap(filter)
 
-	if has_tags || has_time || has_ids || needs_nip17 {
+	if has_tags || has_time || has_ids || has_search || needs_nip17 {
 		one := []nostr.Filter{filter^}
 		return scan_count_at(s, one, auth_pks, now)
 	}
@@ -722,7 +736,12 @@ iter_negentropy :: proc(
 	defer slice_release(idx_g)
 	tags_g := mapped_file_slice(&s.tags)
 	defer slice_release(tags_g)
+	data_g := mapped_file_slice(&s.data)
+	defer slice_release(data_g)
 	idx := idx_g.data
+	data := data_g.data
+
+	fsearch, has_search := filter.search.?
 
 	// NIP-17 gate, same shape as query_authed.
 	nip17_skip_all := len(auth_pks) == 0
@@ -783,6 +802,16 @@ iter_negentropy :: proc(
 					}
 				}
 				if miss {
+					continue
+				}
+			}
+			// NIP-50: content substring check — the only blob-level filter.
+			if has_search {
+				start, end, bok := blob_bounds(idx, i, total, len(data), entry.offset)
+				if !bok {
+					return .Io, ""
+				}
+				if !pack.dp_content_contains(data[start:end], fsearch) {
 					continue
 				}
 			}

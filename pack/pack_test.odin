@@ -665,3 +665,45 @@ test_json_based_json_roundtrip :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, transcode(t, &e, "s1"), expected)
 }
+
+// --- dp_content_contains (NIP-50) ---
+
+@(test)
+test_dp_content_contains_match :: proc(t: ^testing.T) {
+	e := make_ev(0, 1, []Tag{{fields = []string{"e", HEX64}}}, "hello nostr world")
+	dp := pack_blob(t, &e)
+	testing.expect(t, dp_content_contains(dp, "nostr"))
+	testing.expect(t, dp_content_contains(dp, "hello nostr world"))
+	testing.expect(t, dp_content_contains(dp, ""), "empty needle matches everything")
+	testing.expect(t, !dp_content_contains(dp, "Nostr"), "match is case-sensitive")
+	testing.expect(t, !dp_content_contains(dp, "worlds"))
+	testing.expect(t, !dp_content_contains(dp, HEX64), "tag values are not searched")
+}
+
+@(test)
+test_dp_content_contains_hexed_content :: proc(t: ^testing.T) {
+	// Pure-hex content (>= 8 chars, even length) is stored hex-compressed;
+	// the search must still match the original hex text.
+	e := make_ev(0, 1, nil, "deadbeefcafe1234")
+	dp := pack_blob(t, &e)
+	testing.expect(t, dp_content_contains(dp, "beefcafe"))
+	testing.expect(t, dp_content_contains(dp, "deadbeefcafe1234"))
+	testing.expect(t, !dp_content_contains(dp, "beefcaff"))
+}
+
+@(test)
+test_dp_content_contains_serialize_fast_path :: proc(t: ^testing.T) {
+	e := make_ev(0, 1, nil, "deadbeefcafe1234")
+	buf := make([dynamic]u8, context.temp_allocator)
+	testing.expect_value(t, serialize_fast(&e, &buf), Error.None)
+	testing.expect(t, dp_content_contains(buf[:], "beefcafe"))
+}
+
+@(test)
+test_dp_content_contains_truncated_blob :: proc(t: ^testing.T) {
+	e := make_ev(0, 1, []Tag{{fields = []string{"e", HEX64}}}, "hello")
+	dp := pack_blob(t, &e)
+	for n in 0 ..< len(dp) {
+		testing.expect(t, !dp_content_contains(dp[:n], "hello"))
+	}
+}

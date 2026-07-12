@@ -6,6 +6,7 @@ import "core:slice"
 import "core:testing"
 
 import "../nostr"
+import "../pack"
 
 @(test)
 test_append_and_query_one :: proc(t: ^testing.T) {
@@ -901,4 +902,95 @@ test_query_ids_fast_path_after_compact :: proc(t: ^testing.T) {
 	c := test_query_collect(t, s, &f)
 	testing.expect_value(t, len(c.ids), 1)
 	testing.expect_value(t, c.ids[0], ids[701])
+}
+
+// --- NIP-50 search ---
+
+@(test)
+test_query_search_filter :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	// test_make_event content is "k=<kind> t=<created_at>".
+	evs: [3]pack.Event
+	for i in 0 ..< u8(3) {
+		evs[i] = test_make_event(i + 1, 1, 100 + i64(i), nil)
+		test_append_ok(t, s, &evs[i])
+	}
+
+	f: nostr.Filter
+	f.search = "t=101"
+	c := test_query_collect(t, s, &f)
+	testing.expect_value(t, len(c.ids), 1)
+	testing.expect_value(t, c.ids[0], evs[1].id)
+
+	f2: nostr.Filter
+	f2.search = "t=10"
+	testing.expect_value(t, test_query_count(t, s, &f2), 3)
+
+	f3: nostr.Filter
+	f3.search = "t=999"
+	testing.expect_value(t, test_query_count(t, s, &f3), 0)
+}
+
+@(test)
+test_query_search_with_kinds_and_limit :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	for i in 0 ..< u8(4) {
+		kind := u16(1) if i % 2 == 0 else u16(2)
+		ev := test_make_event(i + 1, kind, 100 + i64(i), nil)
+		test_append_ok(t, s, &ev)
+	}
+	f := test_kind_filter(1)
+	f.search = "k=1"
+	f.limit = 1
+	c := test_query_collect(t, s, &f)
+	testing.expect_value(t, len(c.ids), 1)
+	// Newest matching event wins the top-N cut.
+	testing.expect_value(t, c.cas[0], i64(102))
+}
+
+@(test)
+test_query_search_hexed_content :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	// Pure-hex content is stored hex-compressed on disk; search must still
+	// match the original hex text.
+	ev := test_make_event(1, 1, 100, nil)
+	ev.content = "deadbeefcafe1234"
+	test_append_ok(t, s, &ev)
+
+	f: nostr.Filter
+	f.search = "beefcafe"
+	testing.expect_value(t, test_query_count(t, s, &f), 1)
+
+	f2: nostr.Filter
+	f2.search = "beefcaff"
+	testing.expect_value(t, test_query_count(t, s, &f2), 0)
+}
+
+@(test)
+test_count_search_filter :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	for i in 0 ..< u8(3) {
+		ev := test_make_event(i + 1, 1, 100 + i64(i), nil)
+		test_append_ok(t, s, &ev)
+	}
+	// search must force the exact scan, not the in-memory counters.
+	f: nostr.Filter
+	f.search = "t=101"
+	testing.expect_value(t, store_count(s, &f), 1)
+
+	f2 := test_kind_filter(1)
+	f2.search = "t=999"
+	testing.expect_value(t, store_count(s, &f2), 0)
 }

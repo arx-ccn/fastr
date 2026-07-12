@@ -319,6 +319,12 @@ parse_filter :: proc(
 				return f, "invalid: limit not a non-negative integer", false
 			}
 			f.limit = int(n)
+		case "search":
+			s, s_ok := value.(json.String)
+			if !s_ok {
+				return f, "invalid: search not a string", false
+			}
+			f.search = strings.clone(s, allocator)
 		case:
 			if len(key) == 2 && key[0] == '#' {
 				ch := key[1]
@@ -792,6 +798,12 @@ single_filter_matches :: proc(f: ^Filter, ev: ^pack.Event) -> bool {
 	}
 	if until, present := f.until.?; present {
 		if ev.created_at > until {
+			return false
+		}
+	}
+	if search, present := f.search.?; present {
+		// NIP-50 (basic): case-sensitive literal substring of content.
+		if !strings.contains(ev.content, search) {
 			return false
 		}
 	}

@@ -45,6 +45,9 @@ filter_clone :: proc(f: ^Filter, allocator := context.allocator) -> (out: Filter
 	out.since = f.since
 	out.until = f.until
 	out.limit = f.limit
+	if search, present := f.search.?; present {
+		out.search = clone_string(search, allocator)
+	}
 	if f.tags != nil {
 		out.tags = make(map[u8]Tag_Value_Set, allocator)
 		for ch, values in f.tags {
@@ -76,6 +79,9 @@ filter_destroy :: proc(f: ^Filter, allocator := context.allocator) {
 	if kinds, present := f.kinds.?; present {
 		delete(kinds)
 	}
+	if search, present := f.search.?; present {
+		delete(search, allocator)
+	}
 	if f.tags != nil {
 		for _, values in f.tags {
 			for v in values {
@@ -98,6 +104,8 @@ Filter :: struct {
 	since:   Maybe(i64),
 	until:   Maybe(i64),
 	limit:   Maybe(int),
+	// NIP-50: case-sensitive literal substring match against event content.
+	search:  Maybe(string),
 	// key = tag name char ('e', 'p', …), value = set of expected values.
 	// Hash set (not array) so per-event membership checks on the fanout hot
 	// path are O(1); see issue #94.

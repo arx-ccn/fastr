@@ -47,7 +47,7 @@ Relay_Info :: struct {
 
 // NIPs always implemented. NIP-13 (11 -> position) is added conditionally when
 // a proof-of-work floor is enforced; see relay_info_from_config.
-BASE_NIPS := [?]u16{1, 9, 11, 17, 40, 42, 45, 62, 70, 77}
+BASE_NIPS := [?]u16{1, 9, 11, 17, 40, 42, 45, 50, 62, 70, 77}
 
 relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> Relay_Info {
 	// Advertise NIP-13 only when we actually enforce a PoW floor.

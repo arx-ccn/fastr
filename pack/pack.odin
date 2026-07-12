@@ -315,6 +315,47 @@ dp_has_protected_tag :: proc(dp: []u8) -> bool {
 	return false
 }
 
+// Fast scan of a packed event blob for a NIP-50 content substring match.
+//
+// Skips the fixed header and the whole tag section, then searches the content
+// field's bytes for `needle` (case-sensitive, literal). Hex-compressed content
+// is re-encoded into the temp allocator first so the needle matches the
+// original hex text. Returns `false` for any malformed or truncated input —
+// a parser error must not surface an event the client didn't ask for.
+//
+// This avoids the allocations of `deserialize_trusted` on the hot REQ path.
+dp_content_contains :: proc(dp: []u8, needle: string) -> bool {
+	if len(dp) < FIXED_LEN {
+		return false
+	}
+	pos := FIXED_LEN
+	tdl, tc, verr := varint_decode(dp[pos:])
+	if verr != .None {
+		return false
+	}
+	pos += tc
+	if tdl > u64(len(dp) - pos) {
+		return false
+	}
+	pos += int(tdl)
+
+	length, hexed, fc, lerr := read_len_flag(dp[pos:])
+	if lerr != .None {
+		return false
+	}
+	pos += fc
+	if length < 0 || length > len(dp) - pos {
+		return false
+	}
+	content := dp[pos:pos + length]
+	if hexed {
+		out := make([]u8, length * 2, context.temp_allocator)
+		hex_encode(content, out)
+		return strings.contains(string(out), needle)
+	}
+	return strings.contains(string(content), needle)
+}
+
 // JSON string escaping + BASED -> JSON transcoder
 
 // Write `s` as a JSON string (with surrounding quotes) into `buf` for

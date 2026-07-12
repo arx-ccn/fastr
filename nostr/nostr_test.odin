@@ -612,3 +612,45 @@ test_event_expiry_and_p_tag :: proc(t: ^testing.T) {
 	other: [32]u8
 	testing.expect(t, !event_has_p_tag(&ev, &other))
 }
+
+// --- NIP-50 search ---
+
+@(test)
+test_parse_filter_search :: proc(t: ^testing.T) {
+	msg, _, ok := parse_client_msg(`["REQ","s",{"search":"purple ostrich"}]`, 256, context.temp_allocator)
+	testing.expect(t, ok)
+	req := msg.(Msg_Req)
+	search, present := req.filters[0].search.?
+	testing.expect(t, present, "search must be Some")
+	testing.expect_value(t, search, "purple ostrich")
+
+	_, reason, bad := parse_client_msg(`["REQ","s",{"search":5}]`, 256, context.temp_allocator)
+	testing.expect(t, !bad)
+	testing.expect(t, strings.contains(reason, "search"))
+}
+
+@(test)
+test_filter_clone_search :: proc(t: ^testing.T) {
+	f: Filter
+	f.search = "needle"
+	c := filter_clone(&f, context.allocator)
+	defer filter_destroy(&c, context.allocator)
+	search, present := c.search.?
+	testing.expect(t, present, "cloned search must be Some")
+	testing.expect_value(t, search, "needle")
+}
+
+@(test)
+test_live_filter_search :: proc(t: ^testing.T) {
+	ev := make_golden_event() // content "hello"
+	f: Filter
+	f.search = "ell"
+	filters := [?]Filter{f}
+	testing.expect(t, filter_matches(filters[:], &ev))
+	filters[0].search = "Hello" // case-sensitive
+	testing.expect(t, !filter_matches(filters[:], &ev))
+	filters[0].search = "hellos"
+	testing.expect(t, !filter_matches(filters[:], &ev))
+	filters[0].search = "" // empty needle imposes no constraint
+	testing.expect(t, filter_matches(filters[:], &ev))
+}

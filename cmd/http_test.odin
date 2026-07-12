@@ -35,7 +35,7 @@ test_relay_info_supported_nips :: proc(t: ^testing.T) {
 	obj := parse_info(t, relay_info_json(&info, context.temp_allocator))
 	nips, ok := obj["supported_nips"].(json.Array)
 	testing.expect(t, ok, "supported_nips must be an array")
-	want := [?]f64{1, 11, 45, 62, 70, 77}
+	want := [?]f64{1, 11, 45, 50, 62, 70, 77}
 	for w in want {
 		seen := false
 		for n in nips {
