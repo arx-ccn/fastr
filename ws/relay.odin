@@ -33,10 +33,23 @@ relay_content_limit_for_kind :: proc(cfg: ^Relay_Config, kind: u16) -> int {
 	return cfg.max_content_length
 }
 
+// Pre-store policy veto: return ok=false with a NIP-01 machine-readable
+// reason ("blocked: ...") to reject the event before storage.
+Ingest_Hook :: #type proc(user: rawptr, ev: ^pack.Event) -> (reason: string, ok: bool)
+
+// Post-store side effects (e.g. GRASP repo provisioning). Called after a
+// successful (non-duplicate) append.
+Post_Store_Hook :: #type proc(user: rawptr, ev: ^pack.Event)
+
 Relay :: struct {
-	store:  ^store.Store,
-	cfg:    Relay_Config,
-	fanout: Fanout,
+	store:           ^store.Store,
+	cfg:             Relay_Config,
+	fanout:          Fanout,
+	// Optional policy hooks, wired by package main. Keeps ws free of
+	// feature-layer imports (GRASP etc.).
+	ingest_hook:     Ingest_Hook,
+	post_store_hook: Post_Store_Hook,
+	hook_user:       rawptr,
 }
 
 // Maximum number of pubkeys a single connection can authenticate as.

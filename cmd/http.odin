@@ -6,6 +6,7 @@
 package main
 
 import "core:fmt"
+import "core:slice"
 import "core:strings"
 
 import "../nostr"
@@ -32,17 +33,20 @@ Limitation :: struct {
 }
 
 Relay_Info :: struct {
-	name:           string,
-	description:    string,
-	pubkey:         string, // "" = absent
-	contact:        string, // "" = absent
-	icon:           string, // "" = absent
-	banner:         string, // "" = absent
-	tos:            string, // terms_of_service URL; "" = absent
-	supported_nips: []u16,
-	software:       string,
-	version:        string,
-	limitation:     Limitation,
+	name:                     string,
+	description:              string,
+	pubkey:                   string, // "" = absent
+	contact:                  string, // "" = absent
+	icon:                     string, // "" = absent
+	banner:                   string, // "" = absent
+	tos:                      string, // terms_of_service URL; "" = absent
+	supported_nips:           []u16,
+	// GRASP-01: e.g. ["GRASP-01"]. Empty = grasp disabled, fields omitted.
+	supported_grasps:         []string,
+	repo_acceptance_criteria: string,
+	software:                 string,
+	version:                  string,
+	limitation:               Limitation,
 }
 
 // NIPs always implemented. NIP-13 (11 -> position) is added conditionally when
@@ -50,15 +54,26 @@ Relay_Info :: struct {
 BASE_NIPS := [?]u16{1, 9, 11, 17, 40, 42, 45, 50, 62, 70, 77}
 
 relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> Relay_Info {
-	// Advertise NIP-13 only when we actually enforce a PoW floor.
-	nips: []u16 = BASE_NIPS[:]
+	// Advertise conditional NIPs: 13 when a PoW floor is enforced, 34 when
+	// GRASP git hosting is on. Keep the list sorted.
+	nips_dyn := make([dynamic]u16, 0, len(BASE_NIPS) + 2, allocator)
+	append(&nips_dyn, ..BASE_NIPS[:])
 	if cfg.min_pow_difficulty > 0 {
-		merged := make([]u16, len(BASE_NIPS) + 1, allocator)
-		// BASE_NIPS is sorted; 13 belongs between 11 and 17 (index 3).
-		copy(merged[:3], BASE_NIPS[:3])
-		merged[3] = 13
-		copy(merged[4:], BASE_NIPS[3:])
-		nips = merged
+		append(&nips_dyn, 13)
+	}
+	if cfg.grasp_enabled {
+		append(&nips_dyn, 34)
+	}
+	slice.sort(nips_dyn[:])
+	nips: []u16 = nips_dyn[:]
+
+	supported_grasps: []string
+	acceptance := ""
+	if cfg.grasp_enabled {
+		grasps := make([]string, 1, allocator)
+		grasps[0] = "GRASP-01"
+		supported_grasps = grasps
+		acceptance = cfg.grasp_acceptance
 	}
 	return Relay_Info {
 		name = "fastr",
@@ -69,6 +84,8 @@ relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> 
 		banner = cfg.banner,
 		tos = cfg.tos_url,
 		supported_nips = nips,
+		supported_grasps = supported_grasps,
+		repo_acceptance_criteria = acceptance,
 		software = "https://github.com/arx-ccn/fastr",
 		version = VERSION,
 		limitation = Limitation {
@@ -152,7 +169,22 @@ relay_info_json :: proc(info: ^Relay_Info, allocator := context.allocator) -> st
 		}
 		strings.write_uint(&b, uint(nip))
 	}
-	strings.write_string(&b, `],"software":`)
+	strings.write_byte(&b, ']')
+	if len(info.supported_grasps) > 0 {
+		strings.write_string(&b, `,"supported_grasps":[`)
+		for g, i in info.supported_grasps {
+			if i > 0 {
+				strings.write_byte(&b, ',')
+			}
+			write_json_string(&b, g)
+		}
+		strings.write_byte(&b, ']')
+		if info.repo_acceptance_criteria != "" {
+			strings.write_string(&b, `,"repo_acceptance_criteria":`)
+			write_json_string(&b, info.repo_acceptance_criteria)
+		}
+	}
+	strings.write_string(&b, `,"software":`)
 	write_json_string(&b, info.software)
 	strings.write_string(&b, `,"version":`)
 	write_json_string(&b, info.version)
@@ -238,6 +270,42 @@ We did it, nostr!
 </body>
 </html>`
 
+// CORS headers required on ALL HTTP responses (GRASP-01): permissive origin,
+// GET/POST methods, and Content-Type so web-based git clients can preflight.
+CORS_HEADERS ::
+	"Access-Control-Allow-Origin: *\r\n" +
+	"Access-Control-Allow-Methods: GET, POST\r\n" +
+	"Access-Control-Allow-Headers: Content-Type\r\n"
+
+// Pre-rendered 204 reply for OPTIONS preflight requests (GRASP-01).
+OPTIONS_RESPONSE ::
+	"HTTP/1.1 204 No Content\r\n" +
+	CORS_HEADERS +
+	"Connection: close\r\n" +
+	"\r\n"
+
+// Pre-rendered 413 reply for request bodies over the configured limit
+// (FASTR_GRASP_MAX_PACK_BYTES for pushes).
+PAYLOAD_TOO_LARGE_RESPONSE ::
+	"HTTP/1.1 413 Content Too Large\r\n" +
+	"Content-Type: text/plain; charset=utf-8\r\n" +
+	"Content-Length: 19\r\n" +
+	CORS_HEADERS +
+	"Connection: close\r\n" +
+	"\r\n" +
+	"payload too large\r\n"
+
+// Pre-rendered 404 reply for unknown resources (e.g. repositories the relay
+// does not host).
+NOT_FOUND_RESPONSE ::
+	"HTTP/1.1 404 Not Found\r\n" +
+	"Content-Type: text/plain; charset=utf-8\r\n" +
+	"Content-Length: 10\r\n" +
+	CORS_HEADERS +
+	"Connection: close\r\n" +
+	"\r\n" +
+	"not found\n"
+
 // Build a complete HTTP/1.1 200 response for the index HTML page.
 //
 // Includes CORS headers so browser-issued OPTIONS preflights (and any other
@@ -247,9 +315,7 @@ index_page_response :: proc(body: string, allocator := context.allocator) -> str
 		"HTTP/1.1 200 OK\r\n" +
 		"Content-Type: text/html; charset=utf-8\r\n" +
 		"Content-Length: %d\r\n" +
-		"Access-Control-Allow-Origin: *\r\n" +
-		"Access-Control-Allow-Headers: *\r\n" +
-		"Access-Control-Allow-Methods: GET, OPTIONS\r\n" +
+		CORS_HEADERS +
 		"Connection: close\r\n" +
 		"\r\n" +
 		"%s",
@@ -270,7 +336,7 @@ icon_response :: proc(allocator := context.allocator) -> string {
 		"HTTP/1.1 200 OK\r\n" +
 		"Content-Type: image/png\r\n" +
 		"Content-Length: %d\r\n" +
-		"Access-Control-Allow-Origin: *\r\n" +
+		CORS_HEADERS +
 		"Cache-Control: public, max-age=86400\r\n" +
 		"Connection: close\r\n" +
 		"\r\n",
@@ -291,7 +357,7 @@ banner_response :: proc(allocator := context.allocator) -> string {
 		"HTTP/1.1 200 OK\r\n" +
 		"Content-Type: image/png\r\n" +
 		"Content-Length: %d\r\n" +
-		"Access-Control-Allow-Origin: *\r\n" +
+		CORS_HEADERS +
 		"Cache-Control: public, max-age=86400\r\n" +
 		"Connection: close\r\n" +
 		"\r\n",
@@ -307,7 +373,7 @@ tos_response :: proc(body: string, allocator := context.allocator) -> string {
 		"HTTP/1.1 200 OK\r\n" +
 		"Content-Type: text/plain; charset=utf-8\r\n" +
 		"Content-Length: %d\r\n" +
-		"Access-Control-Allow-Origin: *\r\n" +
+		CORS_HEADERS +
 		"Cache-Control: public, max-age=86400\r\n" +
 		"Connection: close\r\n" +
 		"\r\n" +
@@ -324,9 +390,7 @@ relay_info_response :: proc(body: string, allocator := context.allocator) -> str
 		"HTTP/1.1 200 OK\r\n" +
 		"Content-Type: application/nostr+json\r\n" +
 		"Content-Length: %d\r\n" +
-		"Access-Control-Allow-Origin: *\r\n" +
-		"Access-Control-Allow-Headers: *\r\n" +
-		"Access-Control-Allow-Methods: GET\r\n" +
+		CORS_HEADERS +
 		"Connection: close\r\n" +
 		"\r\n" +
 		"%s",

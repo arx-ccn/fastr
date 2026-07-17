@@ -13,7 +13,9 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
+import "../grasp"
 import "../nostr"
+import "../pack"
 import secp "../secp256k1"
 import "../store"
 import "../ws"
@@ -46,6 +48,7 @@ Conn_Ctx :: struct {
 	icon:    string, // pre-rendered /icon.png HTTP response (binary body)
 	banner:  string, // pre-rendered /banner.png HTTP response (binary body)
 	tos:     string, // pre-rendered /tos.txt HTTP response
+	grasp:   ^Grasp_Http, // GRASP-01 git smart HTTP routing
 }
 
 @(private = "file")
@@ -120,6 +123,34 @@ serve :: proc() {
 		thread.create_and_start_with_poly_data(stats_ctx, stats_loop, self_cleanup = true)
 	}
 
+	grasp_http := new(Grasp_Http)
+	grasp_http.enabled = cfg.grasp_enabled
+	grasp_http.dir = cfg.grasp_dir
+	grasp_http.max_pack_bytes = cfg.grasp_max_pack_bytes
+	if grasp_http.enabled {
+		gs := new(grasp.State)
+		grasp.state_init(
+			gs,
+			st,
+			cfg.grasp_dir,
+			cfg.grasp_urls,
+			cfg.grasp_acceptance,
+			cfg.grasp_nostr_ref_ttl,
+		)
+		grasp_http.state = gs
+		relay.ingest_hook = grasp_ingest_hook
+		relay.post_store_hook = grasp_post_store_hook
+		relay.hook_user = gs
+
+		// refs/nostr GC: sweep at 1/4 of the TTL (a ref lives at most ~1.25 TTL).
+		gc_ctx := new(Grasp_Gc_Ctx)
+		gc_ctx.state = gs
+		gc_ctx.interval = u64(max(cfg.grasp_nostr_ref_ttl / 4, 30))
+		thread.create_and_start_with_poly_data(gc_ctx, grasp_gc_loop, self_cleanup = true)
+
+		fmt.eprintfln("grasp enabled; serving repos from %s", grasp_http.dir)
+	}
+
 	active := new(int)
 	next_conn_id: u64 = 0
 
@@ -153,7 +184,36 @@ serve :: proc() {
 		ctx.icon = icon_resp
 		ctx.banner = banner_resp
 		ctx.tos = tos_resp
+		ctx.grasp = grasp_http
 		thread.create_and_start_with_poly_data(ctx, conn_entry, self_cleanup = true)
+	}
+}
+
+// ws hook bridges (rawptr -> ^grasp.State).
+@(private = "file")
+grasp_ingest_hook :: proc(user: rawptr, ev: ^pack.Event) -> (reason: string, ok: bool) {
+	return grasp.ingest_check((^grasp.State)(user), ev)
+}
+
+@(private = "file")
+grasp_post_store_hook :: proc(user: rawptr, ev: ^pack.Event) {
+	grasp.post_store((^grasp.State)(user), ev)
+}
+
+@(private = "file")
+Grasp_Gc_Ctx :: struct {
+	state:    ^grasp.State,
+	interval: u64, // seconds between sweeps
+}
+
+@(private = "file")
+grasp_gc_loop :: proc(ctx: ^Grasp_Gc_Ctx) {
+	for {
+		time.sleep(time.Duration(ctx.interval) * time.Second)
+		if n := grasp.gc_nostr_refs(ctx.state); n > 0 {
+			fmt.eprintfln("grasp: deleted %d unclaimed refs/nostr refs", n)
+		}
+		free_all(context.temp_allocator)
 	}
 }
 
@@ -238,6 +298,13 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 		return
 	}
 
+	// GRASP-01: OPTIONS preflight requests get 204 with permissive CORS,
+	// regardless of path.
+	if req.method == "OPTIONS" {
+		_, _ = net.send_tcp(ctx.sock, transmute([]u8)string(OPTIONS_RESPONSE))
+		return
+	}
+
 	if accept, has_accept := ws.header_get(&req, "accept"); has_accept {
 		if strings.contains(accept, "application/nostr+json") {
 			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.nip11)
@@ -246,6 +313,10 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 	}
 
 	if !ws.is_websocket_upgrade(&req) {
+		// GRASP-01 git smart HTTP: /<npub>/<identifier>.git endpoints.
+		if grasp_try_handle(ctx.grasp, ctx.sock, &req, extra) {
+			return
+		}
 		if req.path == "/icon.png" {
 			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.icon)
 			return

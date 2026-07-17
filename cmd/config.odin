@@ -7,6 +7,8 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 
+import "../nostr"
+
 VERSION :: "0.1.0"
 
 Config :: struct {
@@ -66,6 +68,23 @@ Config :: struct {
 	// NIP-13 minimum proof-of-work difficulty (leading zero bits) required on
 	// incoming events. FASTR_MIN_POW. 0 = disabled. Also reported in NIP-11.
 	min_pow_difficulty:          int,
+	// GRASP-01 git hosting. FASTR_GRASP_ENABLED ("1"/"true"). Off by default.
+	grasp_enabled:               bool,
+	// Directory holding the hosted bare repos. FASTR_GRASP_DIR. Default: "./repos".
+	grasp_dir:                   string,
+	// Ceiling on a push body / single inflated git object in bytes.
+	// FASTR_GRASP_MAX_PACK_BYTES. Default: 256 MiB.
+	grasp_max_pack_bytes:        int,
+	// Public base URLs identifying this GRASP service, comma-separated
+	// (e.g. "https://relay.example.com"). FASTR_GRASP_URL. Defaults to the
+	// HTTP form of relay_url. 30617s must list the service under one of
+	// these in both `clone` and `relays` tags.
+	grasp_urls:                  []string,
+	// NIP-11 repo_acceptance_criteria string. FASTR_GRASP_ACCEPTANCE.
+	grasp_acceptance:            string,
+	// Seconds an unclaimed refs/nostr/<event-id> ref survives before GC.
+	// FASTR_GRASP_NOSTR_REF_TTL. Default: 1200 (20 minutes per GRASP-01).
+	grasp_nostr_ref_ttl:         i64,
 }
 
 @(private = "file")
@@ -119,7 +138,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 	if !contact_found {
 		contact = ""
 		if pubkey != "" {
-			if npub, ok := hex_to_npub(pubkey, allocator); ok {
+			if npub, ok := nostr.hex_to_npub(pubkey, allocator); ok {
 				contact = npub
 			} else {
 				contact = pubkey
@@ -166,6 +185,26 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		min_pow = 0
 	}
 
+	grasp_enabled := false
+	if raw, found := os.lookup_env("FASTR_GRASP_ENABLED", context.temp_allocator); found {
+		grasp_enabled = raw == "1" || raw == "true"
+	}
+	grasp_dir, grasp_dir_found := os.lookup_env("FASTR_GRASP_DIR", allocator)
+	if !grasp_dir_found {
+		grasp_dir = "./repos"
+	}
+
+	grasp_urls_raw, grasp_urls_found := os.lookup_env("FASTR_GRASP_URL", allocator)
+	if !grasp_urls_found || strings.trim_space(grasp_urls_raw) == "" {
+		grasp_urls_raw = default_asset_url(relay_url, "", allocator)
+	}
+	grasp_urls := strings.split(grasp_urls_raw, ",", allocator)
+
+	grasp_acceptance, grasp_acceptance_found := os.lookup_env("FASTR_GRASP_ACCEPTANCE", allocator)
+	if !grasp_acceptance_found {
+		grasp_acceptance = "open: any repository announcement listing this service is accepted"
+	}
+
 	return Config {
 		listen_host                 = host,
 		listen_port                 = u16(port),
@@ -191,6 +230,12 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		tos_url                     = tos_url,
 		tos_text                    = tos_text,
 		min_pow_difficulty          = min_pow,
+		grasp_enabled               = grasp_enabled,
+		grasp_dir                   = grasp_dir,
+		grasp_max_pack_bytes        = env_int("FASTR_GRASP_MAX_PACK_BYTES", 256 * 1024 * 1024),
+		grasp_urls                  = grasp_urls,
+		grasp_acceptance            = grasp_acceptance,
+		grasp_nostr_ref_ttl         = i64(env_int("FASTR_GRASP_NOSTR_REF_TTL", 1200)),
 	}
 }
 
@@ -242,7 +287,7 @@ default_asset_url :: proc(
 @(private = "file")
 parse_pubkey :: proc(raw: string, allocator := context.allocator) -> string {
 	if strings.has_prefix(raw, "npub1") {
-		hex, ok := npub_to_hex(raw, allocator)
+		hex, ok := nostr.npub_to_hex(raw, allocator)
 		if !ok {
 			fmt.panicf("FASTR_PUBKEY: invalid npub %q", raw)
 		}
@@ -263,166 +308,6 @@ parse_pubkey :: proc(raw: string, allocator := context.allocator) -> string {
 		}
 	}
 	return strings.to_lower(raw, allocator)
-}
-
-@(private = "file")
-BECH32_CHARSET :: "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-
-@(private = "file")
-bech32_polymod_step :: proc(chk: u32, v: u32) -> u32 {
-	GEN := [5]u32{0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3}
-	b := chk >> 25
-	out := (chk & 0x1ffffff) << 5 ~ v
-	for g, i in GEN {
-		if (b >> uint(i)) & 1 == 1 {
-			out ~= g
-		}
-	}
-	return out
-}
-
-// Encode 64-char hex (a 32-byte pubkey) as a lowercase bech32 `npub1...`
-// string (NIP-19). Returns ok=false on malformed hex input.
-@(private = "file")
-hex_to_npub :: proc(hex: string, allocator := context.allocator) -> (npub: string, ok: bool) {
-	if len(hex) != 64 {
-		return "", false
-	}
-
-	// hex -> 32 bytes.
-	bytes: [32]u8
-	for i in 0 ..< 32 {
-		hi := hex_nibble(hex[i * 2])
-		lo := hex_nibble(hex[i * 2 + 1])
-		if hi < 0 || lo < 0 {
-			return "", false
-		}
-		bytes[i] = u8(hi) << 4 | u8(lo)
-	}
-
-	// 8-bit bytes -> 5-bit groups (32 bytes -> 52 values, last padded).
-	data: [52]u8
-	acc: u32 = 0
-	bits: uint = 0
-	n := 0
-	for b in bytes {
-		acc = acc << 8 | u32(b)
-		bits += 8
-		for bits >= 5 {
-			bits -= 5
-			data[n] = u8(acc >> bits) & 31
-			n += 1
-		}
-	}
-	if bits > 0 {
-		data[n] = u8(acc << (5 - bits)) & 31
-		n += 1
-	}
-
-	// Checksum over expanded hrp, data values, then 6 zero placeholders.
-	hrp := "npub"
-	chk: u32 = 1
-	for i in 0 ..< len(hrp) {
-		chk = bech32_polymod_step(chk, u32(hrp[i]) >> 5)
-	}
-	chk = bech32_polymod_step(chk, 0)
-	for i in 0 ..< len(hrp) {
-		chk = bech32_polymod_step(chk, u32(hrp[i]) & 31)
-	}
-	for i in 0 ..< n {
-		chk = bech32_polymod_step(chk, u32(data[i]))
-	}
-	for _ in 0 ..< 6 {
-		chk = bech32_polymod_step(chk, 0)
-	}
-	chk ~= 1
-
-	charset := BECH32_CHARSET
-	b := strings.builder_make(allocator)
-	strings.write_string(&b, "npub1")
-	for i in 0 ..< n {
-		strings.write_byte(&b, charset[data[i]])
-	}
-	for i in 0 ..< 6 {
-		strings.write_byte(&b, charset[(chk >> uint(5 * (5 - i))) & 31])
-	}
-	return strings.to_string(b), true
-}
-
-// Value of a lowercase/uppercase hex digit, or -1 if not a hex digit.
-@(private = "file")
-hex_nibble :: proc(c: u8) -> int {
-	switch c {
-	case '0' ..= '9':
-		return int(c - '0')
-	case 'a' ..= 'f':
-		return int(c - 'a') + 10
-	case 'A' ..= 'F':
-		return int(c - 'A') + 10
-	}
-	return -1
-}
-
-// Decode a lowercase bech32 `npub1...` string (NIP-19) into 64-char hex.
-@(private = "file")
-npub_to_hex :: proc(npub: string, allocator := context.allocator) -> (hex: string, ok: bool) {
-	// hrp "npub" + "1" + 52 data chars (32 bytes) + 6 checksum chars.
-	if len(npub) != 63 {
-		return "", false
-	}
-	data := npub[5:]
-
-	// Checksum over expanded hrp then data values (BIP-173).
-	chk: u32 = 1
-	hrp := "npub"
-	for i in 0 ..< len(hrp) {
-		chk = bech32_polymod_step(chk, u32(hrp[i]) >> 5)
-	}
-	chk = bech32_polymod_step(chk, 0)
-	for i in 0 ..< len(hrp) {
-		chk = bech32_polymod_step(chk, u32(hrp[i]) & 31)
-	}
-
-	values: [58]u8
-	for i in 0 ..< len(data) {
-		idx := strings.index_byte(BECH32_CHARSET, data[i])
-		if idx < 0 {
-			return "", false
-		}
-		values[i] = u8(idx)
-		chk = bech32_polymod_step(chk, u32(idx))
-	}
-	if chk != 1 {
-		return "", false
-	}
-
-	// Convert the 52 data values (5-bit groups) to 32 bytes, dropping the
-	// 6 checksum values and the 4 zero padding bits.
-	bytes: [32]u8
-	acc: u32 = 0
-	bits: uint = 0
-	n := 0
-	for v in values[:52] {
-		acc = acc << 5 | u32(v)
-		bits += 5
-		for bits >= 8 {
-			bits -= 8
-			if n >= 32 {
-				return "", false
-			}
-			bytes[n] = u8(acc >> bits)
-			n += 1
-		}
-	}
-	if n != 32 || acc & ((1 << bits) - 1) != 0 {
-		return "", false
-	}
-
-	b := strings.builder_make(allocator)
-	for byte_val in bytes {
-		fmt.sbprintf(&b, "%02x", byte_val)
-	}
-	return strings.to_string(b), true
 }
 
 // Return the effective max content length for a given event kind.

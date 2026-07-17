@@ -51,8 +51,7 @@ jobs:
         run: just build
 
       - name: Smoke test
-        run: |
-          FASTR_PORT=18080 FASTR_DATA_DIR=$(mktemp -d) ./fastr &
-          sleep 1
-          odin build smoke -out:fastr-smoke -o:speed
-          FASTR_PORT=18080 ./fastr-smoke
+        run: just smoke
+
+      - name: GRASP smoke test
+        run: just smoke-grasp

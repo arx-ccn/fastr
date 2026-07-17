@@ -12,6 +12,9 @@ test:
     odin test pack
     odin test negentropy
     odin test nostr
+    odin test git
+    odin test githttp
+    odin test grasp
     odin test store
     odin test ws
     # cmd tests mutate process env (FASTR_*) via os.set_env; serialize them so
@@ -24,10 +27,14 @@ check:
     odin check pack -vet -strict-style -no-entry-point
     odin check negentropy -vet -strict-style -no-entry-point
     odin check nostr -vet -strict-style -no-entry-point
+    odin check git -vet -strict-style -no-entry-point
+    odin check githttp -vet -strict-style -no-entry-point
+    odin check grasp -vet -strict-style -no-entry-point
     odin check store -vet -strict-style -no-entry-point
     odin check ws -vet -strict-style -no-entry-point
     odin check cmd
     odin check smoke
+    odin check graspsmoke
     odin check wsq
     odin check genevent
     odin check qbench
@@ -44,7 +51,23 @@ vendor:
         -DCMAKE_BUILD_TYPE=Release
     cmake --build vendor/secp256k1/build -j
 
-# Run the end-to-end smoke test against a relay on $FASTR_PORT (default 8080)
-smoke:
+# Self-contained end-to-end smoke test: spawns a throwaway fastr on
+# $FASTR_SMOKE_PORT (default 18080) with a temp data dir, runs the client
+# against it, and cleans up.
+smoke: build
+    #!/usr/bin/env bash
+    set -euo pipefail
     odin build smoke -out:fastr-smoke -o:speed
-    ./fastr-smoke
+    port="${FASTR_SMOKE_PORT:-18080}"
+    data=$(mktemp -d)
+    FASTR_PORT="$port" FASTR_DATA_DIR="$data" ./fastr &
+    pid=$!
+    trap 'kill "$pid" 2>/dev/null || true; rm -rf "$data"' EXIT
+    sleep 1
+    FASTR_PORT="$port" ./fastr-smoke
+
+# Run the self-contained GRASP-01 end-to-end test (spawns its own fastr;
+# needs the git CLI as a dev dependency)
+smoke-grasp: build
+    odin build graspsmoke -out:fastr-graspsmoke -o:speed
+    ./fastr-graspsmoke ./fastr

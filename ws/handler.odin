@@ -485,6 +485,14 @@ handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 		return
 	}
 
+	// Feature-layer policy veto (e.g. GRASP 30617 acceptance).
+	if cs.relay.ingest_hook != nil {
+		if reason, hook_ok := cs.relay.ingest_hook(cs.relay.hook_user, ev); !hook_ok {
+			send_ok(cs, &id, false, reason)
+			return
+		}
+	}
+
 	kind_class, d_hash := nostr.classify_kind(ev.kind, ev.tags)
 
 	// Ephemeral events skip storage.
@@ -527,6 +535,9 @@ handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 	case .None:
 		if !store.store_is_tombstoned(cs.relay.store, ev.id) {
 			broadcast_event(cs, ev)
+		}
+		if cs.relay.post_store_hook != nil {
+			cs.relay.post_store_hook(cs.relay.hook_user, ev)
 		}
 		send_ok(cs, &id, true, "")
 	case .Duplicate:

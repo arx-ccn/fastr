@@ -48,6 +48,44 @@ test_relay_info_supported_nips :: proc(t: ^testing.T) {
 	}
 }
 
+// GRASP-01: NIP-11 MUST list supported GRASPs and acceptance criteria when
+// git hosting is enabled, and MUST omit them otherwise.
+@(test)
+test_relay_info_supported_grasps :: proc(t: ^testing.T) {
+	// Disabled (default env): fields absent.
+	cfg, info := default_info()
+	_ = cfg
+	obj := parse_info(t, relay_info_json(&info, context.temp_allocator))
+	_, has_grasps := obj["supported_grasps"]
+	testing.expect(t, !has_grasps, "supported_grasps must be omitted when grasp is off")
+
+	// Enabled: GRASP-01 + acceptance criteria + NIP-34 advertised.
+	os.set_env("FASTR_GRASP_ENABLED", "1")
+	defer os.unset_env("FASTR_GRASP_ENABLED")
+	gcfg := load_config(context.temp_allocator)
+	ginfo := relay_info_from_config(&gcfg, context.temp_allocator)
+	gobj := parse_info(t, relay_info_json(&ginfo, context.temp_allocator))
+
+	grasps, gok := gobj["supported_grasps"].(json.Array)
+	testing.expect(t, gok, "supported_grasps must be an array")
+	testing.expect_value(t, len(grasps), 1)
+	first, _ := grasps[0].(string)
+	testing.expect_value(t, first, "GRASP-01")
+
+	criteria, cok := gobj["repo_acceptance_criteria"].(string)
+	testing.expect(t, cok && criteria != "", "repo_acceptance_criteria must be present")
+
+	nips, nok := gobj["supported_nips"].(json.Array)
+	testing.expect(t, nok)
+	seen34 := false
+	for n in nips {
+		if f, is_f := n.(json.Float); is_f && f == 34 {
+			seen34 = true
+		}
+	}
+	testing.expect(t, seen34, "NIP-34 must be advertised when grasp is on")
+}
+
 @(test)
 test_relay_info_limitation_fields :: proc(t: ^testing.T) {
 	cfg, info := default_info()
