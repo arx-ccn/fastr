@@ -159,8 +159,14 @@ encode_frame :: proc(out: []u8, opcode: Opcode, payload: []u8, fin := true) -> [
 
 // encode_close writes a close frame carrying code (+ optional reason,
 // at most MAX_CONTROL_PAYLOAD-2 bytes) into out and returns the slice.
+// CLOSE_NO_STATUS is never sent on the wire (RFC 6455 section 7.4.1);
+// it encodes as a close frame with an empty payload.
 encode_close :: proc(out: []u8, code: u16, reason := "") -> []u8 {
 	assert(len(reason) <= MAX_CONTROL_PAYLOAD - 2)
+	if code == CLOSE_NO_STATUS {
+		n := encode_frame_header(out, .Close, 0)
+		return out[:n]
+	}
 	payload_len := 2 + len(reason)
 	assert(len(out) >= payload_len + MAX_FRAME_HEADER_LEN)
 	n := encode_frame_header(out, .Close, payload_len)
@@ -168,6 +174,16 @@ encode_close :: proc(out: []u8, code: u16, reason := "") -> []u8 {
 	out[n + 1] = u8(code)
 	copy(out[n + 2:], reason)
 	return out[:n + payload_len]
+}
+
+// close_code_valid_on_wire reports whether a close code received from the
+// peer is legal in a close frame (RFC 6455 section 7.4).
+close_code_valid_on_wire :: proc(code: u16) -> bool {
+	switch code {
+	case 1000 ..= 1003, 1007 ..= 1011, 3000 ..= 4999:
+		return true
+	}
+	return false
 }
 
 // Event is what reader_feed yields after consuming input.
@@ -296,6 +312,9 @@ reader_feed :: proc(r: ^Reader, buf: []u8) -> (event: Event, consumed: int, err:
 			r.close_code = CLOSE_NO_STATUS
 			if r.ctrl_len >= 2 {
 				r.close_code = u16(r.ctrl[0]) << 8 | u16(r.ctrl[1])
+				if !close_code_valid_on_wire(r.close_code) {
+					return .None, pos, .Bad_Close_Payload
+				}
 			}
 			return .Close, pos, .None
 		case:

@@ -280,6 +280,22 @@ test_close_frame_empty_and_bad :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_close_frame_reserved_code :: proc(t: ^testing.T) {
+	// Codes reserved by RFC 6455 (e.g. 1005, 999) must not be accepted
+	// from the wire — and must never be echoed back.
+	for code in ([]u16{999, 1004, 1005, 1006, 1015, 2999}) {
+		frames: [dynamic]u8
+		defer delete(frames)
+		push_client_frame(&frames, .Close, []u8{u8(code >> 8), u8(code)})
+		r: Reader
+		reader_init(&r, 1024)
+		defer reader_destroy(&r)
+		_, _, err := reader_feed(&r, frames[:])
+		testing.expect_value(t, err, Error.Bad_Close_Payload)
+	}
+}
+
+@(test)
 test_oversized_message :: proc(t: ^testing.T) {
 	payload := make([]u8, 32)
 	defer delete(payload)
@@ -439,6 +455,11 @@ test_encode_close_frame :: proc(t: ^testing.T) {
 		t,
 		slice.equal(frame, []u8{0x88, 0x09, 0x03, 0xF1, 't', 'o', 'o', ' ', 'b', 'i', 'g'}),
 	)
+
+	// CLOSE_NO_STATUS is reserved on the wire: it must encode as a close
+	// frame with an empty payload, not carry the 1005 bytes.
+	empty := encode_close(buf[:], CLOSE_NO_STATUS)
+	testing.expect(t, slice.equal(empty, []u8{0x88, 0x00}))
 }
 
 @(test)

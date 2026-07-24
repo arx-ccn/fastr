@@ -259,8 +259,8 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 				delete(payload)
 			}
 		case .Close:
-			code := incoming.close_code if incoming.close_code != 0 else CLOSE_NORMAL
-			_ = chan.try_send(cs.outbox.ch, Out_Msg(Out_Close{code = code}))
+			// CLOSE_NO_STATUS echoes as an empty close frame (see encode_close).
+			_ = chan.try_send(cs.outbox.ch, Out_Msg(Out_Close{code = incoming.close_code}))
 			break read
 		case .Pong, .None:
 		}
