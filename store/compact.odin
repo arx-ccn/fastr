@@ -327,9 +327,11 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 		defer slice_release(idx2_g)
 		data2_g := mapped_file_slice(&s.data)
 		defer slice_release(data2_g)
+		tags2_g := mapped_file_slice(&s.tags)
+		defer slice_release(tags2_g)
 		dtags2_g := mapped_file_slice(&s.dtags)
 		defer slice_release(dtags2_g)
-		new_tombstones := load_tombstones(idx2_g.data, data2_g.data, dtags2_g.data, s.allocator)
+		new_tombstones := load_tombstones(idx2_g.data, data2_g.data, tags2_g.data, dtags2_g.data, s.allocator)
 		// Issue #76: rebuild a-tag coordinate tombstones from the compacted
 		// kind-5 events.
 		new_addr_tombs := load_a_tag_coord_tombstones(idx2_g.data, data2_g.data, s.allocator)

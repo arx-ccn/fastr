@@ -39,19 +39,32 @@ extract_k_tag_kinds :: proc(
 	return out
 }
 
+// (kind, pubkey, data offset) of a resolved deletion target. The offset is
+// needed for the NIP-59 gift-wrap recipient check, which resolves the
+// target's p-tag via the tags index.
+Deletion_Target :: struct {
+	kind:   u16,
+	pubkey: [32]u8,
+	offset: u64,
+}
+
 // Core e-tag deletion logic: iterate a kind-5 event's `e` tags and resolve
-// each target via `resolved` (id -> (kind, pubkey) of stored events; a
-// missing key means the target has not been seen -> preemptive tombstone).
+// each target via `resolved` (id -> (kind, pubkey, offset) of stored events;
+// a missing key means the target has not been seen -> preemptive tombstone).
 //
 // Confirmed tombstones require the target pubkey to match the deletion
-// author. `max_preemptive` caps preemptive entries to bound memory growth.
+// author - except for kind-1059 gift wraps (NIP-59), which are signed by a
+// one-time key: those are also confirmed when the deletion author matches
+// the gift wrap's p-tag (recipient), resolved via `tags_buf`.
+// `max_preemptive` caps preemptive entries to bound memory growth.
 // `newly_confirmed` receives the IDs that transitioned to confirmed state.
 //
 // Note: preemptive candidate sets are allocated from context.allocator -
 // callers must run with the store's allocator installed.
 process_e_tag_deletion_core :: proc(
 	k5: ^pack.Event,
-	resolved: map[[32]u8]Kind_Pubkey,
+	resolved: map[[32]u8]Deletion_Target,
+	tags_buf: []u8,
 	tracker: ^Tombstone_Tracker,
 	max_preemptive: int,
 	newly_confirmed: ^[dynamic][32]u8,
@@ -59,6 +72,15 @@ process_e_tag_deletion_core :: proc(
 	// NIP-09 (#67): build the k-tag allow-list once; empty = no restriction.
 	k_kinds := extract_k_tag_kinds(k5)
 	defer delete(k_kinds)
+
+	// NIP-59: offsets of stored events p-tagged to the deletion author,
+	// computed lazily on the first gift-wrap target whose signing key does
+	// not match (the common non-gift-wrap deletion never pays for the scan).
+	recipient_offsets: Offset_Set
+	recipient_offsets_ready := false
+	defer if recipient_offsets_ready {
+		delete(recipient_offsets)
+	}
 
 	for tag in k5.tags {
 		if len(tag.fields) < 2 || tag.fields[0] != "e" {
@@ -81,7 +103,17 @@ process_e_tag_deletion_core :: proc(
 				// NIP-09 (#67): target kind not in the declared set - skip.
 				continue
 			}
-			if kp.pubkey == k5.pubkey && tombstone_insert_confirmed(tracker, id_bytes) {
+			authorised := kp.pubkey == k5.pubkey
+			if !authorised && kp.kind == nostr.KIND_GIFT_WRAP {
+				// NIP-59: the recipient (p-tag) may delete a gift wrap even
+				// though it was signed by a random one-time key.
+				if !recipient_offsets_ready {
+					recipient_offsets = matching_offsets(tags_buf, 'p', k5.pubkey[:], context.temp_allocator)
+					recipient_offsets_ready = true
+				}
+				authorised = kp.offset in recipient_offsets
+			}
+			if authorised && tombstone_insert_confirmed(tracker, id_bytes) {
 				append(newly_confirmed, id_bytes)
 			}
 			// pubkey mismatch - skip silently.
@@ -122,6 +154,7 @@ process_e_tag_deletion_core :: proc(
 process_deletion_into :: proc(
 	k5: ^pack.Event,
 	index_buf: []u8,
+	tags_buf: []u8,
 	dtags_buf: []u8,
 	tracker: ^Tombstone_Tracker,
 	allocator := context.temp_allocator,
@@ -147,19 +180,19 @@ process_deletion_into :: proc(
 
 	if len(targets) > 0 {
 		// Single pass over the index: resolve only the IDs we care about.
-		resolved := make(map[[32]u8]Kind_Pubkey, context.temp_allocator)
+		resolved := make(map[[32]u8]Deletion_Target, context.temp_allocator)
 		defer delete(resolved)
 		total := index_entry_count(index_buf)
 		for i in 0 ..< total {
 			e := index_entry_at(index_buf, i)
 			if e.id in targets {
-				resolved[e.id] = Kind_Pubkey{e.kind, e.pubkey}
+				resolved[e.id] = Deletion_Target{e.kind, e.pubkey, e.offset}
 				if len(resolved) == len(targets) {
 					break
 				}
 			}
 		}
-		process_e_tag_deletion_core(k5, resolved, tracker, MAX_PREEMPTIVE_TOMBSTONES, &newly_confirmed)
+		process_e_tag_deletion_core(k5, resolved, tags_buf, tracker, MAX_PREEMPTIVE_TOMBSTONES, &newly_confirmed)
 	}
 
 	for &tag in k5.tags {
@@ -169,6 +202,33 @@ process_deletion_into :: proc(
 	}
 
 	return newly_confirmed
+}
+
+// NIP-59: true when any p-tag pubkey of a kind-1059 gift wrap appears in a
+// preemptive tombstone's candidate set - i.e. the recipient issued a kind-5
+// for this gift wrap before the relay ever saw it. Used on ingest to block
+// (re-)publication of recipient-deleted gift wraps.
+giftwrap_recipient_in_candidates :: proc(ev: ^pack.Event, candidates: Key_Set) -> bool {
+	if ev.kind != nostr.KIND_GIFT_WRAP {
+		return false
+	}
+	for tag in ev.tags {
+		if len(tag.fields) < 2 || tag.fields[0] != "p" {
+			continue
+		}
+		pk_hex := tag.fields[1]
+		if len(pk_hex) != 64 {
+			continue
+		}
+		pk: [32]u8
+		if _, herr := pack.hex_decode(transmute([]u8)pk_hex, pk[:]); herr != .None {
+			continue
+		}
+		if pk in candidates {
+			return true
+		}
+	}
+	return false
 }
 
 // Split a NIP-09 coordinate "<kind>:<pubkey-hex>:<d-tag>" into its three

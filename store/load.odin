@@ -17,7 +17,7 @@ import "../pack"
 // load_a_tag_coord_tombstones, which is robust against compaction pruning
 // the target event.
 load_tombstones :: proc(
-	index_buf, data_buf, dtags_buf: []u8,
+	index_buf, data_buf, tags_buf, dtags_buf: []u8,
 	allocator := context.allocator,
 ) -> (
 	tracker: Tombstone_Tracker,
@@ -26,12 +26,13 @@ load_tombstones :: proc(
 	tombstone_tracker_init(&tracker, make(Tombstone_Map))
 	total := index_entry_count(index_buf)
 
-	// Build id -> (kind, pubkey) lookup for O(1) e-tag target resolution.
-	id_map := make(map[[32]u8]Kind_Pubkey, context.temp_allocator)
+	// Build id -> (kind, pubkey, offset) lookup for O(1) e-tag target
+	// resolution.
+	id_map := make(map[[32]u8]Deletion_Target, context.temp_allocator)
 	defer delete(id_map)
 	for i in 0 ..< total {
 		e := index_entry_at(index_buf, i)
-		id_map[e.id] = Kind_Pubkey{e.kind, e.pubkey}
+		id_map[e.id] = Deletion_Target{e.kind, e.pubkey, e.offset}
 	}
 
 	for i in 0 ..< total {
@@ -50,7 +51,7 @@ load_tombstones :: proc(
 		// Boot-time path: counter rebuild happens via boot_rebuild, so the
 		// newly-confirmed ids produced here are discarded (#140).
 		discard := make([dynamic][32]u8, context.temp_allocator)
-		process_e_tag_deletion_core(&ev, id_map, &tracker, MAX_PREEMPTIVE_TOMBSTONES, &discard)
+		process_e_tag_deletion_core(&ev, id_map, tags_buf, &tracker, MAX_PREEMPTIVE_TOMBSTONES, &discard)
 		// a-tag id-tombstone (only resolves targets still in dtags). The
 		// coordinate-tombstone map below is the compaction-resilient source
 		// of truth.

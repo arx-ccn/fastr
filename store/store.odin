@@ -304,9 +304,11 @@ store_open :: proc(dir: string, allocator := context.allocator) -> (s: ^Store, e
 		defer slice_release(idx_g)
 		data_g := mapped_file_slice(&s.data)
 		defer slice_release(data_g)
+		tags_g := mapped_file_slice(&s.tags)
+		defer slice_release(tags_g)
 		dtags_g := mapped_file_slice(&s.dtags)
 		defer slice_release(dtags_g)
-		s.tombstones = load_tombstones(idx_g.data, data_g.data, dtags_g.data, allocator)
+		s.tombstones = load_tombstones(idx_g.data, data_g.data, tags_g.data, dtags_g.data, allocator)
 		// Issue #76: rebuild a-tag coordinate tombstones. Independent of
 		// `tombstones` because it survives compaction pruning the target.
 		s.addressable_tombstones = load_a_tag_coord_tombstones(idx_g.data, data_g.data, allocator)

@@ -325,7 +325,7 @@ test_preemptive_tombstone_cap_stops_growth :: proc(t: ^testing.T) {
 	tracker: Tombstone_Tracker
 	tombstone_tracker_init(&tracker, make(Tombstone_Map))
 	defer tombstone_tracker_destroy(&tracker)
-	resolved := make(map[[32]u8]Kind_Pubkey, context.temp_allocator)
+	resolved := make(map[[32]u8]Deletion_Target, context.temp_allocator)
 
 	// First batch: fill to cap.
 	tags1 := make([dynamic]pack.Tag, context.temp_allocator)
@@ -344,7 +344,7 @@ test_preemptive_tombstone_cap_stops_growth :: proc(t: ^testing.T) {
 	}
 	k5a := test_make_event(1, 5, 1_000, tag_list1[:])
 	newly := make([dynamic][32]u8, context.temp_allocator)
-	process_e_tag_deletion_core(&k5a, resolved, &tracker, max_p, &newly)
+	process_e_tag_deletion_core(&k5a, resolved, nil, &tracker, max_p, &newly)
 	testing.expect_value(t, len(tracker.map_), max_p)
 	testing.expect_value(t, len(newly), 0)
 
@@ -358,7 +358,7 @@ test_preemptive_tombstone_cap_stops_growth :: proc(t: ^testing.T) {
 		append(&tag_list2, test_tag("e", test_hex(id[:])))
 	}
 	k5b := test_make_event(1, 5, 2_000, tag_list2[:])
-	process_e_tag_deletion_core(&k5b, resolved, &tracker, max_p, &newly)
+	process_e_tag_deletion_core(&k5b, resolved, nil, &tracker, max_p, &newly)
 	testing.expect_value(t, len(tracker.map_), max_p)
 	testing.expect_value(t, len(newly), 0)
 }
@@ -372,7 +372,7 @@ test_preemptive_tombstone_cap_allows_confirmed :: proc(t: ^testing.T) {
 	defer tombstone_tracker_destroy(&tracker)
 
 	// Fill to cap with preemptive tombstones.
-	empty_resolved := make(map[[32]u8]Kind_Pubkey, context.temp_allocator)
+	empty_resolved := make(map[[32]u8]Deletion_Target, context.temp_allocator)
 	tag_list := make([dynamic]pack.Tag, context.temp_allocator)
 	for i in 0 ..< u8(2) {
 		id: [32]u8
@@ -383,7 +383,7 @@ test_preemptive_tombstone_cap_allows_confirmed :: proc(t: ^testing.T) {
 	}
 	k5 := test_make_event(1, 5, 1_000, tag_list[:])
 	newly := make([dynamic][32]u8, context.temp_allocator)
-	process_e_tag_deletion_core(&k5, empty_resolved, &tracker, max_p, &newly)
+	process_e_tag_deletion_core(&k5, empty_resolved, nil, &tracker, max_p, &newly)
 	testing.expect_value(t, len(tracker.map_), 2)
 	testing.expect_value(t, len(newly), 0)
 
@@ -393,12 +393,147 @@ test_preemptive_tombstone_cap_allows_confirmed :: proc(t: ^testing.T) {
 		b = 0xCC
 	}
 	k5c := test_make_event(1, 5, 2_000, test_tags(test_tag("e", test_hex(confirmed_id[:]))))
-	resolved := make(map[[32]u8]Kind_Pubkey, context.temp_allocator)
-	resolved[confirmed_id] = Kind_Pubkey{1, k5c.pubkey}
-	process_e_tag_deletion_core(&k5c, resolved, &tracker, max_p, &newly)
+	resolved := make(map[[32]u8]Deletion_Target, context.temp_allocator)
+	resolved[confirmed_id] = Deletion_Target{1, k5c.pubkey, 0}
+	process_e_tag_deletion_core(&k5c, resolved, nil, &tracker, max_p, &newly)
 	testing.expect_value(t, len(tracker.map_), 3)
 	v, ok := tracker.map_[confirmed_id]
 	testing.expect(t, ok && v.confirmed, "confirmed tombstone must bypass the cap")
 	testing.expect_value(t, len(newly), 1)
 	testing.expect_value(t, newly[0], confirmed_id)
+}
+
+// --- NIP-59: gift wrap recipient deletion (strfry #251 parity) ---
+
+@(test)
+test_nip59_recipient_deletes_stored_gift_wrap :: proc(t: ^testing.T) {
+	// A kind-5 whose author matches the gift wrap's p-tag (recipient) must
+	// tombstone the gift wrap even though it was signed by a one-time key.
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+
+	recipient_pk := test_pubkey(1)
+	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+	test_append_ok(t, s, &gw)
+
+	k5 := test_kind5_event(1, gw.id)
+	test_append_ok(t, s, &k5)
+
+	testing.expect(t, store_is_tombstoned(s, gw.id), "recipient deletion must tombstone gift wrap")
+}
+
+@(test)
+test_nip59_non_recipient_cannot_delete_gift_wrap :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+
+	recipient_pk := test_pubkey(1)
+	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+	test_append_ok(t, s, &gw)
+
+	// sk=3 is neither the throwaway author nor the p-tag recipient.
+	k5 := test_kind5_event(3, gw.id)
+	test_append_ok(t, s, &k5)
+
+	testing.expect(t, !store_is_tombstoned(s, gw.id), "unrelated pubkey must not delete gift wrap")
+}
+
+@(test)
+test_nip59_recipient_deletion_respects_k_tag :: proc(t: ^testing.T) {
+	// A k-tag on the kind-5 that excludes 1059 must skip the gift wrap.
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+
+	recipient_pk := test_pubkey(1)
+	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+	test_append_ok(t, s, &gw)
+
+	k5 := test_make_event(
+		1,
+		5,
+		2_000,
+		test_tags(test_tag("e", test_hex(gw.id[:])), test_tag("k", "1")),
+	)
+	test_append_ok(t, s, &k5)
+	testing.expect(t, !store_is_tombstoned(s, gw.id), "k-tag excluding 1059 must skip deletion")
+
+	k5b := test_make_event(
+		1,
+		5,
+		3_000,
+		test_tags(test_tag("e", test_hex(gw.id[:])), test_tag("k", "1059")),
+	)
+	test_append_ok(t, s, &k5b)
+	testing.expect(t, store_is_tombstoned(s, gw.id), "k-tag including 1059 must delete")
+}
+
+@(test)
+test_nip59_deletion_before_gift_wrap_blocks_ingest :: proc(t: ^testing.T) {
+	// Recipient's kind-5 arrives first (preemptive tombstone); the gift wrap
+	// must then be rejected on ingest via its p-tag - this is what blocks
+	// re-publication of a recipient-deleted gift wrap.
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+
+	recipient_pk := test_pubkey(1)
+	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+
+	k5 := test_kind5_event(1, gw.id)
+	test_append_ok(t, s, &k5)
+	testing.expect(t, !store_is_tombstoned(s, gw.id), "preemptive entry must not be confirmed yet")
+
+	err, _ := store_append(s, &gw)
+	testing.expect_value(t, err, Error.Duplicate)
+	testing.expect(t, store_is_tombstoned(s, gw.id), "gift wrap ingest must promote to confirmed")
+}
+
+@(test)
+test_nip59_deletion_before_unrelated_gift_wrap_ingests :: proc(t: ^testing.T) {
+	// A preemptive tombstone whose candidate matches neither author nor
+	// p-tag must be discarded and the gift wrap stored normally.
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+
+	other_pk := test_pubkey(9)
+	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(other_pk[:]))))
+
+	k5 := test_kind5_event(1, gw.id)
+	test_append_ok(t, s, &k5)
+
+	test_append_ok(t, s, &gw)
+	testing.expect(t, !store_is_tombstoned(s, gw.id), "non-matching candidate must not tombstone")
+}
+
+@(test)
+test_nip59_recipient_tombstone_survives_restart :: proc(t: ^testing.T) {
+	// Boot path: load_tombstones must re-derive the recipient tombstone via
+	// the tags index.
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+
+	gw_id: [32]u8
+	{
+		s := test_open(t, dir)
+		recipient_pk := test_pubkey(1)
+		gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+		test_append_ok(t, s, &gw)
+		gw_id = gw.id
+		k5 := test_kind5_event(1, gw.id)
+		test_append_ok(t, s, &k5)
+		store_close(s)
+	}
+
+	s := test_open(t, dir)
+	defer store_close(s)
+	testing.expect(t, store_is_tombstoned(s, gw_id), "recipient tombstone survives restart")
 }

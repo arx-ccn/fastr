@@ -257,7 +257,9 @@ append_classified :: proc(
 			if v.confirmed {
 				return .Duplicate, ""
 			}
-			if ev.pubkey in v.candidates {
+			// NIP-59: gift wraps are also matched by recipient (p-tag), since
+			// their signing key is one-time and never a deletion author.
+			if ev.pubkey in v.candidates || giftwrap_recipient_in_candidates(ev, v.candidates) {
 				if ev.kind == nostr.KIND_DELETION {
 					tombstone_remove(&s.tombstones, ev.id)
 				} else {
@@ -378,6 +380,7 @@ append_classified :: proc(
 	immediately_tombstoned := false
 	if ev.kind == nostr.KIND_DELETION {
 		idx_g := mapped_file_slice(&s.index)
+		tags_g := mapped_file_slice(&s.tags)
 		dtags_g := mapped_file_slice(&s.dtags)
 		tombstoned := make([dynamic]Kind_Pubkey, context.temp_allocator)
 		{
@@ -385,7 +388,7 @@ append_classified :: proc(
 			// Pre-publication index: targets of this deletion are already in
 			// the index from earlier appends; the kind-5 itself is not yet
 			// visible to readers.
-			newly := process_deletion_into(ev, idx_g.data, dtags_g.data, &s.tombstones, context.temp_allocator)
+			newly := process_deletion_into(ev, idx_g.data, tags_g.data, dtags_g.data, &s.tombstones, context.temp_allocator)
 			// Resolve newly-confirmed ids to (kind, pubkey) in a single
 			// index pass under the same lock.
 			if len(newly) > 0 {
@@ -406,6 +409,7 @@ append_classified :: proc(
 			}
 		}
 		slice_release(idx_g)
+		slice_release(tags_g)
 		slice_release(dtags_g)
 		for kp in tombstoned {
 			decrement_live_event_count(s, kp.kind, kp.pubkey)
@@ -436,7 +440,8 @@ append_classified :: proc(
 		// verification now that the target has arrived.
 		sync.guard(&s.tombstones_mu)
 		if v, ok := s.tombstones.map_[ev.id]; ok && !v.confirmed {
-			if ev.pubkey in v.candidates {
+			// NIP-59: gift wraps also match by recipient (p-tag).
+			if ev.pubkey in v.candidates || giftwrap_recipient_in_candidates(ev, v.candidates) {
 				// Candidate pubkey matches: promote to confirmed tombstone.
 				tombstone_insert_confirmed(&s.tombstones, ev.id)
 				immediately_tombstoned = true
