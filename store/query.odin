@@ -126,8 +126,12 @@ event_matches_filter :: proc(f: ^nostr.Filter, ev: ^pack.Event) -> bool {
 	if until, ok := f.until.?; ok && ev.created_at > until {
 		return false
 	}
-	if search, ok := f.search.?; ok && !strings.contains(ev.content, search) {
-		return false
+	if search, ok := f.search.?; ok {
+		for needle in search {
+			if !strings.contains(ev.content, needle) {
+				return false
+			}
+		}
 	}
 	for ch, values in f.tags {
 		matched := false
@@ -446,7 +450,7 @@ query_authed :: proc(
 				return .Io
 			}
 			dp := data[start:end]
-			if has_search && !pack.dp_content_contains(dp, fsearch) {
+			if has_search && !content_contains_all(dp, fsearch) {
 				continue
 			}
 			if !authed && pack.dp_has_protected_tag(dp) {
@@ -811,7 +815,7 @@ iter_negentropy :: proc(
 				if !bok {
 					return .Io, ""
 				}
-				if !pack.dp_content_contains(data[start:end], fsearch) {
+				if !content_contains_all(data[start:end], fsearch) {
 					continue
 				}
 			}
@@ -829,4 +833,16 @@ iter_negentropy :: proc(
 		cb(user, item.ts, item.id)
 	}
 	return .None, ""
+}
+
+// ponytail: re-parses the blob header per needle; fold into pack if
+// multi-needle searches show up in profiles.
+@(private)
+content_contains_all :: proc(dp: []u8, needles: []string) -> bool {
+	for needle in needles {
+		if !pack.dp_content_contains(dp, needle) {
+			return false
+		}
+	}
+	return true
 }

@@ -324,7 +324,10 @@ parse_filter :: proc(
 			if !s_ok {
 				return f, "invalid: search not a string", false
 			}
-			f.search = strings.clone(s, allocator)
+			why, search_ok := parse_search(s, &f, allocator)
+			if !search_ok {
+				return f, why, false
+			}
 		case:
 			if len(key) == 2 && key[0] == '#' {
 				ch := key[1]
@@ -802,9 +805,11 @@ single_filter_matches :: proc(f: ^Filter, ev: ^pack.Event) -> bool {
 		}
 	}
 	if search, present := f.search.?; present {
-		// NIP-50 (basic): case-sensitive literal substring of content.
-		if !strings.contains(ev.content, search) {
-			return false
+		// NIP-50: every needle is a case-sensitive literal substring of content.
+		for needle in search {
+			if !strings.contains(ev.content, needle) {
+				return false
+			}
 		}
 	}
 	for ch, values in f.tags {
@@ -823,4 +828,191 @@ single_filter_matches :: proc(f: ^Filter, ev: ^pack.Event) -> bool {
 		}
 	}
 	return true
+}
+
+// NIP-50 search string. Plain text is a literal content substring. Directives
+// desugar into indexed filter fields so the store answers them from the
+// index instead of scanning content blobs:
+//
+//   from:<pubkey hex>                -> authors
+//   tags:[["p","<hex>"], ...]        -> #p (and any other single-char tag)
+//   content:{"includes":["a","b"]}   -> content substrings (all must match)
+//   since:<t> until:<t>              -> since/until; <t> is unix seconds,
+//                                       YYYY-MM-DD (UTC midnight) or RFC 3339
+//
+// Plain words between directives are joined by single spaces into one needle.
+@(private)
+parse_search :: proc(s: string, f: ^Filter, allocator := context.allocator) -> (reason: string, ok: bool) {
+	needles := make([dynamic]string, allocator)
+	plain := strings.builder_make(context.temp_allocator)
+	flush_plain :: proc(b: ^strings.Builder, needles: ^[dynamic]string, allocator := context.allocator) {
+		t := strings.trim_space(strings.to_string(b^))
+		if len(t) > 0 {
+			append(needles, strings.clone(t, allocator))
+		}
+		strings.builder_reset(b)
+	}
+
+	rest := strings.trim_left_space(s)
+	for len(rest) > 0 {
+		switch {
+		case strings.has_prefix(rest, "from:"):
+			flush_plain(&plain, &needles, allocator)
+			word := rest[5:]
+			end := strings.index_any(word, " \t\r\n")
+			if end < 0 {
+				end = len(word)
+			}
+			p, why, p_ok := decode_hex_prefix(word[:end], "search from")
+			if !p_ok {
+				return why, false
+			}
+			authors, has_authors := f.authors.?
+			if !has_authors {
+				authors = make([dynamic]Hex_Prefix, allocator)
+			}
+			append(&authors, p)
+			f.authors = authors
+			rest = word[end:]
+		case strings.has_prefix(rest, "since:"), strings.has_prefix(rest, "until:"):
+			flush_plain(&plain, &needles, allocator)
+			word := rest[6:]
+			end := strings.index_any(word, " \t\r\n")
+			if end < 0 {
+				end = len(word)
+			}
+			ts, ts_ok := parse_search_time(word[:end])
+			if !ts_ok {
+				return "invalid: search since/until not unix seconds, YYYY-MM-DD or RFC 3339", false
+			}
+			if rest[0] == 's' {
+				f.since = ts
+			} else {
+				f.until = ts
+			}
+			rest = word[end:]
+		case strings.has_prefix(rest, "tags:"):
+			flush_plain(&plain, &needles, allocator)
+			n := json_span(rest[5:])
+			val, val_ok := json_parse_temp(rest[5:5 + n])
+			arr, arr_ok := val.(json.Array)
+			if n == 0 || !val_ok || !arr_ok {
+				return "invalid: search tags not a JSON array", false
+			}
+			for entry in arr {
+				tag, tag_ok := entry.(json.Array)
+				if !tag_ok || len(tag) < 2 {
+					return "invalid: search tag entry not [name, value]", false
+				}
+				name, name_ok := tag[0].(json.String)
+				tv, tv_ok := tag[1].(json.String)
+				if !name_ok || !tv_ok || len(name) != 1 {
+					return "invalid: search tag entry not [single-char name, string value]", false
+				}
+				if f.tags == nil {
+					f.tags = make(map[u8]Tag_Value_Set, allocator)
+				}
+				vals, has_vals := f.tags[name[0]]
+				if !has_vals {
+					vals = make(Tag_Value_Set, allocator)
+				}
+				vals[strings.clone(tv, allocator)] = {}
+				f.tags[name[0]] = vals
+			}
+			rest = rest[5 + n:]
+		case strings.has_prefix(rest, "content:"):
+			flush_plain(&plain, &needles, allocator)
+			n := json_span(rest[8:])
+			val, val_ok := json_parse_temp(rest[8:8 + n])
+			obj, obj_ok := val.(json.Object)
+			if n == 0 || !val_ok || !obj_ok {
+				return "invalid: search content not a JSON object", false
+			}
+			inc, inc_ok := obj["includes"].(json.Array)
+			if !inc_ok {
+				return "invalid: search content.includes not an array", false
+			}
+			for entry in inc {
+				needle, needle_ok := entry.(json.String)
+				if !needle_ok {
+					return "invalid: search content.includes entry not a string", false
+				}
+				append(&needles, strings.clone(needle, allocator))
+			}
+			rest = rest[8 + n:]
+		case:
+			end := strings.index_any(rest, " \t\r\n")
+			if end < 0 {
+				end = len(rest)
+			}
+			strings.write_string(&plain, rest[:end])
+			strings.write_byte(&plain, ' ')
+			rest = rest[end:]
+		}
+		rest = strings.trim_left_space(rest)
+	}
+	flush_plain(&plain, &needles, allocator)
+
+	// No needles = no content constraint; leave search absent so the store
+	// keeps its index-only fast paths.
+	if len(needles) == 0 {
+		delete(needles)
+		return "", true
+	}
+	f.search = needles[:]
+	return "", true
+}
+
+// Byte length of the leading JSON array/object in `s` (bracket depth,
+// string-aware). 0 when `s` does not start with a complete one.
+@(private)
+json_span :: proc(s: string) -> int {
+	depth := 0
+	in_str, esc := false, false
+	for i in 0 ..< len(s) {
+		c := s[i]
+		if in_str {
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				in_str = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			in_str = true
+		case '[', '{':
+			depth += 1
+		case ']', '}':
+			depth -= 1
+			if depth == 0 {
+				return i + 1
+			}
+		case:
+			if depth == 0 {
+				return 0
+			}
+		}
+	}
+	return 0
+}
+
+// Unix seconds, "YYYY-MM-DD" (UTC midnight), or an RFC 3339 datetime.
+@(private)
+parse_search_time :: proc(s: string) -> (ts: i64, ok: bool) {
+	if n, n_ok := strconv.parse_i64(s); n_ok {
+		return n, true
+	}
+	stamp := s
+	if len(s) == 10 {
+		stamp = strings.concatenate({s, "T00:00:00Z"}, context.temp_allocator)
+	}
+	t, consumed := time.rfc3339_to_time_utc(stamp)
+	if consumed != len(stamp) {
+		return 0, false
+	}
+	return time.time_to_unix(t), true
 }

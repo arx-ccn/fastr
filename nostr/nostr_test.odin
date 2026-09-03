@@ -622,7 +622,7 @@ test_parse_filter_search :: proc(t: ^testing.T) {
 	req := msg.(Msg_Req)
 	search, present := req.filters[0].search.?
 	testing.expect(t, present, "search must be Some")
-	testing.expect_value(t, search, "purple ostrich")
+	testing.expect_value(t, search[0], "purple ostrich")
 
 	_, reason, bad := parse_client_msg(`["REQ","s",{"search":5}]`, 256, context.temp_allocator)
 	testing.expect(t, !bad)
@@ -632,25 +632,74 @@ test_parse_filter_search :: proc(t: ^testing.T) {
 @(test)
 test_filter_clone_search :: proc(t: ^testing.T) {
 	f: Filter
-	f.search = "needle"
+	f.search = []string{"needle"}
 	c := filter_clone(&f, context.allocator)
 	defer filter_destroy(&c, context.allocator)
 	search, present := c.search.?
 	testing.expect(t, present, "cloned search must be Some")
-	testing.expect_value(t, search, "needle")
+	testing.expect_value(t, search[0], "needle")
 }
 
 @(test)
 test_live_filter_search :: proc(t: ^testing.T) {
 	ev := make_golden_event() // content "hello"
 	f: Filter
-	f.search = "ell"
+	f.search = []string{"ell"}
 	filters := [?]Filter{f}
 	testing.expect(t, filter_matches(filters[:], &ev))
-	filters[0].search = "Hello" // case-sensitive
+	filters[0].search = []string{"Hello"} // case-sensitive
 	testing.expect(t, !filter_matches(filters[:], &ev))
-	filters[0].search = "hellos"
+	filters[0].search = []string{"hellos"}
 	testing.expect(t, !filter_matches(filters[:], &ev))
-	filters[0].search = "" // empty needle imposes no constraint
+	filters[0].search = []string{""} // empty needle imposes no constraint
 	testing.expect(t, filter_matches(filters[:], &ev))
+}
+
+@(test)
+test_parse_filter_search_directives :: proc(t: ^testing.T) {
+	raw := `["REQ","s",{"search":"from:32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245 tags:[[\"p\", \"04c915daefee38317fa734444acee390a8269fe5810b2241e5e6dd343dfbecc9\"]] content:{\"includes\": [\"TIL\", \"million\"] } odell"}]`
+	msg, reason, ok := parse_client_msg(raw, 256, context.temp_allocator)
+	testing.expect(t, ok, reason)
+	f := msg.(Msg_Req).filters[0]
+
+	authors, has_authors := f.authors.?
+	testing.expect(t, has_authors && len(authors) == 1 && authors[0].length == 32, "from: must desugar into authors")
+	pvals, has_p := f.tags['p']
+	testing.expect(t, has_p && len(pvals) == 1, "tags: must desugar into #p")
+	testing.expect(t, "04c915daefee38317fa734444acee390a8269fe5810b2241e5e6dd343dfbecc9" in pvals)
+	search, has_search := f.search.?
+	testing.expect(t, has_search && len(search) == 3, "content.includes + plain text become needles")
+	testing.expect_value(t, search[0], "TIL")
+	testing.expect_value(t, search[1], "million")
+	testing.expect_value(t, search[2], "odell")
+
+	// Directive-only search leaves `search` absent so the index fast path stays.
+	msg2, _, ok2 := parse_client_msg(`["REQ","s",{"search":"from:32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245"}]`, 256, context.temp_allocator)
+	testing.expect(t, ok2)
+	_, has_search2 := msg2.(Msg_Req).filters[0].search.?
+	testing.expect(t, !has_search2)
+
+	_, _, bad := parse_client_msg(`["REQ","s",{"search":"from:zz"}]`, 256, context.temp_allocator)
+	testing.expect(t, !bad)
+	_, _, bad2 := parse_client_msg(`["REQ","s",{"search":"tags:[[\"p\"]"}]`, 256, context.temp_allocator)
+	testing.expect(t, !bad2)
+}
+
+@(test)
+test_parse_filter_search_since_until :: proc(t: ^testing.T) {
+	msg, reason, ok := parse_client_msg(`["REQ","s",{"search":"since:2026-09-03 until:2026-09-03T18:21:02+02:00 odell"}]`, 256, context.temp_allocator)
+	testing.expect(t, ok, reason)
+	f := msg.(Msg_Req).filters[0]
+	testing.expect_value(t, f.since.?, i64(1788393600))
+	testing.expect_value(t, f.until.?, i64(1788452462))
+	testing.expect_value(t, f.search.?[0], "odell")
+
+	msg2, _, ok2 := parse_client_msg(`["REQ","s",{"search":"since:1780239482"}]`, 256, context.temp_allocator)
+	testing.expect(t, ok2)
+	testing.expect_value(t, msg2.(Msg_Req).filters[0].since.?, i64(1780239482))
+
+	_, _, bad := parse_client_msg(`["REQ","s",{"search":"since:yesterday"}]`, 256, context.temp_allocator)
+	testing.expect(t, !bad)
+	_, _, bad2 := parse_client_msg(`["REQ","s",{"search":"since:2026-09-03T18:21"}]`, 256, context.temp_allocator)
+	testing.expect(t, !bad2)
 }

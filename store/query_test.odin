@@ -920,17 +920,17 @@ test_query_search_filter :: proc(t: ^testing.T) {
 	}
 
 	f: nostr.Filter
-	f.search = "t=101"
+	f.search = []string{"t=101"}
 	c := test_query_collect(t, s, &f)
 	testing.expect_value(t, len(c.ids), 1)
 	testing.expect_value(t, c.ids[0], evs[1].id)
 
 	f2: nostr.Filter
-	f2.search = "t=10"
+	f2.search = []string{"t=10"}
 	testing.expect_value(t, test_query_count(t, s, &f2), 3)
 
 	f3: nostr.Filter
-	f3.search = "t=999"
+	f3.search = []string{"t=999"}
 	testing.expect_value(t, test_query_count(t, s, &f3), 0)
 }
 
@@ -946,7 +946,7 @@ test_query_search_with_kinds_and_limit :: proc(t: ^testing.T) {
 		test_append_ok(t, s, &ev)
 	}
 	f := test_kind_filter(1)
-	f.search = "k=1"
+	f.search = []string{"k=1"}
 	f.limit = 1
 	c := test_query_collect(t, s, &f)
 	testing.expect_value(t, len(c.ids), 1)
@@ -967,11 +967,11 @@ test_query_search_hexed_content :: proc(t: ^testing.T) {
 	test_append_ok(t, s, &ev)
 
 	f: nostr.Filter
-	f.search = "beefcafe"
+	f.search = []string{"beefcafe"}
 	testing.expect_value(t, test_query_count(t, s, &f), 1)
 
 	f2: nostr.Filter
-	f2.search = "beefcaff"
+	f2.search = []string{"beefcaff"}
 	testing.expect_value(t, test_query_count(t, s, &f2), 0)
 }
 
@@ -987,10 +987,10 @@ test_count_search_filter :: proc(t: ^testing.T) {
 	}
 	// search must force the exact scan, not the in-memory counters.
 	f: nostr.Filter
-	f.search = "t=101"
+	f.search = []string{"t=101"}
 	testing.expect_value(t, store_count(s, &f), 1)
 
 	f2 := test_kind_filter(1)
-	f2.search = "t=999"
+	f2.search = []string{"t=999"}
 	testing.expect_value(t, store_count(s, &f2), 0)
 }
