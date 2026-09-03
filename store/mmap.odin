@@ -56,6 +56,19 @@ map_fd :: proc(file: ^os.File, size: uint) -> (^Mmap, Error) {
 	return m, .None
 }
 
+// Smallest mapping size (>= VIRTUAL_MAP_SIZE, doubling) covering `needed_total`
+// bytes. Files past 1 GB must get a larger window at open and after
+// compaction too, not only on the append path — otherwise any read beyond
+// the window segfaults.
+@(private = "file")
+map_size_for :: proc "contextless" (needed_total: uint) -> uint {
+	size := uint(VIRTUAL_MAP_SIZE)
+	for size < needed_total {
+		size <<= 1
+	}
+	return size
+}
+
 @(private = "file")
 mmap_destroy :: proc(m: ^Mmap) {
 	linux.munmap(rawptr(m.ptr), m.size)
@@ -78,7 +91,7 @@ sweep_retired :: proc(mf: ^Mapped_File) {
 // file header. If `logical_len > 0`, creates the initial oversized mapping.
 mapped_file_init :: proc(mf: ^Mapped_File, file: ^os.File, logical_len: u64) -> Error {
 	if logical_len > 0 {
-		m := map_fd(file, VIRTUAL_MAP_SIZE) or_return
+		m := map_fd(file, map_size_for(uint(logical_len) + HEADER_SIZE)) or_return
 		mf.current = m
 	}
 	sync.atomic_store(&mf.logical_len, logical_len)
@@ -134,11 +147,7 @@ mapped_file_ensure_mapped :: proc(mf: ^Mapped_File, file: ^os.File, needed: u64)
 			return .None
 		}
 	}
-	size := uint(VIRTUAL_MAP_SIZE)
-	for size < needed_total {
-		size <<= 1
-	}
-	m := map_fd(file, size) or_return
+	m := map_fd(file, map_size_for(needed_total)) or_return
 	sync.guard(&mf.mu)
 	if mf.current != nil {
 		append(&mf.retired, mf.current)
@@ -153,7 +162,7 @@ mapped_file_ensure_mapped :: proc(mf: ^Mapped_File, file: ^os.File, needed: u64)
 mapped_file_swap :: proc(mf: ^Mapped_File, file: ^os.File, file_len: u64) -> Error {
 	new_m: ^Mmap
 	if file_len > 0 {
-		new_m = map_fd(file, VIRTUAL_MAP_SIZE) or_return
+		new_m = map_fd(file, map_size_for(uint(file_len) + HEADER_SIZE)) or_return
 	}
 	sync.guard(&mf.mu)
 	if mf.current != nil {
