@@ -1,0 +1,140 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# bench/Dockerfile - fastr (Odin) vs strfry vs rnostr end-to-end benchmark
+#
+# Build from the repo root:
+#
+#   podman build -f bench/Dockerfile -t fastr-bench .
+#
+# Run:
+#   podman run --rm \
+#     -v "$(pwd)/docs/BENCHMARKS.md:/results/BENCHMARKS.md" \
+#     --privileged --cpus 8 --memory 8g \
+#     -e EVENTS=500000 -e QUERIES=50000 \
+#     fastr-bench
+#
+# Environment variables (all optional):
+#   EVENTS        events ingested per relay   (default: 50000)
+#   QUERIES       REQ queries per relay       (default: 5000)
+#   CONCURRENCY   parallel workers            (default: 8)
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Stage 1 - build the fastr relay and the fastr-bench driver (both Odin).
+# Uses ubuntu:24.04 to match CI toolchain (LLVM 18 / clang 18).
+# -----------------------------------------------------------------------------
+FROM ubuntu:24.04 AS odin-builder
+
+ARG ODIN_RELEASE=dev-2026-05
+
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  curl ca-certificates git \
+  cmake clang llvm build-essential libssl-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL -o /tmp/odin.tar.gz \
+    "https://github.com/odin-lang/Odin/releases/download/${ODIN_RELEASE}/odin-linux-amd64-${ODIN_RELEASE}.tar.gz" && \
+  mkdir -p /opt/odin && \
+  tar -xzf /tmp/odin.tar.gz -C /opt/odin --strip-components=1 && \
+  ln -s /opt/odin/odin /usr/local/bin/odin && \
+  rm /tmp/odin.tar.gz
+
+WORKDIR /build
+
+RUN git clone --depth 1 --branch v0.7.0 \
+    https://github.com/bitcoin-core/secp256k1 vendor/secp256k1 && \
+  cmake -S vendor/secp256k1 -B vendor/secp256k1/build \
+    -DSECP256K1_ENABLE_MODULE_SCHNORRSIG=ON \
+    -DSECP256K1_ENABLE_MODULE_EXTRAKEYS=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DSECP256K1_BUILD_TESTS=OFF \
+    -DSECP256K1_BUILD_BENCHMARK=OFF \
+    -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF \
+    -DSECP256K1_BUILD_CTIME_TESTS=OFF \
+    -DCMAKE_BUILD_TYPE=Release && \
+  cmake --build vendor/secp256k1/build -j
+
+COPY src/ src/
+COPY cmd/fastr/ cmd/fastr/
+COPY bench/relay/ bench/relay/
+COPY tests/wsclient/ tests/wsclient/
+
+RUN odin build cmd/fastr -out:fastr -o:speed && strip fastr && \
+    odin build bench/relay -out:fastr-bench -o:speed && strip fastr-bench
+
+
+# -----------------------------------------------------------------------------
+# Stage 2 - build strfry from source.
+# -----------------------------------------------------------------------------
+FROM debian:trixie AS strfry-builder
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+  git ca-certificates \
+  g++ make cmake pkg-config \
+  libssl-dev zlib1g-dev \
+  liblmdb-dev \
+  libflatbuffers-dev flatbuffers-compiler \
+  libsecp256k1-dev \
+  libzstd-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+ARG STRFRY_REF=master
+RUN git clone --depth 1 --branch "${STRFRY_REF}" \
+  https://github.com/hoytech/strfry.git . && \
+  git submodule update --init --recursive
+
+RUN make setup-golpe && make -j"$(nproc)"
+
+RUN strip strfry
+
+
+# -----------------------------------------------------------------------------
+# Stage 3 - build rnostr from source.
+# Built on bookworm so the binary's glibc requirement stays below the
+# trixie-based runner stage.
+# -----------------------------------------------------------------------------
+FROM rust:1-slim-bookworm AS rnostr-builder
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+  git ca-certificates build-essential \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+ARG RNOSTR_REF=main
+RUN git clone --depth 1 --branch "${RNOSTR_REF}" \
+  https://github.com/rnostr/rnostr.git .
+
+RUN cargo build --release --bin rnostr && strip target/release/rnostr
+
+
+# -----------------------------------------------------------------------------
+# Stage 4 - benchmark runner.
+# -----------------------------------------------------------------------------
+FROM debian:trixie-slim AS runner
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+  ca-certificates \
+  liblmdb0 libzstd1 libssl3 libsecp256k1-2 \
+  procps linux-perf \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=odin-builder   /build/fastr        /usr/local/bin/fastr
+COPY --from=odin-builder   /build/fastr-bench  /usr/local/bin/fastr-bench
+COPY --from=strfry-builder /build/strfry       /usr/local/bin/strfry
+COPY --from=rnostr-builder /build/target/release/rnostr /usr/local/bin/rnostr
+COPY bench/run_bench.sh                        /usr/local/bin/run_bench.sh
+
+RUN chmod +x /usr/local/bin/run_bench.sh
+
+ENV RESULTS_FILE=/results/BENCHMARKS.md \
+    EVENTS=50000 \
+    QUERIES=5000 \
+    CONCURRENCY=8
+
+RUN mkdir -p /results
+
+ENTRYPOINT ["/usr/local/bin/run_bench.sh"]

@@ -1,44 +1,36 @@
 # Build the relay binary (release)
 build:
-    odin build cmd -out:fastr -o:speed
+    odin build cmd/fastr -out:fastr -o:speed
 
 # Build with debug info
 build-debug:
-    odin build cmd -out:fastr-debug -debug
+    odin build cmd/fastr -out:fastr-debug -debug
 
 # Run all package test suites
 test:
-    odin test secp256k1
-    odin test pack
-    odin test negentropy
-    odin test nostr
-    odin test git
-    odin test githttp
-    odin test grasp
-    odin test store
-    odin test ws
-    # cmd tests mutate process env (FASTR_*) via os.set_env; serialize them so
-    # parallel load_config() calls don't race on shared environment state.
-    odin test cmd -define:ODIN_TEST_THREADS=1
+    bash tests/run.sh
 
 # Type-check every package
 check:
-    odin check secp256k1 -vet -strict-style -no-entry-point
-    odin check pack -vet -strict-style -no-entry-point
-    odin check negentropy -vet -strict-style -no-entry-point
-    odin check nostr -vet -strict-style -no-entry-point
-    odin check git -vet -strict-style -no-entry-point
-    odin check githttp -vet -strict-style -no-entry-point
-    odin check grasp -vet -strict-style -no-entry-point
-    odin check store -vet -strict-style -no-entry-point
-    odin check ws -vet -strict-style -no-entry-point
-    odin check cmd
-    odin check smoke
-    odin check graspsmoke
-    odin check wsq
-    odin check genevent
-    odin check qbench
-    odin check bench
+    odin check src/secp256k1 -vet -strict-style -no-entry-point
+    odin check src/pack -vet -strict-style -no-entry-point
+    odin check src/negentropy -vet -strict-style -no-entry-point
+    odin check src/nostr -vet -strict-style -no-entry-point
+    odin check src/git -vet -strict-style -no-entry-point
+    odin check src/githttp -vet -strict-style -no-entry-point
+    odin check src/grasp -vet -strict-style -no-entry-point
+    odin check src/store -vet -strict-style -no-entry-point
+    odin check src/tls -vet -strict-style -no-entry-point
+    odin check src/peersync -vet -strict-style -no-entry-point
+    odin check src/ws -vet -strict-style -no-entry-point
+    odin check cmd/fastr
+    odin check tests/smoke
+    odin check tests/grasp
+    odin check tests/wsclient -vet -strict-style -no-entry-point
+    odin check cmd/wsq
+    odin check cmd/genevent
+    odin check bench/query
+    odin check bench/relay
 
 # Clone + build vendored libsecp256k1 (one-time)
 vendor:
@@ -57,7 +49,7 @@ vendor:
 smoke: build
     #!/usr/bin/env bash
     set -euo pipefail
-    odin build smoke -out:fastr-smoke -o:speed
+    odin build tests/smoke -out:fastr-smoke -o:speed
     port="${FASTR_SMOKE_PORT:-18080}"
     data=$(mktemp -d)
     FASTR_PORT="$port" FASTR_DATA_DIR="$data" ./fastr &
@@ -69,5 +61,5 @@ smoke: build
 # Run the self-contained GRASP-01 end-to-end test (spawns its own fastr;
 # needs the git CLI as a dev dependency)
 smoke-grasp: build
-    odin build graspsmoke -out:fastr-graspsmoke -o:speed
+    odin build tests/grasp -out:fastr-graspsmoke -o:speed
     ./fastr-graspsmoke ./fastr

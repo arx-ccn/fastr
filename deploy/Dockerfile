@@ -6,10 +6,10 @@
 # drops it into a distroless image.
 #
 # Build (--network=host may be needed to fetch the Odin toolchain + secp256k1):
-#   docker build --network=host -f deploy/Dockerfile -t fastr .
+#   podman build --network=host -f deploy/Dockerfile -t fastr .
 #
 # Run:
-#   docker run -d \
+#   podman run -d \
 #     -p 127.0.0.1:8080:8080 \
 #     -v fastr-data:/data \
 #     --name fastr \
@@ -46,15 +46,13 @@ RUN git clone --depth 1 --branch v0.7.0 https://github.com/bitcoin-core/secp256k
         -DCMAKE_BUILD_TYPE=Release \
     && cmake --build vendor/secp256k1/build -j
 
-COPY secp256k1/ secp256k1/
-COPY pack/ pack/
-COPY negentropy/ negentropy/
-COPY nostr/ nostr/
-COPY store/ store/
-COPY ws/ ws/
-COPY cmd/ cmd/
+COPY src/ src/
+COPY cmd/fastr/ cmd/fastr/
 
-RUN odin build cmd -out:fastr-bin -o:speed -extra-linker-flags:"-static" \
+# Static distroless image: TLS client support is compiled out (-define:FASTR_TLS=false)
+# because distroless/static has no libssl. wss:// sync peers are unavailable in
+# this image; ws:// peers work. Build without the define on a full OS for wss.
+RUN odin build cmd/fastr -out:fastr-bin -o:speed -define:FASTR_TLS=false -extra-linker-flags:"-static" \
     && strip fastr-bin \
     && mkdir -p /data && chown 65532:65532 /data
 

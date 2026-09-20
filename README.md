@@ -37,8 +37,8 @@
 
 Queries are O(limit), not O(event count): the index scan stops the moment
 nothing older can still make the top-N, and exact-id lookups don't scan at
-all. Reproduce with `docker build -f
-Dockerfile.bench -t fastr-bench . && docker run --rm --privileged fastr-bench`.
+all. Reproduce with `podman build -f
+bench/Dockerfile -t fastr-bench . && podman run --rm --privileged fastr-bench`.
 
 strfry wrote **83 GB** of journal brainrot just to ingest 500k immutable events.  
 fastr wrote **119 MB**.
@@ -93,7 +93,7 @@ Transcoding to JSON wire format is one pass, zero heap allocations. The event ne
 
 ### The rest
 
-**Hex:** LUT scalar (SSSE3 SIMD pending). Matters because half of Nostr is hex strings of other Nostr things.
+**Hex:** Scalar lookup tables. Matters because half of Nostr is hex strings of other Nostr things.
 
 **WebSocket batching:** All events for a REQ get encoded into one batch with EOSE appended, handed to the write task as one message. N events = one TCP write.
 
@@ -116,21 +116,44 @@ Transcoding to JSON wire format is one pass, zero heap allocations. The event ne
 | 45 | Event counts |
 | 62 | Request to vanish |
 | 70 | Protected events |
+| 77 | Negentropy sync (server + pull client) |
 
 ---
 
 ## Build & run
 
 fastr is written in [Odin](https://odin-lang.org). One package per directory:
-`pack` (BASED format), `nostr` (validation, filters), `store` (storage engine),
-`ws` (WebSocket + handlers), `negentropy` (NIP-77), `secp256k1` (bindings),
-`cmd` (the binary).
+
+```text
+src/          Relay packages: storage, Nostr, WebSocket, sync, Git, crypto
+cmd/fastr/    Relay entry point and embedded web assets
+cmd/genevent/ Signed-event generator
+cmd/wsq/      WebSocket query client
+tests/        Unit tests, smoke tests, fixtures, and shared test client
+bench/        Benchmark programs (relay/, query/), runner, and container
+deploy/       Service definitions, installer, and production container
+docs/         Benchmark results, performance notes, and ideas
+vendor/       Downloaded dependencies (just vendor)
+```
+
+Unit tests and fixtures live in `tests/unit/<package>/`. The test runner
+combines them with source files in a temporary directory, preserving access
+to private declarations. Run one suite with `bash tests/run.sh store`;
+additional arguments are passed to `odin test`.
+
+Build commands run from the repository root and still write
+binaries there. See [benchmark results](docs/BENCHMARKS.md) and
+[performance notes](docs/PERFORMANCE.md).
 
 ```sh
 just vendor   # one-time: clone + build static libsecp256k1
 just build    # -> ./fastr
 just test     # run all package test suites
 ```
+
+`wss://` sync peers link system OpenSSL (`libssl`). Build with
+`odin build cmd/fastr -define:FASTR_TLS=false` to compile the TLS client out
+(used by the static container image, where only `ws://` peers work).
 
 ```sh
 ./fastr                           # serve on 0.0.0.0:8080
@@ -152,6 +175,8 @@ Accepts bare event objects or `["EVENT", {...}]` envelopes, because the world is
 | `FASTR_MAX_LIMIT` | `500` | Max events returned per REQ |
 | `FASTR_MAX_MESSAGE_BYTES` | `131072` | Max WebSocket message size |
 | `FASTR_COMPACT_INTERVAL` | `21600` | Compaction interval in seconds |
+| `FASTR_SYNC_PEERS` | unset | Comma-separated `ws(s)://` relay URLs to pull-sync from (NIP-77). Empty = disabled |
+| `FASTR_SYNC_INTERVAL` | `3600` | Seconds between sync passes |
 | `FASTR_PUBKEY` | unset | NIP-11 admin contact pubkey, as `npub1...` or 64-char hex |
 | `FASTR_CONTACT` | admin npub | NIP-11 `contact` (e.g. `mailto:`, URL, npub). Defaults to `FASTR_PUBKEY` encoded as an `npub1...`; set to empty to omit |
 | `FASTR_ICON` | `<relay url>/icon.png` | NIP-11 icon URL; the relay serves a built-in icon at `/icon.png`. Set to empty to omit |
@@ -234,11 +259,11 @@ sudo install -m 644 deploy/fastr.plist /Library/LaunchDaemons/com.arx-ccn.fastr.
 sudo launchctl load -w /Library/LaunchDaemons/com.arx-ccn.fastr.plist
 ```
 
-### Docker
+### Containers
 
 ```sh
-docker build --network=host -f deploy/Dockerfile -t fastr .
-docker run -d \
+podman build --network=host -f deploy/Dockerfile -t fastr .
+podman run -d \
   -p 127.0.0.1:8080:8080 \
   -v fastr-data:/data \
   --name fastr \
@@ -248,7 +273,7 @@ docker run -d \
 Or with Compose:
 
 ```sh
-docker compose -f deploy/docker-compose.yml up -d
+podman compose -f deploy/docker-compose.yml up -d
 ```
 
 `--network=host` may be needed at build time to fetch the Odin toolchain and libsecp256k1. The container itself runs without it, as a non-root user.
