@@ -151,8 +151,10 @@ parse_upload_pack_request :: proc(body: []u8) -> (req: Upload_Pack_Request, ok: 
 			switch line[7:] {
 			case "blob:none":
 				req.filter = .Blob_None
+			case "tree:0":
+				req.filter = .Tree_Zero
 			case:
-				req.error = "unsupported filter; only blob:none is available"
+				req.error = "unsupported filter; use blob:none or tree:0"
 			}
 		case line == "done":
 			req.done = true
@@ -225,21 +227,10 @@ handle_upload_pack :: proc(
 		return send_err(sink, user, "no wants")
 	}
 
-	// Validate wants: ref tips always; anything else must be reachable
-	// (allow-tip-sha1-in-want / allow-reachable-sha1-in-want).
-	refs := git.refs_list(repo, context.temp_allocator)
-	tips := make([]git.Oid, len(refs), context.temp_allocator)
-	tip_set := make(map[git.Oid]struct {}, context.temp_allocator)
-	for ref, i in refs {
-		tips[i] = ref.oid
-		tip_set[ref.oid] = {}
-	}
+	// GRASP-01 serves any available oid, including unreferenced PR data.
 	for want in req.wants {
-		if want in tip_set {
-			continue
-		}
-		if !git.has_object(repo, want) || !git.is_reachable(repo, want, tips) {
-			return send_err(sink, user, "want is not reachable from any ref")
+		if !git.has_object(repo, want) {
+			return send_err(sink, user, "want is not available")
 		}
 	}
 

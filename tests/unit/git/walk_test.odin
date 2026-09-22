@@ -36,6 +36,12 @@ test_collect_objects_full_clone :: proc(t: ^testing.T) {
 	for obj in objects {
 		testing.expect(t, obj.kind == .Commit || obj.kind == .Tree)
 	}
+	objects, err = collect_objects(&repo, {c2}, nil, .Tree_Zero, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, len(objects), 2)
+	for obj in objects {
+		testing.expect(t, obj.kind == .Commit)
+	}
 }
 
 @(test)

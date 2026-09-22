@@ -90,6 +90,12 @@ env_open :: proc(t: ^testing.T, ttl: i64 = 1200) -> Test_Env {
 
 @(private = "file")
 env_close :: proc(env: ^Test_Env) {
+	delete(env.state.dir)
+	delete(env.state.acceptance)
+	for host in env.state.service_hosts {
+		delete(host)
+	}
+	delete(env.state.service_hosts)
 	store.store_close(env.st)
 	_ = os.remove_all(env.dir)
 	delete(env.dir)
@@ -116,7 +122,9 @@ test_ident_valid :: proc(t: ^testing.T) {
 	testing.expect(t, !ident_valid("."))
 	testing.expect(t, !ident_valid(".."))
 	testing.expect(t, !ident_valid("a/b"))
-	testing.expect(t, !ident_valid("a b"))
+	testing.expect(t, ident_valid("a b"))
+	testing.expect(t, ident_valid("my 🚀 repo"))
+	testing.expect(t, !ident_valid("a\\b"))
 }
 
 @(private = "file")
@@ -176,6 +184,19 @@ test_ingest_check_30617 :: proc(t: ^testing.T) {
 	)
 	reason, valid := ingest_check(&env.state, &ev)
 	testing.expectf(t, valid, "rejected: %s", reason)
+
+	for bad in ([?]string{"https://relay.example.com.evil", "https://relay.example.com/extra"}) {
+		ev.tags[1] = test_tag("clone", fmt.tprintf("%s/%s/proj.git", bad, npub))
+		_, ok = ingest_check(&env.state, &ev)
+		testing.expect(t, !ok)
+	}
+	ev.tags[1] = test_tag("clone", fmt.tprintf("https://relay.example.com/%s/Proj.git", npub))
+	_, ok = ingest_check(&env.state, &ev)
+	testing.expect(t, !ok)
+	ev.tags[0] = test_tag("d", "my 🚀 repo")
+	ev.tags[1] = test_tag("clone", fmt.tprintf("https://relay.example.com/%s/my%%20%%F0%%9F%%9A%%80%%20repo.git", npub))
+	_, ok = ingest_check(&env.state, &ev)
+	testing.expect(t, ok)
 
 	// Non-30617 kinds always pass.
 	ev = test_event(1, 1, 104, nil)

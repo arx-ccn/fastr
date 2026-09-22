@@ -3,6 +3,7 @@
 package grasp
 
 import "core:strings"
+import "core:bytes"
 
 import "../git"
 import "../githttp"
@@ -25,7 +26,7 @@ ingest_check :: proc(s: ^State, ev: ^pack.Event) -> (reason: string, ok: bool) {
 
 	npub := nostr.npub_encode(ev.pubkey, context.temp_allocator)
 	want_clone_suffix := strings.concatenate(
-		{"/", npub, "/", strings.to_lower(ident, context.temp_allocator), ".git"},
+		{"/", npub, "/", ident, ".git"},
 		context.temp_allocator,
 	)
 
@@ -37,16 +38,21 @@ ingest_check :: proc(s: ^State, ev: ^pack.Event) -> (reason: string, ok: bool) {
 		switch tag.fields[0] {
 		case "clone":
 			for value in tag.fields[1:] {
+				if !strings.has_prefix(value, "https://") && !strings.has_prefix(value, "http://") {
+					continue
+				}
 				normalized := normalize_url(value)
 				for host in s.service_hosts {
-					if strings.has_prefix(normalized, host) &&
-					   strings.has_suffix(normalized, want_clone_suffix) {
+					if normalized == strings.concatenate({host, want_clone_suffix}, context.temp_allocator) {
 						clone_ok = true
 					}
 				}
 			}
 		case "relays":
 			for value in tag.fields[1:] {
+				if !strings.has_prefix(value, "wss://") && !strings.has_prefix(value, "ws://") {
+					continue
+				}
 				normalized := normalize_url(value)
 				for host in s.service_hosts {
 					if normalized == host {
@@ -83,7 +89,10 @@ post_store :: proc(s: ^State, ev: ^pack.Event) {
 			return
 		}
 		defer git.repo_close(&repo, context.temp_allocator)
-		apply_state_head(&repo, ev)
+		latest, found := latest_state(s, ev.pubkey, ident)
+		if found {
+			apply_state_head(&repo, &latest)
+		}
 	}
 }
 
@@ -94,7 +103,8 @@ apply_state_head :: proc(repo: ^git.Repo, state_ev: ^pack.Event) {
 	if !ok {
 		return
 	}
-	if _, exists := git.ref_read(repo, target); !exists {
+	want, listed := state_ref_oid(state_ev, target)
+	if current, exists := git.ref_read(repo, target); !exists || !listed || current != want || !git.has_object(repo, current) {
 		return
 	}
 	current, detached, hok := git.head_read(repo, context.temp_allocator)
@@ -131,15 +141,9 @@ maintainer_set :: proc(
 	set := make(map[[32]u8]struct {}, allocator)
 	queue := make([dynamic][32]u8, 0, 4, context.temp_allocator)
 	append(&queue, owner)
-	depth := 0
-	for len(queue) > 0 && depth < MAX_MAINTAINER_DEPTH {
-		depth += 1
-		next := make([dynamic][32]u8, 0, 4, context.temp_allocator)
-		for pk in queue {
-			if pk in set {
-				continue
-			}
-			set[pk] = {}
+	set[owner] = {}
+	for i := 0; i < len(queue); i += 1 {
+			pk := queue[i]
 			ev, found := store.latest_addressable(
 				s.store,
 				pk,
@@ -160,13 +164,13 @@ maintainer_set :: proc(
 					}
 					m: [32]u8
 					if _, herr := pack.hex_decode(transmute([]u8)value, m[:]); herr == .None {
-						append(&next, m)
+						if !(m in set) {
+							set[m] = {}
+							append(&queue, m)
+						}
 					}
 				}
 			}
-		}
-		clear(&queue)
-		append(&queue, ..next[:])
 	}
 	return set
 }
@@ -189,7 +193,8 @@ latest_state :: proc(
 		if !has {
 			continue
 		}
-		if !found || candidate.created_at > best.created_at {
+		if !found || candidate.created_at > best.created_at ||
+		   (candidate.created_at == best.created_at && bytes.compare(candidate.id[:], best.id[:]) < 0) {
 			best = candidate
 			found = true
 		}

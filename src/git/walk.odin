@@ -5,6 +5,7 @@ package git
 Filter :: enum u8 {
 	None,
 	Blob_None, // partial clone --filter=blob:none: omit all blobs
+	Tree_Zero, // partial clone --filter=tree:0: omit trees and blobs
 }
 
 // One object headed for a pack.
@@ -66,10 +67,17 @@ collect_objects :: proc(
 		if rerr != .None {
 			return nil, .Corrupt
 		}
-		if !(filter == .Blob_None && kind == .Blob) {
+		if !(filter == .Blob_None && kind == .Blob) &&
+		   !(filter == .Tree_Zero && (kind == .Tree || kind == .Blob)) {
 			append(&out, Pack_Object{oid, kind})
 		}
-		mark_children(kind, data, &queue)
+		if filter == .Tree_Zero && kind == .Commit {
+			if info, ok := parse_commit(data, context.temp_allocator); ok {
+				append(&queue, ..info.parents)
+			}
+		} else if filter != .Tree_Zero || kind != .Tree {
+			mark_children(kind, data, &queue)
+		}
 		delete(data, context.allocator)
 	}
 	return out[:], .None

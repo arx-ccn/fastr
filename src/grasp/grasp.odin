@@ -5,8 +5,10 @@
 package grasp
 
 import "core:fmt"
+import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:unicode/utf8"
 
 import "../git"
 import "../pack"
@@ -18,9 +20,6 @@ KIND_PATCH :: u16(1617)
 KIND_PR :: u16(1618)
 KIND_PR_UPDATE :: u16(1619)
 KIND_ISSUE :: u16(1621)
-
-// Cap on the recursive maintainer resolution (30617 -> maintainers -> ...).
-MAX_MAINTAINER_DEPTH :: 32
 
 State :: struct {
 	store:         ^store.Store,
@@ -39,7 +38,7 @@ State :: struct {
 }
 
 // Normalize a URL to "host[:port][/path]" — scheme-insensitive, no trailing
-// slash, lowercased host+path (repo identity comparison only).
+// slash. Hosts ignore case; repository identifiers preserve it.
 normalize_url :: proc(url: string, allocator := context.temp_allocator) -> string {
 	s := url
 	for prefix in ([?]string{"https://", "http://", "wss://", "ws://"}) {
@@ -49,7 +48,16 @@ normalize_url :: proc(url: string, allocator := context.temp_allocator) -> strin
 		}
 	}
 	s = strings.trim_suffix(s, "/")
-	return strings.to_lower(s, allocator)
+	host := s
+	path := ""
+	if slash := strings.index_byte(s, '/'); slash >= 0 {
+		host, path = s[:slash], s[slash:]
+	}
+	decoded, ok := net.percent_decode(path, context.temp_allocator)
+	if !ok {
+		return ""
+	}
+	return strings.concatenate({strings.to_lower(host, context.temp_allocator), decoded}, allocator)
 }
 
 state_init :: proc(
@@ -113,13 +121,12 @@ event_d_tag :: proc(ev: ^pack.Event) -> (d: string, ok: bool) {
 // Repository identifiers become filesystem path segments: conservative
 // charset, no dot-only names.
 ident_valid :: proc(ident: string) -> bool {
-	if len(ident) == 0 || len(ident) > 256 || ident == "." || ident == ".." {
+	if len(ident) == 0 || len(ident) > 251 || ident == "." || ident == ".." || !utf8.valid_string(ident) {
 		return false
 	}
 	for i in 0 ..< len(ident) {
 		switch ident[i] {
-		case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9', '.', '_', '-':
-		case:
+		case 0 ..= 31, 127, '/', '\\':
 			return false
 		}
 	}
