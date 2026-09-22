@@ -262,7 +262,7 @@ chunked_start :: proc(w: ^Chunked_Writer, content_type: string) -> bool {
 		"Cache-Control: no-cache\r\n" +
 		"Access-Control-Allow-Origin: *\r\n" +
 		"Access-Control-Allow-Methods: GET, POST\r\n" +
-		"Access-Control-Allow-Headers: Content-Type\r\n" +
+		"Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
 		"Connection: close\r\n" +
 		"\r\n",
 	)

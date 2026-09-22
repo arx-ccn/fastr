@@ -2,7 +2,7 @@
 // header is deliberately ignored — clients fall back to v0).
 //
 // Capabilities: side-band-64k, allow-{tip,reachable}-sha1-in-want, filter
-// (blob:none). No multi_ack/no-done: the base protocol terminates correctly
+// (blob:none and tree:0). No multi_ack/no-done: the base protocol terminates correctly
 // (clients batch haves per request and finish with "done"), just with more
 // round-trips on deep incremental fetches. No shallow: `clone --depth`
 // fails client-side with a clear message; GRASP does not require it.

@@ -113,6 +113,8 @@ test_normalize_url :: proc(t: ^testing.T) {
 	testing.expect_value(t, normalize_url("wss://relay.example.com"), "relay.example.com")
 	testing.expect_value(t, normalize_url("http://h:8080/x/"), "h:8080/x")
 	testing.expect_value(t, normalize_url("relay.example.com"), "relay.example.com")
+	testing.expect_value(t, normalize_url("https://relay.example.com/%%"), "")
+	testing.expect_value(t, normalize_url("https://relay.example.com/%z0"), "")
 }
 
 @(test)
@@ -194,7 +196,7 @@ test_ingest_check_30617 :: proc(t: ^testing.T) {
 	_, ok = ingest_check(&env.state, &ev)
 	testing.expect(t, !ok)
 	ev.tags[0] = test_tag("d", "my 🚀 repo")
-	ev.tags[1] = test_tag("clone", fmt.tprintf("https://relay.example.com/%s/my%%20%%F0%%9F%%9A%%80%%20repo.git", npub))
+	ev.tags[1] = test_tag("clone", fmt.tprintf("https://relay.example.com/%s/%s.git", npub, "my%20%F0%9F%9A%80%20repo"))
 	_, ok = ingest_check(&env.state, &ev)
 	testing.expect(t, ok)
 

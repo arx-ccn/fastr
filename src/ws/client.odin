@@ -12,6 +12,7 @@ import "core:fmt"
 import "core:net"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 
 import "../tls"
 
@@ -93,6 +94,11 @@ client_connect :: proc(
 	c.sock = sock
 	c.secure = secure
 	c.mask_gen = u64(uintptr(c)) | 1
+	if net.set_option(sock, .Receive_Timeout, 30 * time.Second) != nil ||
+	   net.set_option(sock, .Send_Timeout, 30 * time.Second) != nil {
+		net.close(sock)
+		return .Socket
+	}
 
 	if secure {
 		tconn, terr := tls.connect(int(uintptr(sock)), host)

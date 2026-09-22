@@ -53,6 +53,21 @@ normalize_url :: proc(url: string, allocator := context.temp_allocator) -> strin
 	if slash := strings.index_byte(s, '/'); slash >= 0 {
 		host, path = s[:slash], s[slash:]
 	}
+	for i := 0; i < len(path); i += 1 {
+		if path[i] != '%' {
+			continue
+		}
+		if i + 2 >= len(path) {
+			return ""
+		}
+		for j in i + 1 ..= i + 2 {
+			c := path[j]
+			if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+				return ""
+			}
+		}
+		i += 2
+	}
 	decoded, ok := net.percent_decode(path, context.temp_allocator)
 	if !ok {
 		return ""

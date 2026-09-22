@@ -18,6 +18,9 @@ HANDSHAKE_RESPONSE_LEN :: len(HANDSHAKE_PREFIX) + ACCEPT_KEY_LEN + 4
 HANDSHAKE_PREFIX :: "HTTP/1.1 101 Switching Protocols\r\n" +
 	"Upgrade: websocket\r\n" +
 	"Connection: Upgrade\r\n" +
+	"Access-Control-Allow-Origin: *\r\n" +
+	"Access-Control-Allow-Methods: GET, POST\r\n" +
+	"Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
 	"Sec-WebSocket-Accept: "
 
 // compute_accept_key derives Sec-WebSocket-Accept =

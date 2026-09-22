@@ -57,6 +57,9 @@ test_handshake_response_bytes :: proc(t: ^testing.T) {
 		"HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
+		"Access-Control-Allow-Origin: *\r\n" +
+		"Access-Control-Allow-Methods: GET, POST\r\n" +
+		"Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
 		"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
 	testing.expect_value(t, string(resp), expected)
 	testing.expect_value(t, len(resp), HANDSHAKE_RESPONSE_LEN)
