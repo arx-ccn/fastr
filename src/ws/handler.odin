@@ -18,16 +18,15 @@ package ws
 import "core:encoding/endian"
 import "core:net"
 import "core:slice"
-import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
 import "core:thread"
-import "core:unicode/utf8"
 
 import "../negentropy"
 import "../nostr"
 import "../pack"
+import "../policy"
 import "../store"
 
 OUTBOX_CAPACITY :: 512
@@ -160,33 +159,15 @@ writer_loop :: proc(cs: ^Conn_State) {
 			delete(m.frames)
 			free_all(context.temp_allocator)
 		case Out_Live:
-			// NIP-17: kind-1059 gift wraps only go to the p-tagged recipient.
-			// NIP-70: protected events only go to connections authed as author.
 			ev := &m.live.shared.ev
-			allowed := true
-			if ev.kind == nostr.KIND_GIFT_WRAP {
-				allowed = false
-				sync.shared_guard(&cs.outbox.auth_mu)
-				for pk in cs.outbox.auth_pks {
-					pk := pk
-					if nostr.event_has_p_tag(ev, &pk) {
-						allowed = true
-						break
-					}
-				}
-			}
-			if allowed && nostr.has_protected_tag(ev.tags) {
-				sync.shared_guard(&cs.outbox.auth_mu)
-				allowed = ev.pubkey in cs.outbox.auth_pks
-			}
-			if allowed {
+			if live_allowed(cs, m.live) {
 				buf := make([dynamic]u8, 0, 512, context.temp_allocator)
 				nostr.write_event_json(m.live.sub_id, ev, &buf)
 				if conn_write_text(&cs.conn, buf[:]) != .None {
 					dead = true
 				}
-				free_all(context.temp_allocator)
 			}
+			free_all(context.temp_allocator)
 			delete(m.live.sub_id)
 			shared_event_release(m.live.shared)
 		case Out_Pong:
@@ -200,6 +181,48 @@ writer_loop :: proc(cs: ^Conn_State) {
 			}
 		}
 	}
+}
+
+// Reject queued events from closed/replaced subscriptions before running policy.
+@(private)
+live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
+	{
+		sync.shared_guard(&cs.relay.fanout.mu)
+		if sub, found := cs.relay.fanout.subs[live.key]; !found || sub.outbox != cs.outbox {
+			return false
+		}
+	}
+	auth: [MAX_AUTH_PUBKEYS][32]u8
+	n := 0
+	{
+		sync.shared_guard(&cs.outbox.auth_mu)
+		for pk in cs.outbox.auth_pks {
+			auth[n] = pk
+			n += 1
+		}
+	}
+	ev := &live.shared.ev
+	if ev.kind == nostr.KIND_GIFT_WRAP {
+		matched := false
+		for &pk in auth[:n] {
+			if nostr.event_has_p_tag(ev, &pk) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if nostr.has_protected_tag(ev.tags) && !slice.contains(auth[:n], ev.pubkey) {
+		return false
+	}
+	if cs.relay.hooks.check_read != nil {
+		principal := policy.Principal{source = .Client, conn_id = cs.outbox.conn_id, auth_pks = auth[:n]}
+		view := pack.view_event(ev)
+		return cs.relay.hooks.check_read(cs.relay.hooks.user, &principal, &view) == .Show
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -417,162 +440,17 @@ handle_auth :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 // ---------------------------------------------------------------------------
 // EVENT
 
-// NIP-62: a vanish request applies to this relay only if it carries a
-// `relay` tag matching our relay_url domain or the literal ALL_RELAYS.
-@(private)
-vanish_targets_relay :: proc(ev: ^pack.Event, relay_url: string) -> bool {
-	our_domain := url_domain(relay_url)
-	for tag in ev.tags {
-		if len(tag.fields) < 2 || tag.fields[0] != "relay" {
-			continue
-		}
-		value := tag.fields[1]
-		if value == "ALL_RELAYS" || url_domain(value) == our_domain {
-			return true
-		}
-	}
-	return false
-}
-
-// Clone the (temp-arena) event into the heap and broadcast it.
-@(private)
-broadcast_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
-	shared := shared_event_new(event_clone(ev, context.allocator))
-	fanout_broadcast(&cs.relay.fanout, shared)
-	shared_event_release(shared)
-}
-
 @(private)
 handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
-	cfg := &cs.relay.cfg
-	id := ev.id
-
-	// Enforce advertised NIP-11 limits before expensive crypto validation.
-	if len(ev.tags) > cfg.max_event_tags {
-		send_ok(cs, &id, false, "invalid: too many tags")
-		return
+	auth: [MAX_AUTH_PUBKEYS][32]u8
+	n := 0
+	for pk in cs.auth.authenticated {
+		auth[n] = pk
+		n += 1
 	}
-	// NIP-11 max_content_length is a CHARACTER count, not bytes (#115).
-	if utf8.rune_count_in_string(ev.content) > relay_content_limit_for_kind(cfg, ev.kind) {
-		send_ok(cs, &id, false, "invalid: content too long")
-		return
-	}
-
-	// NIP-13: enforce minimum proof-of-work. Cheap bit-count on the claimed id;
-	// validate_event's event_id_hash check below prevents a forged low-work id
-	// from claiming a higher difficulty than it actually has.
-	if cfg.min_pow_difficulty > 0 {
-		if pow := nostr.leading_zero_bits(&ev.id); pow < cfg.min_pow_difficulty {
-			send_ok(cs, &id, false, pow_reject_reason(pow, cfg.min_pow_difficulty))
-			return
-		}
-	}
-
-	if reason, valid := nostr.validate_event(ev); !valid {
-		send_ok(cs, &id, false, reason)
-		return
-	}
-
-	// NIP-62: reject events from vanished pubkeys.
-	if store.store_is_vanished(cs.relay.store, ev.pubkey) {
-		send_ok(cs, &id, false, "blocked: pubkey vanished")
-		return
-	}
-
-	// NIP-70: reject protected events unless AUTH'd as the author.
-	if nostr.has_protected_tag(ev.tags) && ev.pubkey not_in cs.auth.authenticated {
-		send_ok(cs, &id, false, "auth-required: protected event")
-		return
-	}
-
-	// Feature-layer policy veto (e.g. GRASP 30617 acceptance).
-	if cs.relay.ingest_hook != nil {
-		if reason, hook_ok := cs.relay.ingest_hook(cs.relay.hook_user, ev); !hook_ok {
-			send_ok(cs, &id, false, reason)
-			return
-		}
-	}
-
-	kind_class, d_hash := nostr.classify_kind(ev.kind, ev.tags)
-
-	// Ephemeral events skip storage.
-	if kind_class == .Ephemeral {
-		// NIP-42: never broadcast kind-22242 AUTH events to subscribers.
-		if ev.kind != nostr.KIND_AUTH {
-			broadcast_event(cs, ev)
-		}
-		send_ok(cs, &id, true, "")
-		return
-	}
-
-	// NIP-62 vanish requests: persist, then apply if targeted at us.
-	if kind_class == .Vanish {
-		targets_us := vanish_targets_relay(ev, cfg.relay_url)
-		err, reason := store.append_classified(cs.relay.store, ev, kind_class, d_hash)
-		switch err {
-		case .None:
-			if targets_us {
-				store.store_vanish(cs.relay.store, ev)
-			}
-			broadcast_event(cs, ev)
-			send_ok(cs, &id, true, "")
-		case .Duplicate:
-			send_ok(cs, &id, true, "duplicate: already have this event")
-		case .Duplicate_Newer:
-			send_ok(cs, &id, true, "duplicate: have newer version")
-		case .Invalid_Event:
-			send_ok(cs, &id, false, prefixed(cs, "invalid: ", reason))
-		case .Rejected:
-			send_ok(cs, &id, false, reason)
-		case .Io, .Mmap_Failed, .Incompatible_Index, .Pack_Invalid:
-			send_ok(cs, &id, false, "error: internal store error")
-		}
-		return
-	}
-
-	err, reason := store.append_classified(cs.relay.store, ev, kind_class, d_hash)
-	switch err {
-	case .None:
-		if !store.store_is_tombstoned(cs.relay.store, ev.id) {
-			broadcast_event(cs, ev)
-		}
-		if cs.relay.post_store_hook != nil {
-			cs.relay.post_store_hook(cs.relay.hook_user, ev)
-		}
-		send_ok(cs, &id, true, "")
-	case .Duplicate:
-		send_ok(cs, &id, true, "duplicate: already have this event")
-	case .Duplicate_Newer:
-		// NIP-01 (#102): newer version exists — accepted no-op.
-		send_ok(cs, &id, true, "duplicate: have newer version")
-	case .Rejected:
-		send_ok(cs, &id, false, reason)
-	case .Invalid_Event:
-		// NIP-40 expiry and future policy checks surface as `invalid:` (#68).
-		send_ok(cs, &id, false, prefixed(cs, "invalid: ", reason))
-	case .Io, .Mmap_Failed, .Incompatible_Index, .Pack_Invalid:
-		send_ok(cs, &id, false, "error: internal store error")
-	}
-}
-
-@(private)
-prefixed :: proc(cs: ^Conn_State, prefix: string, reason: string) -> string {
-	buf := make([dynamic]u8, 0, len(prefix) + len(reason), context.temp_allocator)
-	append(&buf, prefix)
-	append(&buf, reason)
-	return string(buf[:])
-}
-
-// NIP-13 rejection reason, hand-built to keep core:fmt out of this file.
-@(private)
-pow_reject_reason :: proc(got, want: int) -> string {
-	nbuf: [20]u8
-	buf := make([dynamic]u8, 0, 48, context.temp_allocator)
-	append(&buf, "pow: difficulty ")
-	append(&buf, strconv.write_int(nbuf[:], i64(got), 10))
-	append(&buf, " below minimum ")
-	append(&buf, strconv.write_int(nbuf[:], i64(want), 10))
-	return string(buf[:])
+	principal := policy.Principal{source = .Client, conn_id = cs.outbox.conn_id, auth_pks = auth[:n]}
+	err, reason := ingest_event(cs.relay, principal, ev)
+	send_ok(cs, &ev.id, err == .None || err == .Duplicate || err == .Duplicate_Newer, reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +486,7 @@ req_emit :: proc(user: rawptr, dp: []u8) -> store.Error {
 		ctx.seen^[id] = {}
 	}
 	created_at := i64(endian.unchecked_get_u64le(dp[128:136]))
-	buf := make([dynamic]u8, 0, 1024)
+	buf := make([dynamic]u8, 0, max(1024, len(dp) + len(ctx.sub_id) + 512))
 	if err := pack.transcode_to_event_json(dp, ctx.sub_id, &buf); err != .None {
 		delete(buf)
 		return .Pack_Invalid
@@ -627,8 +505,28 @@ collect_auth_pks :: proc(cs: ^Conn_State) -> [][32]u8 {
 }
 
 @(private)
+read_access :: proc(cs: ^Conn_State) -> policy.Read_Access {
+	return {
+		principal = {source = .Client, conn_id = cs.outbox.conn_id, auth_pks = collect_auth_pks(cs)},
+		user = cs.relay.hooks.user,
+		check = cs.relay.hooks.check_read,
+	}
+}
+
+@(private)
+request_denial :: proc(cs: ^Conn_State, access: policy.Read_Access, op: policy.Operation, filters: []nostr.Filter) -> string {
+	if cs.relay.hooks.check_request == nil {
+		return ""
+	}
+	principal := access.principal
+	d := cs.relay.hooks.check_request(cs.relay.hooks.user, &principal, op, filters)
+	return policy.decision_reason(d)
+}
+
+@(private)
 handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 	cfg := &cs.relay.cfg
+	remove_live_sub(cs, sub_id)
 
 	// NIP-77: REQ namespace cap only; replacing an existing sub_id is free.
 	if len(cs.live_subs) >= cfg.max_subscriptions_per_conn && sub_id not_in cs.live_subs {
@@ -651,6 +549,12 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 		}
 	}
 
+	access := read_access(cs)
+	if reason := request_denial(cs, access, .Req, filters); reason != "" {
+		send_closed(cs, sub_id, reason)
+		return
+	}
+
 	// #65: register the fanout subscription BEFORE the stored query so events
 	// published during the query queue in the outbox rather than being lost.
 	if sub_id not_in cs.live_subs {
@@ -664,14 +568,16 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 		sub_id = sub_id,
 		hits   = &hits,
 	}
-	// One store query emits unique IDs; only a filter union needs deduplication.
-	if len(filters) > 1 {
-		seen = make(map[[32]u8]struct {}, context.temp_allocator)
-		qctx.seen = &seen
-	}
-	auth_pks := collect_auth_pks(cs)
-	for &filter in filters {
-		if err := store.query_authed(cs.relay.store, &filter, auth_pks, &qctx, req_emit); err != .None {
+	for &filter, i in filters {
+		if i == 1 {
+			// Seed the union from the already-unique first query.
+			seen = make(map[[32]u8]struct {}, len(hits), context.temp_allocator)
+			for hit in hits {
+				seen[hit.id] = {}
+			}
+			qctx.seen = &seen
+		}
+		if err := store.query_authed(cs.relay.store, &filter, access.principal.auth_pks, &qctx, req_emit, access); err != .None {
 			// #73: roll back and tell the client instead of a lying EOSE.
 			remove_live_sub(cs, sub_id)
 			for hit in hits {
@@ -720,8 +626,12 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 
 @(private)
 handle_count :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
-	auth_pks := collect_auth_pks(cs)
-	total := store.count_filters(cs.relay.store, filters, auth_pks)
+	access := read_access(cs)
+	if reason := request_denial(cs, access, .Count, filters); reason != "" {
+		send_closed(cs, sub_id, reason)
+		return
+	}
+	total := store.count_filters(cs.relay.store, filters, access.principal.auth_pks, access)
 	buf := make([dynamic]u8, 0, 96)
 	append(&buf, "[\"COUNT\",")
 	pack.write_json_str(sub_id, &buf)
@@ -814,14 +724,19 @@ handle_neg_open :: proc(cs: ^Conn_State, sub_id: string, filter: ^nostr.Filter, 
 		return
 	}
 
+	access := read_access(cs)
+	if reason := request_denial(cs, access, .Neg_Open, []nostr.Filter{filter^}); reason != "" {
+		send_neg_err(cs, sub_id, reason)
+		return
+	}
+
 	session := new(Neg_Session)
 	session.storage = negentropy.storage_make()
 
 	fill := Neg_Fill_Ctx {
 		storage = &session.storage,
 	}
-	auth_pks := collect_auth_pks(cs)
-	if err, reason := store.iter_negentropy(cs.relay.store, filter, auth_pks, cfg.max_neg_records, &fill, neg_fill);
+	if err, reason := store.iter_negentropy(cs.relay.store, filter, access.principal.auth_pks, cfg.max_neg_records, &fill, neg_fill, access);
 	   err != .None {
 		// #79: record-cap rejections carry "blocked:" and max_records.
 		max_records := cfg.max_neg_records if strings.has_prefix(reason, "blocked:") else -1

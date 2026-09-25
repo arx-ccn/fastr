@@ -28,6 +28,7 @@ Grasp_Http :: struct {
 	max_pack_bytes: int, // push body / inflated object ceiling
 	// Policy layer (30617 acceptance, push authorization, HEAD tracking).
 	state:          ^grasp.State,
+	profiles:       ^Grasp_Profiles,
 }
 
 // A parsed /<npub>/<ident>.git request path.
@@ -38,6 +39,8 @@ Repo_Route :: struct {
 	ident:     string, // decoded repository identifier
 	suffix:    string, // "", "/info/refs", "/git-upload-pack", ...
 	query:     string, // raw query string (no '?')
+	pr_only:   bool,
+	url_path:  string,
 }
 
 // Handle a non-websocket HTTP request if it addresses a GRASP repo path.
@@ -55,9 +58,23 @@ grasp_try_handle :: proc(
 	if !matched {
 		return false
 	}
+	if g.profiles != nil && g.profiles.cfg.grasp_private &&
+	   !grasp_http_auth(g.profiles, route.url_path, req) {
+		_, _ = net.send_tcp(sock, transmute([]u8)string(GRASP_AUTH_RESPONSE))
+		return true
+	}
 
 	// Unknown repository: GRASP mandates a 404 here.
 	repo, oerr := git.repo_open(route.repo_path, context.temp_allocator)
+	if oerr != .None && route.pr_only {
+		if req.method == "POST" && route.suffix == "/git-receive-pack" {
+			repo, oerr = git.repo_init_bare(route.repo_path, context.temp_allocator)
+		} else {
+			// An absent PR repository advertises no refs without allocating disk.
+			repo.path = strings.clone(route.repo_path, context.temp_allocator)
+			oerr = .None
+		}
+	}
 	if oerr != .None {
 		_, _ = net.send_tcp(sock, transmute([]u8)string(NOT_FOUND_RESPONSE))
 		return true
@@ -93,6 +110,13 @@ grasp_parse_path :: proc(g: ^Grasp_Http, raw_path: string) -> (route: Repo_Route
 		return {}, false
 	}
 	rest := path[1:]
+	if strings.has_prefix(rest, "prs/") {
+		if g.profiles == nil {
+			return {}, false
+		}
+		route.pr_only = true
+		rest = rest[4:]
+	}
 	slash := strings.index_byte(rest, '/')
 	if slash < 0 {
 		return {}, false
@@ -104,10 +128,14 @@ grasp_parse_path :: proc(g: ^Grasp_Http, raw_path: string) -> (route: Repo_Route
 	}
 
 	tail := rest[slash + 1:]
-	git_ext := strings.index(tail, ".git")
-	if git_ext <= 0 {
+	segment := tail
+	if slash := strings.index_byte(tail, '/'); slash >= 0 {
+		segment = tail[:slash]
+	}
+	if !strings.has_suffix(segment, ".git") || len(segment) <= 4 {
 		return {}, false
 	}
+	git_ext := len(segment) - 4
 	encoded_ident := tail[:git_ext]
 	route.suffix = tail[git_ext + 4:]
 	if route.suffix != "" && route.suffix[0] != '/' {
@@ -123,9 +151,17 @@ grasp_parse_path :: proc(g: ^Grasp_Http, raw_path: string) -> (route: Repo_Route
 	pack.hex_encode_into(pubkey[:], &hex)
 	route.owner = pubkey
 	route.ident = ident
+	base := g.dir
+	if route.pr_only {
+		base = strings.concatenate({base, "/prs"}, context.temp_allocator)
+	}
+	route.url_path = fmt.tprintf("/%s/%s.git", nostr.npub_encode(pubkey, context.temp_allocator), net.percent_encode(ident, context.temp_allocator))
+	if route.pr_only {
+		route.url_path = strings.concatenate({"/prs", route.url_path}, context.temp_allocator)
+	}
 	route.repo_path = fmt.aprintf(
 		"%s/%s/%s.git",
-		g.dir,
+		base,
 		string(hex[:]),
 		ident,
 		allocator = context.temp_allocator,
@@ -220,6 +256,9 @@ grasp_receive_pack :: proc(
 		}
 		auth = grasp.authorize_push
 		auth_user = &push_ctx
+		if route.pr_only {
+			auth = grasp_pr_authorize
+		}
 	}
 
 	if githttp.handle_receive_pack(
@@ -234,9 +273,20 @@ grasp_receive_pack :: proc(
 		_ = githttp.chunked_finish(&w)
 	}
 	// GRASP-01: set HEAD as soon as the branch data has been received.
-	if g.state != nil {
+	if g.state != nil && !route.pr_only {
 		grasp.after_push(g.state, route.owner, route.ident)
 	}
+}
+
+@(private)
+grasp_pr_authorize :: proc(user: rawptr, cmds: []githttp.Ref_Cmd) -> []string {
+	results := grasp.authorize_push(user, cmds)
+	for cmd, i in cmds {
+		if !strings.has_prefix(cmd.name, "refs/nostr/") {
+			results[i] = "alternative PR hosting only accepts refs/nostr/<event-id>"
+		}
+	}
+	return results
 }
 
 // POST /<repo>.git/git-upload-pack

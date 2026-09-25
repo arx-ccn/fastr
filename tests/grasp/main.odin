@@ -25,11 +25,17 @@ PORT :: 8971
 // skips defers).
 @(private)
 g_server: Maybe(os.Process)
+@(private)
+g_extra: Maybe(os.Process)
 
 @(private)
 fail :: proc(msg: string, args: ..any) {
 	fmt.eprintf("GRASP SMOKE FAIL: ")
 	fmt.eprintfln(msg, ..args)
+	if server, ok := g_extra.?; ok {
+		_ = os.process_kill(server)
+		_, _ = os.process_wait(server)
+	}
 	if server, ok := g_server.?; ok {
 		_ = os.process_kill(server)
 		_, _ = os.process_wait(server)
@@ -399,6 +405,7 @@ main :: proc() {
 		fail("cloned tip %s != pushed tip %s", cloned_tip, tip2)
 	}
 	run_ok(clone, "git", "fsck")
+	check_profiles(work, abs_fastr, src, &signer, tip2, &conn)
 
 	fmt.println("GRASP SMOKE PASS")
 }

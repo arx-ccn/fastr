@@ -36,6 +36,7 @@ Relay_Info :: struct {
 	name:                     string,
 	description:              string,
 	pubkey:                   string, // "" = absent
+	owner:                    string,
 	contact:                  string, // "" = absent
 	icon:                     string, // "" = absent
 	banner:                   string, // "" = absent
@@ -44,6 +45,7 @@ Relay_Info :: struct {
 	// GRASP-01: e.g. ["GRASP-01"]. Empty = grasp disabled, fields omitted.
 	supported_grasps:         []string,
 	repo_acceptance_criteria: string,
+	curation:                 string,
 	software:                 string,
 	version:                  string,
 	limitation:               Limitation,
@@ -70,15 +72,31 @@ relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> 
 	supported_grasps: []string
 	acceptance := ""
 	if cfg.grasp_enabled {
-		grasps := make([]string, 1, allocator)
-		grasps[0] = "GRASP-01"
-		supported_grasps = grasps
+		grasps := make([dynamic]string, 0, 6, allocator)
+		append(&grasps, "GRASP-01")
+		if cfg.grasp_sync {
+			append(&grasps, "GRASP-02")
+			if cfg.grasp_sync_plus {
+				append(&grasps, "GRASP-03")
+			}
+		}
+		if cfg.grasp_archive {
+			append(&grasps, "GRASP-05")
+		}
+		if !cfg.grasp_private {
+			append(&grasps, "GRASP-06")
+		}
+		if cfg.grasp_private {
+			append(&grasps, "GRASP-08")
+		}
+		supported_grasps = grasps[:]
 		acceptance = cfg.grasp_acceptance
 	}
 	return Relay_Info {
 		name = "fastr",
 		description = "A high-performance Nostr relay",
 		pubkey = cfg.pubkey,
+		owner = grasp_owner(cfg, allocator),
 		contact = cfg.contact,
 		icon = cfg.icon,
 		banner = cfg.banner,
@@ -86,6 +104,7 @@ relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> 
 		supported_nips = nips,
 		supported_grasps = supported_grasps,
 		repo_acceptance_criteria = acceptance,
+		curation = cfg.grasp_curation if cfg.grasp_enabled else "",
 		software = "https://github.com/arx-ccn/fastr",
 		version = VERSION,
 		limitation = Limitation {
@@ -102,7 +121,7 @@ relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> 
 			created_at_upper_limit = nostr.CREATED_AT_WINDOW,
 			created_at_lower_limit = 0,
 			min_pow_difficulty = cfg.min_pow_difficulty,
-			auth_required = false,
+			auth_required = cfg.grasp_enabled && cfg.grasp_private,
 		},
 	}
 }
@@ -146,6 +165,10 @@ relay_info_json :: proc(info: ^Relay_Info, allocator := context.allocator) -> st
 		strings.write_string(&b, `,"pubkey":`)
 		write_json_string(&b, info.pubkey)
 	}
+	if info.owner != "" {
+		strings.write_string(&b, `,"owner":`)
+		write_json_string(&b, info.owner)
+	}
 	if info.contact != "" {
 		strings.write_string(&b, `,"contact":`)
 		write_json_string(&b, info.contact)
@@ -182,6 +205,10 @@ relay_info_json :: proc(info: ^Relay_Info, allocator := context.allocator) -> st
 		if info.repo_acceptance_criteria != "" {
 			strings.write_string(&b, `,"repo_acceptance_criteria":`)
 			write_json_string(&b, info.repo_acceptance_criteria)
+		}
+		if info.curation != "" {
+			strings.write_string(&b, `,"curation":`)
+			write_json_string(&b, info.curation)
 		}
 	}
 	strings.write_string(&b, `,"software":`)
@@ -275,7 +302,7 @@ We did it, nostr!
 CORS_HEADERS ::
 	"Access-Control-Allow-Origin: *\r\n" +
 	"Access-Control-Allow-Methods: GET, POST\r\n" +
-	"Access-Control-Allow-Headers: Content-Type\r\n"
+	"Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
 
 // Pre-rendered 204 reply for OPTIONS preflight requests (GRASP-01).
 OPTIONS_RESPONSE ::

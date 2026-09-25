@@ -14,6 +14,7 @@ test:
 check:
     odin check src/secp256k1 -vet -strict-style -no-entry-point
     odin check src/pack -vet -strict-style -no-entry-point
+    odin check src/policy -vet -strict-style -no-entry-point
     odin check src/negentropy -vet -strict-style -no-entry-point
     odin check src/nostr -vet -strict-style -no-entry-point
     odin check src/git -vet -strict-style -no-entry-point
@@ -29,8 +30,8 @@ check:
     odin check tests/wsclient -vet -strict-style -no-entry-point
     odin check cmd/wsq
     odin check cmd/genevent
-    odin check bench/query
-    odin check bench/relay
+    odin check tests/bench/query
+    odin check tests/bench/relay
 
 # Clone + build vendored libsecp256k1 (one-time)
 vendor:

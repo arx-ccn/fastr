@@ -3,7 +3,7 @@
 # Dockerfile - fastr production image (minimal)
 #
 # Builds the Odin relay with a statically linked vendored libsecp256k1 and
-# drops it into a distroless image.
+# includes Git and curl for GRASP synchronization and private-peer discovery.
 #
 # Build (--network=host may be needed to fetch the Odin toolchain + secp256k1):
 #   podman build --network=host -f deploy/Dockerfile -t fastr .
@@ -25,7 +25,7 @@
 FROM ubuntu:24.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git cmake make clang llvm curl xz-utils \
+    ca-certificates git cmake make clang llvm curl xz-utils libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Odin toolchain (pinned monthly release).
@@ -49,27 +49,31 @@ RUN git clone --depth 1 --branch v0.7.0 https://github.com/bitcoin-core/secp256k
 COPY src/ src/
 COPY cmd/fastr/ cmd/fastr/
 
-# Static distroless image: TLS client support is compiled out (-define:FASTR_TLS=false)
-# because distroless/static has no libssl. wss:// sync peers are unavailable in
-# this image; ws:// peers work. Build without the define on a full OS for wss.
-RUN odin build cmd/fastr -out:fastr-bin -o:speed -define:FASTR_TLS=false -extra-linker-flags:"-static" \
+# Keep the TLS client enabled for wss:// repository relays.
+RUN odin build cmd/fastr -out:fastr-bin -o:speed \
     && strip fastr-bin \
     && mkdir -p /data && chown 65532:65532 /data
 
 # -----------------------------------------------------------------------------
 # Stage 2 — runtime
-# distroless/static:nonroot = ~1.7 MB, no shell, no libc, non-root user.
-# distroless nonroot UID is 65532 — /data is pre-created with that ownership
+# Non-root UID is 65532 — /data is pre-created with that ownership
 # so named volumes and bind mounts work without a separate init step.
 # -----------------------------------------------------------------------------
-FROM gcr.io/distroless/static:nonroot
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git curl libssl3t64 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/fastr-bin /fastr
 COPY --chown=65532:65532 --from=builder /data /data
 
 ENV FASTR_ADDR=0.0.0.0 \
   FASTR_PORT=8080 \
-  FASTR_DATA_DIR=/data
+  FASTR_DATA_DIR=/data \
+  FASTR_GRASP_DIR=/data/repos
+
+USER 65532:65532
 
 EXPOSE 8080
 

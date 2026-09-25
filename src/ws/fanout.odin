@@ -51,6 +51,7 @@ shared_event_release :: proc(s: ^Shared_Event) {
 // A live event queued to a connection's writer, with the subscription id.
 // `sub_id` is owned by the receiver (cloned at broadcast time).
 Live_Event :: struct {
+	key:    u64, // subscription generation; queued events die on replacement
 	sub_id: string,
 	shared: ^Shared_Event,
 }
@@ -305,7 +306,7 @@ fanout_broadcast :: proc(f: ^Fanout, shared: ^Shared_Event) {
 				}
 				shared_event_acquire(shared)
 				live := Out_Live {
-					live = Live_Event{sub_id = strings.clone(sub.sub_id), shared = shared},
+					live = Live_Event{key = key, sub_id = strings.clone(sub.sub_id), shared = shared},
 				}
 				if !chan.try_send(sub.outbox.ch, Out_Msg(live)) {
 					// Full (slow client) or closed: drop the event.

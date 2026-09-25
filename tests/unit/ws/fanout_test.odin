@@ -372,23 +372,28 @@ test_perf_queries :: proc(t: ^testing.T) {
 			free_all(context.temp_allocator)
 		}
 		fmt.printfln("PERF req-cycle-%d %.1f ns/op", n, f64(time.tick_since(start)) / PERF_ITERS)
-		// An overlapping two-filter union must produce the same ordered bytes.
-		handle_req(&cs, "perf", {filter, filter})
-		// The second batch must be freed when the outbox is already full.
-		handle_req(&cs, "perf", {filter, filter})
-		msg, ok := chan.try_recv(o.ch)
-		assert(ok)
-		batch, is_batch := msg.(Out_Batch)
-		assert(is_batch && len(batch.frames) == n + 1)
-		checksum: u64
-		for frame in batch.frames {
-			for b in transmute([]u8)frame {
-				checksum = checksum * 31 + u64(b)
-			}
+		// Empty filters must not reset or bypass deduplication of the union.
+		empty := nostr.Filter {
+			limit = 0,
 		}
-		assert(checksum == ref)
-		drop_msg(msg)
-		free_all(context.temp_allocator)
+		for filters in ([3][]nostr.Filter{{filter, filter}, {empty, filter, filter}, {filter, empty, filter}}) {
+			handle_req(&cs, "perf", filters)
+			// The second batch must be freed when the outbox is already full.
+			handle_req(&cs, "perf", filters)
+			msg, ok := chan.try_recv(o.ch)
+			assert(ok)
+			batch, is_batch := msg.(Out_Batch)
+			assert(is_batch && len(batch.frames) == n + 1)
+			checksum: u64
+			for frame in batch.frames {
+				for b in transmute([]u8)frame {
+					checksum = checksum * 31 + u64(b)
+				}
+			}
+			assert(checksum == ref)
+			drop_msg(msg)
+			free_all(context.temp_allocator)
+		}
 	}
 }
 

@@ -82,9 +82,16 @@ Config :: struct {
 	grasp_urls:                  []string,
 	// NIP-11 repo_acceptance_criteria string. FASTR_GRASP_ACCEPTANCE.
 	grasp_acceptance:            string,
+	grasp_curation:              string,
 	// Seconds an unclaimed refs/nostr/<event-id> ref survives before GC.
 	// FASTR_GRASP_NOSTR_REF_TTL. Default: 1200 (20 minutes per GRASP-01).
 	grasp_nostr_ref_ttl:         i64,
+	grasp_sync:                 bool,
+	grasp_sync_plus:            bool,
+	grasp_archive:              bool,
+	grasp_private:              bool,
+	grasp_whitelist:            [][32]u8,
+	grasp_secret:               [32]u8,
 	// Relay-to-relay pull sync. FASTR_SYNC_PEERS: comma-separated ws(s)://
 	// relay URLs. Empty = disabled (default).
 	sync_peers:                  []string,
@@ -206,8 +213,39 @@ load_config :: proc(allocator := context.allocator) -> Config {
 	grasp_urls := strings.split(grasp_urls_raw, ",", allocator)
 
 	grasp_acceptance, grasp_acceptance_found := os.lookup_env("FASTR_GRASP_ACCEPTANCE", allocator)
-	if !grasp_acceptance_found {
+	if !grasp_acceptance_found || strings.trim_space(grasp_acceptance) == "" {
+		grasp_acceptance_found = false
 		grasp_acceptance = "open: any repository announcement listing this service is accepted"
+	}
+	grasp_curation := os.get_env("FASTR_GRASP_CURATION", allocator)
+	archive := env_int("FASTR_GRASP_ARCHIVE", 0) == 1
+	private := env_int("FASTR_GRASP_PRIVATE", 0) == 1
+	if !grasp_acceptance_found && archive {
+		grasp_acceptance = "archive: any repository announcement with a safe identifier is accepted"
+	}
+	if !grasp_acceptance_found && private {
+		grasp_acceptance = strings.concatenate({"whitelisted authenticated users only; ", grasp_acceptance}, allocator)
+	}
+	whitelist := make([dynamic][32]u8, allocator)
+	if raw, found := os.lookup_env("FASTR_GRASP_WHITELIST", context.temp_allocator); found {
+		for item in strings.split(raw, ",", context.temp_allocator) {
+			if strings.trim_space(item) == "" {
+				continue
+			}
+			hex := parse_pubkey(strings.trim_space(item), context.temp_allocator)
+			pk, ok := grasp_hex_key(hex)
+			assert(ok)
+			append(&whitelist, pk)
+		}
+	}
+	secret: [32]u8
+	if private && grasp_enabled {
+		raw := os.get_env("FASTR_GRASP_SECRET", context.temp_allocator)
+		key, ok := grasp_hex_key(raw)
+		if !ok || key == ([32]u8{}) || len(whitelist) == 0 {
+			panic("private GRASP requires FASTR_GRASP_SECRET (32-byte hex) and FASTR_GRASP_WHITELIST")
+		}
+		secret = key
 	}
 
 	return Config {
@@ -240,7 +278,14 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		grasp_max_pack_bytes        = env_int("FASTR_GRASP_MAX_PACK_BYTES", 256 * 1024 * 1024),
 		grasp_urls                  = grasp_urls,
 		grasp_acceptance            = grasp_acceptance,
+		grasp_curation              = grasp_curation,
 		grasp_nostr_ref_ttl         = i64(env_int("FASTR_GRASP_NOSTR_REF_TTL", 1200)),
+		grasp_sync                 = archive || env_int("FASTR_GRASP_SYNC", 1) == 1,
+		grasp_sync_plus            = env_int("FASTR_GRASP_SYNC_PLUS", 1) == 1,
+		grasp_archive              = archive,
+		grasp_private              = private,
+		grasp_whitelist            = whitelist[:],
+		grasp_secret               = secret,
 		sync_peers                  = parse_sync_peers(allocator),
 		sync_interval               = env_u64("FASTR_SYNC_INTERVAL", 3600),
 	}

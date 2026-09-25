@@ -10,6 +10,7 @@ import "core:sync"
 
 import "../nostr"
 import "../pack"
+import "../policy"
 
 // Callback invoked once per matching event with its BASED blob bytes.
 // Returning a non-.None error aborts the query and propagates the error.
@@ -47,6 +48,37 @@ build_tag_specs :: proc(filter: ^nostr.Filter, allocator := context.temp_allocat
 		append(&specs, Tag_Spec{name = ch, values = decoded[:]})
 	}
 	return specs[:]
+}
+
+// Match one event's contiguous tag records: dimensions AND, values OR.
+@(private)
+event_tags_match_specs :: proc(tags: []u8, specs: []Tag_Spec) -> bool {
+	for spec in specs {
+		matched := false
+		for pos := 0; pos < len(tags); pos += TAG_ENTRY_SIZE {
+			tag := tags[pos:pos + TAG_ENTRY_SIZE]
+			if tag[8] != spec.name {
+				continue
+			}
+			for &val in spec.values {
+				if tag[41] != val.length {
+					continue
+				}
+				cmp_len := 32 if val.length == VALUE_LEN_HASHED else int(val.length)
+				if string(tag[9:9 + cmp_len]) == string(val.bytes[:cmp_len]) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
 }
 
 // Union of tags.s p-tag offsets matching any auth pubkey (NIP-17 gate).
@@ -183,6 +215,7 @@ query_authed :: proc(
 	auth_pks: [][32]u8,
 	user: rawptr,
 	emit: Emit_Proc,
+	access: policy.Read_Access = {},
 ) -> Error {
 	idx_g := mapped_file_slice(&s.index)
 	defer slice_release(idx_g)
@@ -210,18 +243,10 @@ query_authed :: proc(
 		nip17_set = p_tag_offsets_union(tags_g.data, auth_pks)
 	}
 
-	// Pre-compute tag offset sets via a single pass over tags.s.
+	// Tag records follow increasing data offsets, including after compaction.
+	// Both scan branches visit descending slots (resolved ids are sorted below).
 	specs := build_tag_specs(filter)
-	tag_sets: []Offset_Set
-	if len(specs) > 0 {
-		tag_sets = multi_matching_offsets(tags_g.data, specs, context.temp_allocator)
-	}
-	defer {
-		for set in tag_sets {
-			delete(set)
-		}
-		delete(tag_sets, context.temp_allocator)
-	}
+	tag_end := len(tags_g.data) / TAG_ENTRY_SIZE
 
 	now := unix_now()
 	// Snapshot tombstones once per query - held for the scan + emission.
@@ -362,7 +387,7 @@ query_authed :: proc(
 			}
 		}
 
-		// 5. data offset — u64le at byte 0. Needed for NIP-17 and tag sets.
+		// 5. data offset — u64le at byte 0. Needed for NIP-17 and tag matching.
 		offset := endian.unchecked_get_u64le(base[0:8])
 
 		// 6. NIP-17: kind-1059 events only served to the p-tag recipient.
@@ -372,16 +397,25 @@ query_authed :: proc(
 			}
 		}
 
-		// 7. Tag sets — hash-set lookup per dimension.
-		if len(tag_sets) > 0 {
-			miss := false
-			for set in tag_sets {
-				if offset not_in set {
-					miss = true
+		// 7. Walk tags backwards with the index, comparing only this event's
+		// records. Skip newer offsets, including tags beyond the index snapshot.
+		if len(specs) > 0 {
+			for tag_end > 0 {
+				pos := (tag_end - 1) * TAG_ENTRY_SIZE
+				if endian.unchecked_get_u64le(tags_g.data[pos:pos + 8]) <= offset {
 					break
 				}
+				tag_end -= 1
 			}
-			if miss {
+			end := tag_end
+			for tag_end > 0 {
+				pos := (tag_end - 1) * TAG_ENTRY_SIZE
+				if endian.unchecked_get_u64le(tags_g.data[pos:pos + 8]) != offset {
+					break
+				}
+				tag_end -= 1
+			}
+			if !event_tags_match_specs(tags_g.data[tag_end * TAG_ENTRY_SIZE:end * TAG_ENTRY_SIZE], specs) {
 				continue
 			}
 		}
@@ -446,7 +480,7 @@ query_authed :: proc(
 		//     - NIP-50: content substring match.
 		//     - NIP-70: protected events only served to the author.
 		authed := pk_in(auth_pks, pubkey^)
-		if has_search || !authed {
+		if has_search || !authed || access.check != nil {
 			start, end, bok := blob_bounds(idx, i, total, len(data), offset)
 			if !bok {
 				return .Io
@@ -456,6 +490,15 @@ query_authed :: proc(
 				continue
 			}
 			if !authed && pack.dp_has_protected_tag(dp) {
+				continue
+			}
+			// ponytail: arbitrary predicates scan candidates; add index constraints
+			// if selective policies dominate query profiles.
+			visible, verr := policy.read_packed(access, dp)
+			if verr != .None {
+				return .Pack_Invalid
+			}
+			if !visible {
 				continue
 			}
 		}
@@ -500,15 +543,18 @@ store_count :: proc(s: ^Store, filter: ^nostr.Filter) -> u64 {
 	return count_authors(s, filter, nil, unix_now())
 }
 
-count_filters :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8) -> u64 {
-	return count_filters_at(s, filters, auth_pks, unix_now())
+count_filters :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, access: policy.Read_Access = {}) -> u64 {
+	return count_filters_at(s, filters, auth_pks, unix_now(), access)
 }
 
 // Same as count_filters but with an explicit `now`; used by the #117 expiry
 // fast-path fallback tests.
-count_filters_at :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, now: i64) -> u64 {
+count_filters_at :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, now: i64, access: policy.Read_Access = {}) -> u64 {
 	if len(filters) == 0 {
 		return 0
+	}
+	if access.check != nil {
+		return scan_count_at(s, filters, auth_pks, now, access)
 	}
 	if len(filters) == 1 {
 		return count_authors(s, &filters[0], auth_pks, now)
@@ -601,7 +647,7 @@ count_authors :: proc(s: ^Store, filter: ^nostr.Filter, auth_pks: [][32]u8, now:
 }
 
 @(private)
-scan_count_at :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, now: i64) -> u64 {
+scan_count_at :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, now: i64, access: policy.Read_Access = {}) -> u64 {
 	idx_g := mapped_file_slice(&s.index)
 	defer slice_release(idx_g)
 	data_g := mapped_file_slice(&s.data)
@@ -705,6 +751,9 @@ scan_count_at :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, no
 		if !pk_in(auth_pks, entry.pubkey) && pack.dp_has_protected_tag(ev_bytes) {
 			continue
 		}
+		if visible, verr := policy.read_packed(access, ev_bytes); verr != .None || !visible {
+			continue
+		}
 
 		ev, derr := pack.deserialize_trusted(ev_bytes, context.temp_allocator)
 		if derr != .None {
@@ -745,6 +794,7 @@ iter_negentropy :: proc(
 	max_records: int,
 	user: rawptr,
 	cb: Neg_Item_Proc,
+	access: policy.Read_Access = {},
 ) -> (
 	err: Error,
 	reason: string,
@@ -822,13 +872,25 @@ iter_negentropy :: proc(
 					continue
 				}
 			}
-			// NIP-50: content substring check — the only blob-level filter.
-			if has_search {
+			// Match REQ visibility before exposing even an event ID.
+			authed := pk_in(auth_pks, entry.pubkey)
+			if has_search || !authed || access.check != nil {
 				start, end, bok := blob_bounds(idx, i, total, len(data), entry.offset)
 				if !bok {
 					return .Io, ""
 				}
-				if !content_contains_all(data[start:end], fsearch) {
+				dp := data[start:end]
+				if has_search && !content_contains_all(dp, fsearch) {
+					continue
+				}
+				if !authed && pack.dp_has_protected_tag(dp) {
+					continue
+				}
+				visible, verr := policy.read_packed(access, dp)
+				if verr != .None {
+					return .Pack_Invalid, "error: invalid stored event"
+				}
+				if !visible {
 					continue
 				}
 			}

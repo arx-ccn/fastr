@@ -15,7 +15,6 @@ import "core:time"
 
 import "../../src/grasp"
 import "../../src/nostr"
-import "../../src/pack"
 import "../../src/peersync"
 import secp "../../src/secp256k1"
 import "../../src/store"
@@ -55,6 +54,7 @@ Conn_Ctx :: struct {
 @(private = "file")
 serve :: proc() {
 	cfg := load_config()
+	grasp_check_tools(&cfg)
 
 	// Bind first — the port becomes reachable (kernel backlog) while heavier
 	// init continues.
@@ -81,22 +81,8 @@ serve :: proc() {
 	}
 
 	relay := new(ws.Relay)
-	relay.store = st
-	ws.fanout_init(&relay.fanout)
-	relay.cfg = ws.Relay_Config {
-		max_message_bytes           = cfg.max_message_bytes,
-		max_subscriptions_per_conn  = cfg.max_subscriptions_per_conn,
-		max_filters_per_req         = cfg.max_filters_per_req,
-		max_limit                   = cfg.max_limit,
-		max_subid_length            = cfg.max_subid_length,
-		max_filter_values           = cfg.max_filter_values,
-		max_event_tags              = cfg.max_event_tags,
-		max_neg_records             = cfg.max_neg_records,
-		max_content_length          = cfg.max_content_length,
-		max_content_length_per_kind = cfg.max_content_length_per_kind,
-		relay_url                   = cfg.relay_url,
-		min_pow_difficulty          = cfg.min_pow_difficulty,
-	}
+	plugins := new(Plugin_State)
+	init_relay(relay, st, &cfg, plugins)
 
 	// Pre-render the cold-path HTTP responses once.
 	info := relay_info_from_config(&cfg)
@@ -126,7 +112,7 @@ serve :: proc() {
 
 	// Relay-to-relay pull sync (NIP-77): reconcile against each configured
 	// peer at startup and once per interval afterwards.
-	if len(cfg.sync_peers) > 0 && cfg.sync_interval > 0 {
+	if len(cfg.sync_peers) > 0 && cfg.sync_interval > 0 && !(cfg.grasp_enabled && cfg.grasp_private) {
 		sync_ctx := new(Sync_Ctx)
 		peers := make([dynamic]peersync.Peer, 0, len(cfg.sync_peers))
 		for url in cfg.sync_peers {
@@ -139,7 +125,7 @@ serve :: proc() {
 		}
 		sync_ctx.peers = peers[:]
 		if len(sync_ctx.peers) > 0 {
-			sync_ctx.store = st
+			sync_ctx.relay = relay
 			sync_ctx.interval = cfg.sync_interval
 			sync_ctx.max_neg_records = cfg.max_neg_records
 			sync_ctx.max_message_bytes = cfg.max_message_bytes
@@ -152,26 +138,19 @@ serve :: proc() {
 	grasp_http.enabled = cfg.grasp_enabled
 	grasp_http.dir = cfg.grasp_dir
 	grasp_http.max_pack_bytes = cfg.grasp_max_pack_bytes
+	grasp_http.profiles = &plugins.profiles
 	if grasp_http.enabled {
-		gs := new(grasp.State)
-		grasp.state_init(
-			gs,
-			st,
-			cfg.grasp_dir,
-			cfg.grasp_urls,
-			cfg.grasp_acceptance,
-			cfg.grasp_nostr_ref_ttl,
-		)
+		gs := &plugins.grasp
 		grasp_http.state = gs
-		relay.ingest_hook = grasp_ingest_hook
-		relay.post_store_hook = grasp_post_store_hook
-		relay.hook_user = gs
 
 		// refs/nostr GC: sweep at 1/4 of the TTL (a ref lives at most ~1.25 TTL).
 		gc_ctx := new(Grasp_Gc_Ctx)
 		gc_ctx.state = gs
 		gc_ctx.interval = u64(max(cfg.grasp_nostr_ref_ttl / 4, 30))
 		thread.create_and_start_with_poly_data(gc_ctx, grasp_gc_loop, self_cleanup = true)
+		if cfg.grasp_sync || cfg.grasp_private {
+			thread.create_and_start_with_poly_data(&plugins.profiles, grasp_sync_loop, self_cleanup = true)
+		}
 
 		fmt.eprintfln("grasp enabled; serving repos from %s", grasp_http.dir)
 	}
@@ -214,17 +193,6 @@ serve :: proc() {
 	}
 }
 
-// ws hook bridges (rawptr -> ^grasp.State).
-@(private = "file")
-grasp_ingest_hook :: proc(user: rawptr, ev: ^pack.Event) -> (reason: string, ok: bool) {
-	return grasp.ingest_check((^grasp.State)(user), ev)
-}
-
-@(private = "file")
-grasp_post_store_hook :: proc(user: rawptr, ev: ^pack.Event) {
-	grasp.post_store((^grasp.State)(user), ev)
-}
-
 @(private = "file")
 Grasp_Gc_Ctx :: struct {
 	state:    ^grasp.State,
@@ -238,6 +206,8 @@ grasp_gc_loop :: proc(ctx: ^Grasp_Gc_Ctx) {
 		if n := grasp.gc_nostr_refs(ctx.state); n > 0 {
 			fmt.eprintfln("grasp: deleted %d unclaimed refs/nostr refs", n)
 		}
+		pr_state := grasp.State{store = ctx.state.store, dir = strings.concatenate({ctx.state.dir, "/prs"}, context.temp_allocator), nostr_ref_ttl = ctx.state.nostr_ref_ttl}
+		_ = grasp.gc_nostr_refs(&pr_state)
 		free_all(context.temp_allocator)
 	}
 }
@@ -245,7 +215,7 @@ grasp_gc_loop :: proc(ctx: ^Grasp_Gc_Ctx) {
 @(private = "file")
 Sync_Ctx :: struct {
 	peers:             []peersync.Peer,
-	store:             ^store.Store,
+	relay:             ^ws.Relay,
 	interval:          u64,
 	max_neg_records:   int,
 	max_message_bytes: int,
@@ -253,7 +223,7 @@ Sync_Ctx :: struct {
 
 @(private = "file")
 sync_loop_entry :: proc(ctx: ^Sync_Ctx) {
-	peersync.loop(ctx.peers, ctx.store, ctx.interval, ctx.max_neg_records, ctx.max_message_bytes)
+	peersync.loop(ctx.peers, ctx.relay, ctx.interval, ctx.max_neg_records, ctx.max_message_bytes)
 }
 
 @(private = "file")
@@ -343,6 +313,9 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 		_, _ = net.send_tcp(ctx.sock, transmute([]u8)string(OPTIONS_RESPONSE))
 		return
 	}
+	if grasp_try_handle(ctx.grasp, ctx.sock, &req, extra) {
+		return
+	}
 
 	if accept, has_accept := ws.header_get(&req, "accept"); has_accept {
 		if strings.contains(accept, "application/nostr+json") {
@@ -353,9 +326,6 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 
 	if !ws.is_websocket_upgrade(&req) {
 		// GRASP-01 git smart HTTP: /<npub>/<identifier>.git endpoints.
-		if grasp_try_handle(ctx.grasp, ctx.sock, &req, extra) {
-			return
-		}
 		if req.path == "/icon.png" {
 			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.icon)
 			return
@@ -392,6 +362,25 @@ import_jsonl :: proc(dir: string, jsonl: string) -> (imported, duplicates, failu
 	}
 	defer store.store_close(st)
 
+	cfg := load_config()
+	relay: ws.Relay
+	plugins: Plugin_State
+	init_relay(&relay, st, &cfg, &plugins)
+	defer ws.fanout_destroy(&relay.fanout)
+	defer {
+		delete(plugins.profiles.allowed)
+		delete(plugins.grasp.dir)
+		delete(plugins.grasp.acceptance)
+		for host in plugins.grasp.service_hosts {
+			delete(host)
+		}
+		delete(plugins.grasp.service_hosts)
+	}
+	return import_events(&relay, jsonl)
+}
+
+@(private)
+import_events :: proc(relay: ^ws.Relay, jsonl: string) -> (imported, duplicates, failures: u64, ok: bool) {
 	data, read_err := os.read_entire_file_from_path(jsonl, context.allocator)
 	if read_err != nil {
 		fmt.eprintfln("fastr import: cannot read %s: %v", jsonl, read_err)
@@ -424,15 +413,7 @@ import_jsonl :: proc(dir: string, jsonl: string) -> (imported, duplicates, failu
 			continue
 		}
 		ev := &ev_msg.ev
-		if v_reason, valid := nostr.validate_event(ev); !valid {
-			fmt.eprintfln("line %d: validation failed: %s", line_no, v_reason)
-			failures += 1
-			free_all(context.temp_allocator)
-			continue
-		}
-
-		class, d_hash := nostr.classify_kind(ev.kind, ev.tags)
-		append_err, append_reason := store.append_classified(st, ev, class, d_hash)
+		append_err, append_reason := ws.ingest_event(relay, {source = .Import}, ev)
 		switch append_err {
 		case .None:
 			imported += 1

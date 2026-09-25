@@ -169,6 +169,145 @@ test_query_tag_filter_no_match :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_tag_filter_encodings :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+
+	long_value := "a tag value longer than thirty-two bytes"
+	hash := hash_value(long_value)
+	raw32 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	hex64 := test_hex(transmute([]u8)raw32)
+	events := [8]pack.Event {
+		test_make_event(
+			1,
+			1,
+			10,
+			test_tags(test_tag("t", "raw"), test_tag("t", "raw"), test_tag("x", "gate")),
+		),
+		test_make_event(2, 1, 20, test_tags(test_tag("t", long_value), test_tag("x", "gate"))),
+		test_make_event(3, 1, 30, test_tags(test_tag("t", hex64), test_tag("x", "gate"))),
+		test_make_event(4, 1, 40, test_tags(test_tag("t", ""), test_tag("x", "gate"))),
+		test_make_event(5, 1, 50, test_tags(test_tag("t", "raw"))),
+		test_make_event(6, 1, 60, test_tags(test_tag("x", "gate"))),
+		test_make_event(7, 1, 70, test_tags(test_tag("t"), test_tag("x", "gate"))),
+		test_make_event(
+			8,
+			1,
+			80,
+			test_tags(test_tag("t", test_hex(hash[:])), test_tag("x", "gate")),
+		),
+	}
+	for &ev in events {
+		test_append_ok(t, s, &ev)
+	}
+
+	// OR within t, AND with x. A decoded hex hash is not a hashed value,
+	// even when all 32 stored bytes are identical.
+	f := test_tag_filter('t', "raw")
+	values := f.tags['t']
+	values[long_value] = {}
+	gate := make(nostr.Tag_Value_Set, context.temp_allocator)
+	gate["gate"] = {}
+	f.tags['x'] = gate
+	c := test_query_collect(t, s, &f)
+	testing.expect_value(t, len(c.ids), 2)
+	testing.expect_value(t, c.ids[0], events[1].id)
+	testing.expect_value(t, c.ids[1], events[0].id)
+
+	// Hex decoding keeps the existing equivalence to the same raw 32 bytes.
+	hex_filter := test_tag_filter('t', raw32)
+	h := test_query_collect(t, s, &hex_filter)
+	testing.expect_value(t, len(h.ids), 1)
+	testing.expect_value(t, h.ids[0], events[2].id)
+
+	empty_filter := test_tag_filter('t', "")
+	e := test_query_collect(t, s, &empty_filter)
+	testing.expect_value(t, len(e.ids), 1)
+	testing.expect_value(t, e.ids[0], events[3].id)
+	// An empty value set is unsatisfiable, not an absent constraint.
+	empty_filter.tags['t'] = make(nostr.Tag_Value_Set, context.temp_allocator)
+	testing.expect_value(t, test_query_count(t, s, &empty_filter), 0)
+}
+
+@(test)
+test_tag_cursor_order_compact :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	topic := test_tags(test_tag("t", "topic"))
+	events := [7]pack.Event {
+		test_make_event(1, 1, 100, topic),
+		test_make_event(2, 1, 50, topic),
+		test_make_event(3, 1, 50, topic),
+		test_make_event(4, 1, 60, nil),
+		test_make_event(5, 1, 70, test_tags(test_tag("t", "other"))),
+		test_make_event(6, 1, 1, topic),
+		test_make_event(7, 1, 80, test_tags(test_tag("t", "topic"), test_tag("-"))),
+	}
+	for &ev in events {
+		test_append_ok(t, s, &ev)
+	}
+	deletion := test_kind5_event(1, events[0].id)
+	test_append_ok(t, s, &deletion)
+	expected := [2][32]u8{events[1].id, events[2].id}
+	slice.sort_by(expected[:], test_id_less)
+	requested := make([dynamic]nostr.Hex_Prefix, context.temp_allocator)
+	for i in ([8]int{1, 6, 5, 2, 1, 4, 3, 0}) {
+		append(&requested, nostr.Hex_Prefix{bytes = events[i].id, length = 32})
+	}
+
+	for phase in 0 ..< 2 {
+		if phase == 1 {
+			_, err := store_compact(s)
+			testing.expect_value(t, err, Error.None)
+		}
+		f := test_tag_filter('t', "topic")
+		f.limit = 2
+		// Backdated ingest cannot stop before the earlier timestamp ties;
+		// untagged, tombstoned and protected events cannot consume the limit.
+		scanned := test_query_collect(t, s, &f)
+		testing.expect_value(t, len(scanned.ids), 2)
+		testing.expect_value(t, scanned.ids[0], expected[0])
+		testing.expect_value(t, scanned.ids[1], expected[1])
+		// Caller order jumps between offsets and repeats an id.
+		f.ids = requested
+		resolved := test_query_collect(t, s, &f)
+		testing.expect_value(t, len(resolved.ids), 2)
+		testing.expect_value(t, resolved.ids[0], expected[0])
+		testing.expect_value(t, resolved.ids[1], expected[1])
+	}
+}
+
+@(test)
+test_tag_snapshot_ahead :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	old := test_make_event(1, 1, 10, test_tags(test_tag("t", "topic")))
+	test_append_ok(t, s, &old)
+	index_len := mapped_file_load_len(&s.index)
+	data_len := mapped_file_load_len(&s.data)
+	newer := test_make_event(2, 1, 20, test_tags(test_tag("t", "topic"), test_tag("x", "newer")))
+	test_append_ok(t, s, &newer)
+	full_index_len := mapped_file_load_len(&s.index)
+	full_data_len := mapped_file_load_len(&s.data)
+	defer mapped_file_publish_len(&s.index, full_index_len)
+	defer mapped_file_publish_len(&s.data, full_data_len)
+	// Emulate index/data snapshots taken before a concurrent tag publication.
+	mapped_file_publish_len(&s.index, index_len)
+	mapped_file_publish_len(&s.data, data_len)
+	f := test_tag_filter('t', "topic")
+	f.limit = 1
+	c := test_query_collect(t, s, &f)
+	testing.expect_value(t, len(c.ids), 1)
+	testing.expect_value(t, c.ids[0], old.id)
+}
+
+@(test)
 test_query_since_excludes_older :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
@@ -715,7 +854,12 @@ test_query_early_exit_created_at_ties :: proc(t: ^testing.T) {
 	total := 2500
 	ids := make([dynamic][32]u8, context.temp_allocator)
 	for i in 0 ..< total {
-		ev := test_make_event(u8(i % 200 + 1), u16(1), 5_000, test_tags(test_tag("t", fmt.tprintf("%d", i))))
+		ev := test_make_event(
+			u8(i % 200 + 1),
+			u16(1),
+			5_000,
+			test_tags(test_tag("t", fmt.tprintf("%d", i))),
+		)
 		test_append_ok(t, s, &ev)
 		append(&ids, ev.id)
 	}

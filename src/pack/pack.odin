@@ -7,6 +7,7 @@
 package pack
 
 import "core:encoding/endian"
+import "core:simd"
 import "core:strings"
 import "core:unicode/utf8"
 
@@ -374,6 +375,79 @@ write_json_str :: proc(s: string, buf: ^[dynamic]u8) {
 	i := 0
 	for i < len(bytes) {
 		start := i
+		when simd.HAS_HARDWARE_SIMD {
+			// Array alignment is one byte; never load beyond this string.
+			for len(bytes) - i >= 16 {
+				v := simd.from_array((cast(^[16]u8)&bytes[i])^)
+				control := simd.lanes_lt(
+					v,
+					simd.u8x16 {
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+						0x20,
+					},
+				)
+				quote := simd.lanes_eq(
+					v,
+					simd.u8x16 {
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+						'"',
+					},
+				)
+				slash := simd.lanes_eq(
+					v,
+					simd.u8x16 {
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+						'\\',
+					},
+				)
+				if simd.extract_msbs(control | quote | slash) != {} {
+					break
+				}
+				i += 16
+			}
+		}
 		for i < len(bytes) && bytes[i] >= 0x20 && bytes[i] != '"' && bytes[i] != '\\' {
 			i += 1
 		}
@@ -482,8 +556,19 @@ write_field_as_json :: proc(dp: []u8, pos: ^int, buf: ^[dynamic]u8) -> Error {
 		hex_encode_into(data, buf)
 		append(buf, '"')
 	} else {
-		// Raw UTF-8 -> validate then JSON-escape.
-		if !utf8.valid_string(string(data)) {
+		// Whole ASCII blocks are valid UTF-8. Validate the remaining suffix
+		// normally; the skipped prefix cannot split a multibyte sequence.
+		ascii := 0
+		when simd.HAS_HARDWARE_SIMD {
+			for len(data) - ascii >= 16 {
+				v := simd.from_array((cast(^[16]u8)&data[ascii])^)
+				if simd.extract_msbs(v) != {} {
+					break
+				}
+				ascii += 16
+			}
+		}
+		if !utf8.valid_string(string(data[ascii:])) {
 			return .Invalid
 		}
 		write_json_str(string(data), buf)

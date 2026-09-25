@@ -68,7 +68,7 @@ test_relay_info_supported_grasps :: proc(t: ^testing.T) {
 
 	grasps, gok := gobj["supported_grasps"].(json.Array)
 	testing.expect(t, gok, "supported_grasps must be an array")
-	testing.expect_value(t, len(grasps), 1)
+	testing.expect_value(t, len(grasps), 4)
 	first, _ := grasps[0].(string)
 	testing.expect_value(t, first, "GRASP-01")
 

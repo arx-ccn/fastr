@@ -174,7 +174,9 @@ test_serialize_multibyte_varint_golden_bytes :: proc(t: ^testing.T) {
 	// a 2-byte tdl varint (0xa1 0x02).
 	tags: [8]Tag
 	for &tag in tags {
-		tag = Tag{fields = []string{"e", HEX64}}
+		tag = Tag {
+			fields = []string{"e", HEX64},
+		}
 	}
 	e := make_ev(1_700_000_000, 1, tags[:], "x")
 
@@ -226,7 +228,9 @@ test_ten_tags_three_fields_each :: proc(t: ^testing.T) {
 		fields[0] = fmt.tprintf("t%d", i)
 		fields[1] = fmt.tprintf("v%d", i)
 		fields[2] = fmt.tprintf("x%d", i)
-		tags[i] = Tag{fields = fields}
+		tags[i] = Tag {
+			fields = fields,
+		}
 	}
 	e := make_ev(0, 0, tags, "test")
 	got := rt(t, &e)
@@ -317,7 +321,12 @@ test_transcode_basic :: proc(t: ^testing.T) {
 
 @(test)
 test_transcode_hex_tags :: proc(t: ^testing.T) {
-	e := make_ev(42, 1, []Tag{{fields = []string{"e", HEX64}}, {fields = []string{"p", HEX64}}}, "tagged")
+	e := make_ev(
+		42,
+		1,
+		[]Tag{{fields = []string{"e", HEX64}}, {fields = []string{"p", HEX64}}},
+		"tagged",
+	)
 	testing.expect_value(t, transcode(t, &e, "sub"), via_event(t, &e, "sub"))
 }
 
@@ -326,7 +335,7 @@ test_transcode_mixed_tags :: proc(t: ^testing.T) {
 	e := make_ev(
 		0,
 		7,
-		[]Tag{
+		[]Tag {
 			{fields = []string{"e", HEX64}},
 			{fields = []string{"t", "nostr"}},
 			{fields = []string{"r", "wss://relay.example.com"}},
@@ -356,7 +365,9 @@ test_transcode_ten_tags :: proc(t: ^testing.T) {
 		fields[0] = fmt.tprintf("t%d", i)
 		fields[1] = fmt.tprintf("v%d", i)
 		fields[2] = fmt.tprintf("x%d", i)
-		tags[i] = Tag{fields = fields}
+		tags[i] = Tag {
+			fields = fields,
+		}
 	}
 	e := make_ev(0, 0, tags, "ten tags")
 	testing.expect_value(t, transcode(t, &e, "multi"), via_event(t, &e, "multi"))
@@ -366,7 +377,12 @@ test_transcode_ten_tags :: proc(t: ^testing.T) {
 test_transcode_valid_json :: proc(t: ^testing.T) {
 	e := make_ev(1_700_000_000, 1, []Tag{{fields = []string{"e", HEX64}}}, "hello")
 	js := transcode(t, &e, "s1")
-	val, jerr := json.parse(transmute([]u8)js, json.DEFAULT_SPECIFICATION, false, context.temp_allocator)
+	val, jerr := json.parse(
+		transmute([]u8)js,
+		json.DEFAULT_SPECIFICATION,
+		false,
+		context.temp_allocator,
+	)
 	testing.expect_value(t, jerr, json.Error.None)
 	arr, is_arr := val.(json.Array)
 	testing.expect(t, is_arr)
@@ -413,7 +429,11 @@ test_dp_has_protected_tag_amongst_others :: proc(t: ^testing.T) {
 	e := make_ev(
 		0,
 		1,
-		[]Tag{{fields = []string{"e", HEX64}}, {fields = []string{"-"}}, {fields = []string{"p", HEX64}}},
+		[]Tag {
+			{fields = []string{"e", HEX64}},
+			{fields = []string{"-"}},
+			{fields = []string{"p", HEX64}},
+		},
 		"x",
 	)
 	testing.expect(t, dp_has_protected_tag(pack_blob(t, &e)))
@@ -471,7 +491,14 @@ test_write_json_str_canonical_all_ascii_bytes :: proc(t: ^testing.T) {
 			// Per NIP-01: "all other characters must be included verbatim".
 			expected = string(raw[:])
 		}
-		testing.expectf(t, got == expected, "byte 0x%02x escaped wrong: got %q want %q", b, got, expected)
+		testing.expectf(
+			t,
+			got == expected,
+			"byte 0x%02x escaped wrong: got %q want %q",
+			b,
+			got,
+			expected,
+		)
 	}
 }
 
@@ -498,9 +525,34 @@ test_write_json_str_canonical_form_feed_named_escape :: proc(t: ^testing.T) {
 // seven-escape list) must pass through verbatim, NOT be escaped.
 @(test)
 test_write_json_str_canonical_other_control_bytes_verbatim :: proc(t: ^testing.T) {
-	control_bytes := []u8{
-		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0b, 0x0e, 0x0f, 0x10, 0x11, 0x12,
-		0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+	control_bytes := []u8 {
+		0x00,
+		0x01,
+		0x02,
+		0x03,
+		0x04,
+		0x05,
+		0x06,
+		0x07,
+		0x0b,
+		0x0e,
+		0x0f,
+		0x10,
+		0x11,
+		0x12,
+		0x13,
+		0x14,
+		0x15,
+		0x16,
+		0x17,
+		0x18,
+		0x19,
+		0x1a,
+		0x1b,
+		0x1c,
+		0x1d,
+		0x1e,
+		0x1f,
 	}
 	for b in control_bytes {
 		bb := [1]u8{b}
@@ -532,22 +584,59 @@ test_write_json_str_canonical_utf8_verbatim :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(got_buf[:]), "\"héllo 🦀\"")
 }
 
-// The transmission-path writer (RFC 7159 compliant) must still produce
-// valid JSON for every control byte — i.e. nothing below 0x20 is left raw.
+// Wire escaping must preserve control bytes, quotes, and backslashes across
+// block boundaries, independently of the canonical NIP-01 rules above.
 @(test)
 test_write_json_str_transmission_escapes_all_control_bytes :: proc(t: ^testing.T) {
+	special := make([dynamic]u8, context.temp_allocator)
 	for bi in 0 ..< 0x20 {
-		b := u8(bi)
-		bb := [1]u8{b}
-		got_buf := make([dynamic]u8, context.temp_allocator)
-		write_json_str(string(bb[:]), &got_buf)
-		// Must always parse as valid JSON.
-		val, jerr := json.parse(got_buf[:], json.Specification.JSON, false, context.temp_allocator)
-		testing.expectf(t, jerr == .None, "transmission output for 0x%02x not valid JSON: %v", b, jerr)
-		decoded, is_str := val.(json.String)
-		testing.expect(t, is_str)
-		db := transmute([]u8)string(decoded)
-		testing.expectf(t, len(db) == 1 && db[0] == b, "round-trip mismatch for 0x%02x", b)
+		append(&special, u8(bi))
+	}
+	append(&special, '"', '\\')
+	for b in special {
+		for offset in ([4]int{0, 1, 7, 15}) {
+			for prefix in ([8]int{0, 14, 15, 16, 17, 30, 31, 32}) {
+				for trailing in ([3]int{0, 1, 17}) {
+					n := prefix + 1 + trailing
+					storage := make([]u8, offset + n + 16, context.temp_allocator)
+					input := storage[offset:offset + n]
+					for &c in input {
+						c = 'x'
+					}
+					input[prefix] = b
+					// NUL sentinels outside the slice must not enter the JSON.
+					got_buf := make([dynamic]u8, context.temp_allocator)
+					write_json_str(string(input), &got_buf)
+					val, jerr := json.parse(
+						got_buf[:],
+						json.Specification.JSON,
+						false,
+						context.temp_allocator,
+					)
+					testing.expectf(
+						t,
+						jerr == .None,
+						"byte 0x%02x offset %d prefix %d tail %d: %v",
+						b,
+						offset,
+						prefix,
+						trailing,
+						jerr,
+					)
+					decoded, is_str := val.(json.String)
+					testing.expect(t, is_str)
+					testing.expectf(
+						t,
+						string(decoded) == string(input),
+						"byte 0x%02x offset %d prefix %d tail %d changed",
+						b,
+						offset,
+						prefix,
+						trailing,
+					)
+				}
+			}
+		}
 	}
 }
 
@@ -579,6 +668,71 @@ test_transcode_serialize_fast_equivalence :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(fast_json[:]), string(comp_json[:]))
 }
 
+@(test)
+test_transcode_utf8_edges :: proc(t: ^testing.T) {
+	prefix: [48]u8
+	for &b in prefix {
+		b = 'x'
+	}
+	for n in ([10]int{0, 14, 15, 16, 17, 30, 31, 32, 47, 48}) {
+		for suffix in ([3]string{"é", "€", "\xf0\x90\x8d\x88"}) {
+			for tail in ([2]string{"", "xxxxxxxxxxxxxxxxx"}) {
+				input := fmt.tprintf("%s%s%s", string(prefix[:n]), suffix, tail)
+				e := make_ev(0, 1, []Tag{{fields = []string{"t", input}}}, input)
+				js := transcode(t, &e, input)
+				val, jerr := json.parse(
+					transmute([]u8)js,
+					json.Specification.JSON,
+					false,
+					context.temp_allocator,
+				)
+				if !testing.expect(t, jerr == .None) {
+					continue
+				}
+				arr := val.(json.Array)
+				obj := arr[2].(json.Object)
+				tags := obj["tags"].(json.Array)
+				fields := tags[0].(json.Array)
+				testing.expect_value(t, string(arr[1].(json.String)), input)
+				testing.expect_value(t, string(obj["content"].(json.String)), input)
+				testing.expect_value(t, string(fields[1].(json.String)), input)
+			}
+		}
+	}
+}
+
+@(test)
+test_transcode_invalid_utf8 :: proc(t: ^testing.T) {
+	prefix: [48]u8
+	for &b in prefix {
+		b = 'x'
+	}
+	for n in ([10]int{0, 14, 15, 16, 17, 30, 31, 32, 47, 48}) {
+		for suffix in ([9]string{"\x80", "\xc2", "\xe2\x82", "\xf0\x9f\xa6", "\xe2x\xa1", "\xc0\xaf", "\xe0\x80\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80"}) {
+			input := fmt.tprintf("%s%s", string(prefix[:n]), suffix)
+			for in_tag in ([2]bool{false, true}) {
+				e := make_ev(0, 1, nil, input)
+				if in_tag {
+					e.tags = []Tag{{fields = []string{"t", input}}}
+					e.content = "ok"
+				}
+				dp := pack_blob(t, &e)
+				buf := make([dynamic]u8, context.temp_allocator)
+				err := transcode_to_event_json(dp, "s", &buf)
+				testing.expectf(
+					t,
+					err == .Invalid,
+					"accepted invalid UTF-8 %q after %d ASCII bytes (tag=%v): %v",
+					suffix,
+					n,
+					in_tag,
+					err,
+				)
+			}
+		}
+	}
+}
+
 // --- memory discipline (Odin port addition) ---
 
 // deserialize_trusted allocates with the supplied allocator; event_destroy
@@ -590,7 +744,11 @@ test_deserialize_destroy_no_leak :: proc(t: ^testing.T) {
 	e := make_ev(
 		1_700_000_000,
 		1,
-		[]Tag{{fields = []string{"e", HEX64}}, {fields = []string{"t", "nostr"}}, {fields = []string{"-"}}},
+		[]Tag {
+			{fields = []string{"e", HEX64}},
+			{fields = []string{"t", "nostr"}},
+			{fields = []string{"-"}},
+		},
 		"content with allocation",
 	)
 	blob := pack_blob(t, &e)
@@ -619,7 +777,12 @@ test_json_based_json_roundtrip :: proc(t: ^testing.T) {
 		HEX64,
 		HEX64,
 	)
-	val, jerr := json.parse(transmute([]u8)fixture, json.Specification.JSON, true, context.temp_allocator)
+	val, jerr := json.parse(
+		transmute([]u8)fixture,
+		json.Specification.JSON,
+		true,
+		context.temp_allocator,
+	)
 	testing.expect_value(t, jerr, json.Error.None)
 	obj, is_obj := val.(json.Object)
 	if !testing.expect(t, is_obj) {
@@ -641,7 +804,9 @@ test_json_based_json_roundtrip :: proc(t: ^testing.T) {
 		for fv, j in fa {
 			fields[j] = fv.(json.String)
 		}
-		tags[i] = Tag{fields = fields}
+		tags[i] = Tag {
+			fields = fields,
+		}
 	}
 	e.tags = tags
 	e.content = obj["content"].(json.String)

@@ -11,7 +11,7 @@ import "../nostr"
 import "../pack"
 import "../store"
 
-// Pre-store veto (wired as ws.Relay.ingest_hook). Only kind 30617 is
+// Pre-store veto (wired as ws.Relay.hooks.check_write). Only kind 30617 is
 // policed: GRASP-01 requires rejecting announcements that do not list this
 // service in BOTH `clone` and `relays` tags. Everything else passes — a
 // general-purpose relay already satisfies the MUST-accept rules.
@@ -68,7 +68,7 @@ ingest_check :: proc(s: ^State, ev: ^pack.Event) -> (reason: string, ok: bool) {
 	return "", true
 }
 
-// Post-store side effects (wired as ws.Relay.post_store_hook).
+// Post-store side effects (wired as ws.Relay.hooks.after_store).
 post_store :: proc(s: ^State, ev: ^pack.Event) {
 	switch ev.kind {
 	case KIND_REPO_ANNOUNCEMENT:

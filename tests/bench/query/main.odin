@@ -5,16 +5,18 @@
 // Usage: qbench <data-dir> [events] [iters]
 package main
 
-import "../../tests/fixtures"
+import "../../fixtures"
 
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strconv"
 import "core:time"
 
-import "../../src/nostr"
-import "../../src/pack"
-import "../../src/store"
+import "../../../src/nostr"
+import "../../../src/pack"
+import "../../../src/policy"
+import "../../../src/store"
 
 Bench_Ctx :: struct {
 	count: int,
@@ -49,10 +51,10 @@ event_created_at :: proc(i: int) -> i64 {
 	return 1_000_000 + i64(i) + jitter
 }
 
-run_filter :: proc(s: ^store.Store, name: string, filter: ^nostr.Filter, iters: int) {
+run_filter :: proc(s: ^store.Store, name: string, filter: ^nostr.Filter, iters: int, access: policy.Read_Access = {}) {
 	// Warm-up + reference result.
 	ref: Bench_Ctx
-	if err := store.query_authed(s, filter, nil, &ref, bench_cb); err != .None {
+	if err := store.query_authed(s, filter, nil, &ref, bench_cb, access); err != .None {
 		fmt.eprintfln("qbench: %s: %v", name, err)
 		os.exit(1)
 	}
@@ -61,20 +63,50 @@ run_filter :: proc(s: ^store.Store, name: string, filter: ^nostr.Filter, iters: 
 	t0 := time.tick_now()
 	for _ in 0 ..< iters {
 		c: Bench_Ctx
-		_ = store.query_authed(s, filter, nil, &c, bench_cb)
+		assert(store.query_authed(s, filter, nil, &c, bench_cb, access) == .None)
+		assert(c.count == ref.count && c.sum == ref.sum)
 		free_all(context.temp_allocator)
 	}
 	dt := time.tick_since(t0)
+	// Count allocator requests separately so tracking does not affect timing.
+	allocs: i64
+	{
+		heap, scratch: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&heap, context.allocator)
+		mem.tracking_allocator_init(&scratch, context.temp_allocator)
+		defer mem.tracking_allocator_destroy(&heap)
+		defer mem.tracking_allocator_destroy(&scratch)
+		context.allocator = mem.tracking_allocator(&heap)
+		context.temp_allocator = mem.tracking_allocator(&scratch)
+		c: Bench_Ctx
+		assert(store.query_authed(s, filter, nil, &c, bench_cb, access) == .None)
+		allocs = heap.total_allocation_count + scratch.total_allocation_count
+		free_all(context.temp_allocator)
+	}
 
 	ns_per := i64(dt) / i64(iters)
 	fmt.printfln(
-		"%-12s %10d ns/query  matched=%d bytes=%d checksum=%d",
+		"%-12s %10d ns/query  matched=%d bytes=%d checksum=%d allocs=%d",
 		name,
 		ns_per,
 		ref.count,
 		ref.bytes,
 		ref.sum,
+		allocs,
 	)
+}
+
+@(private)
+allow_all :: proc(user: rawptr, principal: ^policy.Principal, ev: ^pack.Event_View) -> policy.Visibility {
+	return .Show
+}
+
+@(private)
+allow_author :: proc(user: rawptr, principal: ^policy.Principal, ev: ^pack.Event_View) -> policy.Visibility {
+	if ev.pubkey == (^pack.Pubkey)(user)^ {
+		return .Show
+	}
+	return .Hide
 }
 
 main :: proc() {
@@ -126,6 +158,9 @@ main :: proc() {
 	f_all: nostr.Filter
 	f_all.limit = limit
 	run_filter(s, "all", &f_all, iters)
+	run_filter(s, "allow-all", &f_all, iters, {check = allow_all})
+	allowed := fixtures.test_pubkey(5)
+	run_filter(s, "allow-author", &f_all, iters, {user = &allowed, check = allow_author})
 
 	k1 := make([dynamic]u16)
 	append(&k1, 1)

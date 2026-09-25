@@ -16,32 +16,12 @@
 
 ## Benchmarks
 
-500k events, 8 CPU / 8 GB RAM, 50k queries (2026-06-10):
+The current comparison uses 10,000 base events, eight clients, and a shared
+eight-CPU / 8 GiB limit. Every query validates event bodies, exact result
+sets, and completion; single-filter queries also validate ordering.
 
-| Metric | fastr | strfry | difference |
-|--------|------:|-------:|------------|
-| Ingest throughput (ev/s) | 148,251 | 2,378 | **62x** |
-| Ingest OK p50 latency (µs) | 48 | 3,081 | **64x** |
-| Ingest OK p99 latency (µs) | 80 | 6,801 | **85x** |
-| REQ query throughput (q/s) | 58,868 | 6,622 | **9x** |
-| REQ→EOSE p50 latency (µs) | 128 | 1,107 | **9x** |
-| REQ→EOSE p99 latency (µs) | 181 | 2,220 | **12x** |
-| Peak RSS @ 500k events | 130 MB | 548 MB | **4x** |
-| Disk usage @ 500k events | 119 MB | 526 MB | **4x** |
-| Disk I/O written | 119 MB | 76,052 MB | **639x** ← not a typo |
-| CPU Mcycles (user) | 110,124 | 265,301 | **2x** |
-| CPU Mcycles (kernel) | 20,439 | 777,892 | **38x** |
-| Syscalls | 3,761,077 | 76,390,183 | **20x** |
-| Context switches | 1,105,063 | 17,609,468 | **16x** |
-| Cold start (µs) | 13,121 | 23,607 | **2x** |
-
-Queries are O(limit), not O(event count): the index scan stops the moment
-nothing older can still make the top-N, and exact-id lookups don't scan at
-all. Reproduce with `podman build -f
-bench/Dockerfile -t fastr-bench . && podman run --rm --privileged fastr-bench`.
-
-strfry wrote **83 GB** of journal brainrot just to ingest 500k immutable events.  
-fastr wrote **119 MB**.
+See [relay benchmarks](docs/BENCHMARKS.md) for measured results, limitations,
+and the Podman command.
 
 ---
 
@@ -101,6 +81,8 @@ Transcoding to JSON wire format is one pass, zero heap allocations. The event ne
 
 **Compaction:** Every 6 hours, when tombstones exceed 1,000, a background task rebuilds the files.
 
+**Plugins:** [Compiled read/write policies](docs/PLUGINS.md), composed in source and rebuilt with the relay.
+
 ---
 
 ## Supported NIPs
@@ -122,6 +104,9 @@ Transcoding to JSON wire format is one pass, zero heap allocations. The event ne
 
 ## Build & run
 
+GRASP Git hosting supports profiles 01, 02, 03, 05, 06, and 08.
+See [configuration, coverage, and optional recommendations](docs/GRASP.md).
+
 fastr is written in [Odin](https://odin-lang.org). One package per directory:
 
 ```text
@@ -130,7 +115,7 @@ cmd/fastr/    Relay entry point and embedded web assets
 cmd/genevent/ Signed-event generator
 cmd/wsq/      WebSocket query client
 tests/        Unit tests, smoke tests, fixtures, and shared test client
-bench/        Benchmark programs (relay/, query/), runner, and container
+tests/bench/  Relay comparison runner, container, and query microbenchmark
 deploy/       Service definitions, installer, and production container
 docs/         Benchmark results, performance notes, and ideas
 vendor/       Downloaded dependencies (just vendor)
@@ -153,7 +138,8 @@ just test     # run all package test suites
 
 `wss://` sync peers link system OpenSSL (`libssl`). Build with
 `odin build cmd/fastr -define:FASTR_TLS=false` to compile the TLS client out
-(used by the static container image, where only `ws://` peers work).
+(for a `ws://`-only build). The production container includes TLS, Git,
+and curl for GRASP synchronization.
 
 ```sh
 ./fastr                           # serve on 0.0.0.0:8080

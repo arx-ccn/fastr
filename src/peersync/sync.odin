@@ -19,6 +19,7 @@ import "core:time"
 import "../negentropy"
 import "../nostr"
 import "../pack"
+import "../policy"
 import "../store"
 import "../ws"
 
@@ -45,14 +46,14 @@ Peer :: struct {
 // loop runs the sync schedule forever: an immediate pass at startup, then
 // one pass per interval. Due peers are synced serially; a failed peer backs
 // off without blocking the others. Runs on its own thread.
-loop :: proc(peers: []Peer, st: ^store.Store, interval: u64, max_neg_records: int, max_message_bytes: int) {
+loop :: proc(peers: []Peer, relay: ^ws.Relay, interval: u64, max_neg_records: int, max_message_bytes: int) {
 	for {
 		now := time.time_to_unix(time.now())
 		for &p in peers {
 			if !peer_due(&p, now) {
 				continue
 			}
-			n, ok, why := sync_once(&p, st, max_neg_records, max_message_bytes)
+			n, ok, why := sync_once(&p, relay, max_neg_records, max_message_bytes)
 			if ok {
 				fmt.eprintfln("fastr sync: %s: pulled %d events", p.url, n)
 			} else {
@@ -94,7 +95,7 @@ peer_failed :: proc(p: ^Peer, now: i64) {
 // Returns the number of events ingested; on failure `why` names the step.
 sync_once :: proc(
 	p: ^Peer,
-	st: ^store.Store,
+	relay: ^ws.Relay,
 	max_neg_records: int,
 	max_message_bytes: int,
 ) -> (ingested: int, ok: bool, why: string) {
@@ -114,7 +115,15 @@ sync_once :: proc(
 	defer negentropy.storage_destroy(&storage)
 
 	fill := Neg_Fill_Ctx{storage = &storage}
-	if serr, _ := store.iter_negentropy(st, &filter, nil, max_neg_records, &fill, neg_fill); serr != .None {
+	principal := policy.Principal{source = .Peer, peer = p.url}
+	if relay.hooks.check_request != nil {
+		d := relay.hooks.check_request(relay.hooks.user, &principal, .Neg_Open, []nostr.Filter{filter})
+		if d.reason != .Allow {
+			return 0, false, policy.decision_reason(d)
+		}
+	}
+	access := policy.Read_Access{principal = principal, user = relay.hooks.user, check = relay.hooks.check_read}
+	if serr, _ := store.iter_negentropy(relay.store, &filter, nil, max_neg_records, &fill, neg_fill, access); serr != .None {
 		return 0, false, "local store scan failed"
 	}
 	if fill.insert_err != .None {
@@ -180,10 +189,10 @@ sync_once :: proc(
 	// Fetch and ingest everything the peer has that we don't.
 	for start := 0; start < len(need_ids); start += FETCH_BATCH {
 		end := min(start + FETCH_BATCH, len(need_ids))
-		n, f_ok := fetch_batch(&c, st, need_ids[start:end])
+		n, f_ok, fetch_reason := fetch_batch(&c, relay, principal, need_ids[start:end])
 		ingested += n
 		if !f_ok {
-			return ingested, false, "connection lost during fetch"
+			return ingested, false, fetch_reason
 		}
 	}
 
@@ -280,7 +289,7 @@ server_neg_msg :: proc(data: []u8) -> (hex: string, ok: bool) {
 
 // fetch_batch REQs a batch of ids and ingests every EVENT until EOSE.
 @(private)
-fetch_batch :: proc(c: ^ws.Client, st: ^store.Store, ids: [][32]u8) -> (int, bool) {
+fetch_batch :: proc(c: ^ws.Client, relay: ^ws.Relay, principal: policy.Principal, ids: [][32]u8) -> (int, bool, string) {
 	buf := make([dynamic]u8, 0, 32 + len(ids) * 66, context.temp_allocator)
 	defer delete(buf)
 	append(&buf, `["REQ","fetch",{"ids":[`)
@@ -294,41 +303,34 @@ fetch_batch :: proc(c: ^ws.Client, st: ^store.Store, ids: [][32]u8) -> (int, boo
 	}
 	append(&buf, `]}]`)
 	if werr := ws.client_write_text(c, buf[:]); werr != .None {
-		return 0, false
+		return 0, false, "REQ send failed"
 	}
 
 	ingested := 0
 	for {
 		data, closed, rerr := ws.client_next(c)
 		if rerr != .None || closed {
-			return ingested, false
+			return ingested, false, "connection lost during fetch"
 		}
 		msg := parse_server_msg(data)
 		switch m in msg {
 		case Server_Event:
 			ev := m.ev
-			if ingest_event(st, &ev) {
+			err, reason := ws.ingest_event(relay, principal, &ev)
+			switch err {
+			case .None:
 				ingested += 1
+			case .Duplicate, .Duplicate_Newer, .Invalid_Event, .Rejected:
+			case .Io, .Mmap_Failed, .Incompatible_Index, .Pack_Invalid:
+				return ingested, false, reason
 			}
 		case Server_Eose:
-			return ingested, true
+			return ingested, true, ""
 		case Server_Other:
 			fmt.eprintfln("fastr sync: fetch: unexpected frame: %.120s", string(data))
 		}
 		free_all(context.temp_allocator)
 	}
-}
-
-// ingest_event validates and stores one pulled event; duplicate or
-// invalid events are skipped, not fatal.
-@(private)
-ingest_event :: proc(st: ^store.Store, ev: ^pack.Event) -> bool {
-	if _, valid := nostr.validate_event(ev); !valid {
-		return false
-	}
-	class, d_hash := nostr.classify_kind(ev.kind, ev.tags)
-	err, _ := store.append_classified(st, ev, class, d_hash)
-	return err == .None
 }
 
 Server_Msg :: union {
