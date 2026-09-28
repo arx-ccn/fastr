@@ -2,12 +2,15 @@
 // header is deliberately ignored — clients fall back to v0).
 //
 // Capabilities: side-band-64k, allow-{tip,reachable}-sha1-in-want, filter
-// (blob:none and tree:0). No multi_ack/no-done: the base protocol terminates correctly
-// (clients batch haves per request and finish with "done"), just with more
-// round-trips on deep incremental fetches. No shallow: `clone --depth`
-// fails client-side with a clear message; GRASP does not require it.
+// (blob:none and tree:0), shallow and deepen-relative. No multi_ack/no-done:
+// the base protocol terminates correctly (clients batch haves per request
+// and finish with "done"), just with more round-trips on deep incremental
+// fetches. deepen-since/deepen-not are not advertised, so clients reject
+// --shallow-since/--shallow-exclude before connecting.
 package githttp
 
+import "core:slice"
+import "core:strconv"
 import "core:strings"
 
 import "../git"
@@ -16,7 +19,8 @@ AGENT :: "agent=fastr"
 
 UPLOAD_PACK_CAPS ::
 	"side-band-64k allow-tip-sha1-in-want allow-reachable-sha1-in-want " +
-	"filter no-progress " + AGENT
+	"filter shallow deepen-relative no-progress " +
+	AGENT
 
 ZERO_HEX :: "0000000000000000000000000000000000000000"
 
@@ -101,19 +105,23 @@ advertise_refs :: proc(
 
 @(private = "file")
 Upload_Pack_Request :: struct {
-	wants:    [dynamic]git.Oid,
-	haves:    [dynamic]git.Oid,
-	filter:   git.Filter,
-	done:     bool,
-	sideband: bool,
+	wants:           [dynamic]git.Oid,
+	haves:           [dynamic]git.Oid,
+	shallows:        [dynamic]git.Oid, // client's current shallow commits
+	depth:           int, // "deepen <n>"; 0 when not deepening
+	deepen_relative: bool, // depth counts from `shallows`, not the wants
+	filter:          git.Filter,
+	done:            bool,
+	sideband:        bool,
 	// Non-empty when the request asked for something we refuse to serve.
-	error:    string,
+	error:           string,
 }
 
 @(private = "file")
 parse_upload_pack_request :: proc(body: []u8) -> (req: Upload_Pack_Request, ok: bool) {
 	req.wants = make([dynamic]git.Oid, 0, 4, context.temp_allocator)
 	req.haves = make([dynamic]git.Oid, 0, 16, context.temp_allocator)
+	req.shallows = make([dynamic]git.Oid, 0, 4, context.temp_allocator)
 
 	r := Pkt_Reader {
 		data = body,
@@ -141,6 +149,9 @@ parse_upload_pack_request :: proc(body: []u8) -> (req: Upload_Pack_Request, ok: 
 			if strings.contains(rest, "side-band-64k") {
 				req.sideband = true
 			}
+			if strings.contains(rest, "deepen-relative") {
+				req.deepen_relative = true
+			}
 		case strings.has_prefix(line, "have "):
 			if len(line) < 45 {
 				return req, false
@@ -158,8 +169,20 @@ parse_upload_pack_request :: proc(body: []u8) -> (req: Upload_Pack_Request, ok: 
 			}
 		case line == "done":
 			req.done = true
-		case strings.has_prefix(line, "shallow ") || strings.has_prefix(line, "deepen"):
-			req.error = "shallow clones are not supported by this server"
+		case strings.has_prefix(line, "shallow "):
+			if len(line) < 48 {
+				return req, false
+			}
+			oid := git.oid_parse(line[8:48]) or_return
+			append(&req.shallows, oid)
+		case strings.has_prefix(line, "deepen "):
+			depth, dok := strconv.parse_int(line[7:], 10)
+			if !dok || depth <= 0 {
+				return req, false
+			}
+			req.depth = depth
+		case strings.has_prefix(line, "deepen-"):
+			req.error = "only deepen and the deepen-relative capability are supported"
 		case line == "":
 		// keepalive/empty line: ignore
 		case:
@@ -199,6 +222,16 @@ sideband_write :: proc(user: rawptr, data: []u8) -> bool {
 		}
 	}
 	return true
+}
+
+@(private = "file")
+write_oid_line :: proc(buf: ^[dynamic]u8, prefix: string, oid: git.Oid) {
+	hex_buf: [40]u8
+	git.oid_hex_into(oid, hex_buf[:])
+	pkt_write_string(
+		buf,
+		strings.concatenate({prefix, string(hex_buf[:]), "\n"}, context.temp_allocator),
+	)
 }
 
 // Handle a `POST /git-upload-pack` body, emitting the complete response
@@ -242,7 +275,49 @@ handle_upload_pack :: proc(
 		}
 	}
 
+	// Client shallow commits we lack cannot bound the walk; drop them.
+	client := make([dynamic]git.Oid, 0, len(req.shallows), context.temp_allocator)
+	for oid in req.shallows {
+		if git.has_object(repo, oid) {
+			append(&client, oid)
+		}
+	}
+	shallow := git.Shallow {
+		client = client[:],
+	}
+
 	buf := make([dynamic]u8, 0, 64, context.temp_allocator)
+	if req.depth > 0 {
+		// deepen-relative counts from the client's boundary: its shallow
+		// commits are depth 1, so N more commits means depth N + 1.
+		heads, depth := req.wants[:], req.depth
+		if req.deepen_relative {
+			heads, depth = client[:], req.depth + 1
+		}
+		serr: git.Error
+		shallow, serr = git.shallow_boundary(repo, heads, depth, client[:], context.temp_allocator)
+		if serr != .None {
+			return send_err(sink, user, "internal error computing shallow boundary")
+		}
+
+		// Shallow-update section, sent before ACK/NAK in every deepen round.
+		for oid in shallow.boundary {
+			if !slice.contains(client[:], oid) {
+				write_oid_line(&buf, "shallow ", oid)
+			}
+		}
+		for oid in shallow.unshallow {
+			write_oid_line(&buf, "unshallow ", oid)
+		}
+		pkt_flush(&buf)
+
+		// The first deepen round carries only wants and deepen lines; the
+		// client reads just the shallow update, then starts sending haves.
+		if !req.done && len(req.haves) == 0 {
+			return sink(user, buf[:])
+		}
+	}
+
 	if !req.done {
 		// Stateless negotiation round: no pack yet; the client re-posts
 		// with more haves (or done) next round.
@@ -262,7 +337,14 @@ handle_upload_pack :: proc(
 		return false
 	}
 
-	objects, cerr := git.collect_objects(repo, req.wants[:], common[:], req.filter, context.temp_allocator)
+	objects, cerr := git.collect_objects(
+		repo,
+		req.wants[:],
+		common[:],
+		req.filter,
+		shallow,
+		context.temp_allocator,
+	)
 	if cerr != .None {
 		return send_err(sink, user, "internal error collecting objects")
 	}

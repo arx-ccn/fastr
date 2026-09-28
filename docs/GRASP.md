@@ -6,7 +6,7 @@ pinned there to `f35b4f9a4ed2`. GRASP is disabled unless
 
 | Profile | Implementation | Enablement |
 | --- | --- | --- |
-| 01 | Nostr relay, announcement acceptance, recursive maintainers, signed-state pushes, HEAD, available-object fetches, `blob:none`/`tree:0`, CORS, PR ref expiry | GRASP enabled |
+| 01 | Nostr relay, announcement acceptance, recursive maintainers, signed-state pushes, HEAD, available-object fetches, `blob:none`/`tree:0`, shallow fetches (`--depth`, `--deepen`, `--unshallow`), CORS, PR ref expiry | GRASP enabled |
 | 02 | Repository-relay historical and live subscriptions; signed-state and PR Git fetching | Default; `FASTR_GRASP_SYNC=0` disables |
 | 03 | Issue/patch/PR conversations from participant outboxes; author metadata, NIP-65 and kind 10317 lists | Default with sync; `FASTR_GRASP_SYNC_PLUS=0` disables |
 | 05 | Accept announcements without this service in their clone/relay tags and mirror their Git data | `FASTR_GRASP_ARCHIVE=1`; implies sync |
@@ -109,6 +109,10 @@ bash tests/run.sh
 just smoke-grasp
 ```
 
-The GRASP smoke suite exercises signed pushes, partial/full clones,
+The GRASP smoke suite exercises signed pushes, partial/full/shallow clones,
 alternative PR hosting, archive Git fetching, historical/live event sync,
 private HTTP challenges, authenticated Git push/clone, and NIP-42 access.
+
+`--shallow-since` and `--shallow-exclude` are not supported; git refuses them
+before connecting because the server does not advertise `deepen-since` or
+`deepen-not`.

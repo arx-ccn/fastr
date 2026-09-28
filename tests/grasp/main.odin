@@ -405,6 +405,24 @@ main :: proc() {
 		fail("cloned tip %s != pushed tip %s", cloned_tip, tip2)
 	}
 	run_ok(clone, "git", "fsck")
+
+	step("shallow clone, deepen, then unshallow")
+	shallow := fmt.tprintf("%s/shallow", work)
+	run_ok(work, "git", "clone", "-q", "--depth", "1", repo_url, shallow)
+	if count := run_ok(shallow, "git", "rev-list", "--count", "HEAD"); count != "1" {
+		fail("depth-1 clone has %s commits", count)
+	}
+	run_ok(shallow, "git", "fsck")
+	run_ok(shallow, "git", "fetch", "-q", "--deepen", "1")
+	if count := run_ok(shallow, "git", "rev-list", "--count", "HEAD"); count != "2" {
+		fail("deepened clone has %s commits", count)
+	}
+	run_ok(shallow, "git", "fetch", "-q", "--unshallow")
+	if is_shallow := run_ok(shallow, "git", "rev-parse", "--is-shallow-repository");
+	   is_shallow != "false" {
+		fail("clone still shallow after --unshallow")
+	}
+	run_ok(shallow, "git", "fsck")
 	check_profiles(work, abs_fastr, src, &signer, tip2, &conn)
 
 	fmt.println("GRASP SMOKE PASS")

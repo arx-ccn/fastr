@@ -25,18 +25,18 @@ test_collect_objects_full_clone :: proc(t: ^testing.T) {
 	defer rm_repo(&repo, dir)
 
 	c2, _ := oid_parse(FIX_C2)
-	objects, err := collect_objects(&repo, {c2}, nil, .None, context.temp_allocator)
+	objects, err := collect_objects(&repo, {c2}, nil, .None, {}, context.temp_allocator)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, len(objects), 8) // whole history
 
 	// blob:none keeps commits + trees only (2 commits + 2 trees).
-	objects, err = collect_objects(&repo, {c2}, nil, .Blob_None, context.temp_allocator)
+	objects, err = collect_objects(&repo, {c2}, nil, .Blob_None, {}, context.temp_allocator)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, len(objects), 4)
 	for obj in objects {
 		testing.expect(t, obj.kind == .Commit || obj.kind == .Tree)
 	}
-	objects, err = collect_objects(&repo, {c2}, nil, .Tree_Zero, context.temp_allocator)
+	objects, err = collect_objects(&repo, {c2}, nil, .Tree_Zero, {}, context.temp_allocator)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, len(objects), 2)
 	for obj in objects {
@@ -51,7 +51,7 @@ test_collect_objects_incremental :: proc(t: ^testing.T) {
 
 	c1, _ := oid_parse(FIX_C1)
 	c2, _ := oid_parse(FIX_C2)
-	objects, err := collect_objects(&repo, {c2}, {c1}, .None, context.temp_allocator)
+	objects, err := collect_objects(&repo, {c2}, {c1}, .None, {}, context.temp_allocator)
 	testing.expect_value(t, err, Error.None)
 	// C2 + its tree + the two blobs C1 lacks (new big.txt, b.txt).
 	testing.expect_value(t, len(objects), 4)
@@ -60,8 +60,54 @@ test_collect_objects_incremental :: proc(t: ^testing.T) {
 	}
 
 	// Wanting a missing object fails.
-	_, err = collect_objects(&repo, {object_id(.Blob, {7})}, nil, .None, context.temp_allocator)
+	_, err = collect_objects(
+		&repo,
+		{object_id(.Blob, {7})},
+		nil,
+		.None,
+		{},
+		context.temp_allocator,
+	)
 	testing.expect_value(t, err, Error.Corrupt)
+}
+
+@(test)
+test_collect_objects_shallow :: proc(t: ^testing.T) {
+	repo, dir := fixture_repo(t)
+	defer rm_repo(&repo, dir)
+
+	c1, _ := oid_parse(FIX_C1)
+	c2, _ := oid_parse(FIX_C2)
+	has :: proc(objects: []Pack_Object, oid: Oid) -> bool {
+		for obj in objects {
+			if obj.oid == oid {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Depth 1: C2 is the boundary; C1 is not sent.
+	shallow, err := shallow_boundary(&repo, {c2}, 1, nil, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, len(shallow.boundary), 1)
+	testing.expect_value(t, shallow.boundary[0], c2)
+	objects: []Pack_Object
+	objects, err = collect_objects(&repo, {c2}, nil, .None, shallow, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, has(objects, c2))
+	testing.expect(t, !has(objects, c1))
+
+	// Deepen a depth-1 client that already has C2: C2 is unshallowed and
+	// C1 is sent even though the want tip is fully in `have`.
+	shallow, err = shallow_boundary(&repo, {c2}, 2, {c2}, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, len(shallow.unshallow), 1)
+	testing.expect_value(t, shallow.unshallow[0], c2)
+	objects, err = collect_objects(&repo, {c2}, {c2}, .None, shallow, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, has(objects, c1))
+	testing.expect(t, !has(objects, c2))
 }
 
 @(test)
@@ -97,7 +143,7 @@ test_pack_write_ingest_roundtrip :: proc(t: ^testing.T) {
 	defer rm_repo(&src, src_dir)
 
 	c2, _ := oid_parse(FIX_C2)
-	objects, cerr := collect_objects(&src, {c2}, nil, .None, context.temp_allocator)
+	objects, cerr := collect_objects(&src, {c2}, nil, .None, {}, context.temp_allocator)
 	testing.expect_value(t, cerr, Error.None)
 
 	sink: Collect_Sink

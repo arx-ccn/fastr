@@ -129,7 +129,7 @@ grasp_git_fetch :: proc(p: ^Grasp_Profiles, repo: ^git.Repo, url: string, oid: g
 
 @(private)
 grasp_fetch_tip :: proc(p: ^Grasp_Profiles, repo: ^git.Repo, providers: []pack.Event, oid: git.Oid) -> bool {
-	if _, err := git.collect_objects(repo, {oid}, nil, .None, context.temp_allocator); err == .None {
+	if _, err := git.collect_objects(repo, {oid}, nil, .None, {}, context.temp_allocator); err == .None {
 		return true
 	}
 	for ev in providers {

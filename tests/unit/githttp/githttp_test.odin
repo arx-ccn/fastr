@@ -173,11 +173,37 @@ test_handle_upload_pack_rejects :: proc(t: ^testing.T) {
 	testing.expect(t, ok)
 	testing.expect(t, strings.contains(string(cap.buf[:]), "ERR "))
 
-	// Shallow requests are refused.
+	// Unadvertised deepen variants are refused.
 	buf := make([dynamic]u8, 0, 128, context.temp_allocator)
-	pkt_write_string(&buf, "deepen 1\n")
+	pkt_write_string(&buf, "deepen-since 1700000000\n")
 	clear(&cap.buf)
 	ok = handle_upload_pack(&repo, buf[:], capture_sink, &cap)
 	testing.expect(t, ok)
-	testing.expect(t, strings.contains(string(cap.buf[:]), "ERR shallow"))
+	testing.expect(t, strings.contains(string(cap.buf[:]), "ERR "))
+}
+
+@(test)
+test_handle_upload_pack_deepen_first_round :: proc(t: ^testing.T) {
+	repo, dir, commit_oid := test_repo(t)
+	defer rm_test_repo(&repo, dir)
+
+	// First deepen round (wants + deepen, no haves, no done) gets only the
+	// shallow-update section; a trailing NAK would desync git's reader.
+	hex := git.oid_hex(commit_oid, context.temp_allocator)
+	buf := make([dynamic]u8, 0, 128, context.temp_allocator)
+	pkt_write_string(
+		&buf,
+		strings.concatenate({"want ", hex, " shallow\n"}, context.temp_allocator),
+	)
+	pkt_write_string(&buf, "deepen 1\n")
+	pkt_flush(&buf)
+	cap: Capture
+	cap.buf = make([dynamic]u8, 0, 128, context.temp_allocator)
+	ok := handle_upload_pack(&repo, buf[:], capture_sink, &cap)
+	testing.expect(t, ok)
+	testing.expect_value(
+		t,
+		string(cap.buf[:]),
+		strings.concatenate({"0035shallow ", hex, "\n0000"}, context.temp_allocator),
+	)
 }

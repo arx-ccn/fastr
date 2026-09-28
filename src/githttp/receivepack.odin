@@ -127,7 +127,7 @@ handle_receive_pack :: proc(
 				results[i] = "missing objects"
 				continue
 			}
-			if _, cerr := git.collect_objects(repo, {cmd.new}, nil, .None, context.temp_allocator);
+			if _, cerr := git.collect_objects(repo, {cmd.new}, nil, .None, {}, context.temp_allocator);
 			   cerr != .None {
 				results[i] = "missing objects"
 			}

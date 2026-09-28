@@ -59,7 +59,7 @@ test_receive_pack_create_branch :: proc(t: ^testing.T) {
 	dst, dst_dir, _ := test_repo(t)
 	defer rm_test_repo(&dst, dst_dir)
 
-	objects, cerr := git.collect_objects(&src, {commit_oid}, nil, .None, context.temp_allocator)
+	objects, cerr := git.collect_objects(&src, {commit_oid}, nil, .None, {}, context.temp_allocator)
 	testing.expect_value(t, cerr, git.Error.None)
 	body := push_body(t, &src, git.ZERO_OID, commit_oid, "refs/heads/feature", objects)
 
@@ -84,7 +84,7 @@ test_receive_pack_auth_denied :: proc(t: ^testing.T) {
 	dst, dst_dir, _ := test_repo(t)
 	defer rm_test_repo(&dst, dst_dir)
 
-	objects, _ := git.collect_objects(&src, {commit_oid}, nil, .None, context.temp_allocator)
+	objects, _ := git.collect_objects(&src, {commit_oid}, nil, .None, {}, context.temp_allocator)
 	body := push_body(t, &src, git.ZERO_OID, commit_oid, "refs/heads/feature", objects)
 
 	cap := Capture {
@@ -108,7 +108,7 @@ test_receive_pack_stale_old_and_missing_objects :: proc(t: ^testing.T) {
 	// Stale old value: claim master is at an oid it never held. (Note both
 	// test repos build byte-identical commits, so commit_oid == dst_commit.)
 	stale := git.object_id(.Blob, {1, 2, 3})
-	objects, _ := git.collect_objects(&src, {commit_oid}, nil, .None, context.temp_allocator)
+	objects, _ := git.collect_objects(&src, {commit_oid}, nil, .None, {}, context.temp_allocator)
 	body := push_body(t, &src, stale, commit_oid, "refs/heads/master", objects)
 	cap := Capture {
 		buf = make([dynamic]u8, 0, 256, context.temp_allocator),
