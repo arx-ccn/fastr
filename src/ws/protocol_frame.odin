@@ -18,8 +18,8 @@
 package ws
 
 // Default cap on an assembled message (the FASTR_MAX_MESSAGE_BYTES default,
-// 128 KiB).
-DEFAULT_MAX_MESSAGE_BYTES :: 131072
+// 2 MiB).
+DEFAULT_MAX_MESSAGE_BYTES :: 2 * 1024 * 1024
 
 // Server frames are unmasked: 2 fixed bytes + up to 8 length bytes.
 MAX_FRAME_HEADER_LEN :: 10

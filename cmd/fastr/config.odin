@@ -8,6 +8,7 @@ import "core:strconv"
 import "core:strings"
 
 import "../../src/nostr"
+import "../../src/ws"
 
 VERSION :: "0.1.0"
 
@@ -23,7 +24,7 @@ Config :: struct {
 	max_filters_per_req:         int,
 	// Maximum events returned per filter. Default: 500
 	max_limit:                   int,
-	// Maximum incoming WebSocket message size in bytes. Default: 128 KiB
+	// Maximum incoming WebSocket message size in bytes. Default: 2 MiB
 	max_message_bytes:           int,
 	// Maximum subscription ID length in characters (NIP-01: max 64). Default: 64
 	max_subid_length:            int,
@@ -42,8 +43,9 @@ Config :: struct {
 	max_neg_records:             int,
 	// Maximum number of tags allowed on an incoming event. Default: 2000.
 	max_event_tags:              int,
-	// Per-kind content length overrides (FASTR_MAX_CONTENT_LENGTH_PER_KIND,
-	// comma-separated `kind:bytes` pairs). NIP-11 reports the kind-1 limit.
+	// Per-kind content length overrides: MARMOT_KINDS defaults, then
+	// FASTR_MAX_CONTENT_LENGTH_PER_KIND (comma-separated `kind:bytes` pairs,
+	// which win per kind). NIP-11 reports the kind-1 limit.
 	max_content_length_per_kind: map[u16]int,
 	// Global default content length limit in bytes. Default: 50 KiB.
 	max_content_length:          int,
@@ -255,7 +257,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		max_subscriptions_per_conn  = env_int("FASTR_MAX_SUBSCRIPTIONS", 20),
 		max_filters_per_req         = env_int("FASTR_MAX_FILTERS", 10),
 		max_limit                   = env_int("FASTR_MAX_LIMIT", 500),
-		max_message_bytes           = env_int("FASTR_MAX_MESSAGE_BYTES", 128 * 1024),
+		max_message_bytes           = env_int("FASTR_MAX_MESSAGE_BYTES", ws.DEFAULT_MAX_MESSAGE_BYTES),
 		max_subid_length            = clamp(env_int("FASTR_MAX_SUBID_LENGTH", 64), 1, 64),
 		max_filter_values           = env_int("FASTR_MAX_FILTER_VALUES", 256),
 		data_dir                    = data_dir,
@@ -389,12 +391,24 @@ content_limit_for_kind :: proc(cfg: ^Config, kind: u16) -> int {
 	return cfg.max_content_length
 }
 
-// Parse `kind:bytes,kind:bytes,...` from an env var.
+// Marmot (MLS over Nostr) Welcomes (444) and group messages (445) carry
+// MLS commits and ratchet trees that grow with group size, so they get a
+// larger content limit than the global default. KeyPackages keep it.
+// Welcomes reach relays inside NIP-59 gift wraps (1059), so 1059 gets the
+// same limit; NIP-17 DMs share that kind and inherit it.
+MARMOT_KINDS :: [?]u16{444, 445, 1059}
+MARMOT_CONTENT_LENGTH :: 1536 * 1024
+
+// Build per-kind limits: Marmot defaults, then `kind:bytes,kind:bytes,...`
+// from an env var (env entries replace defaults for the same kind).
 // Panics at startup if any token is malformed so configuration mistakes
 // surface immediately.
 parse_kind_limits :: proc(key: string, allocator := context.allocator) -> map[u16]int {
 	raw, found := os.lookup_env(key, context.temp_allocator)
 	m := make(map[u16]int, allocator)
+	for kind in MARMOT_KINDS {
+		m[kind] = MARMOT_CONTENT_LENGTH
+	}
 	if !found || raw == "" {
 		return m
 	}

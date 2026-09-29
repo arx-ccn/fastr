@@ -159,7 +159,9 @@ Accepts bare event objects or `["EVENT", {...}]` envelopes, because the world is
 | `FASTR_MAX_SUBSCRIPTIONS` | `20` | Max subscriptions per connection |
 | `FASTR_MAX_FILTERS` | `10` | Max filters per subscription |
 | `FASTR_MAX_LIMIT` | `500` | Max events returned per REQ |
-| `FASTR_MAX_MESSAGE_BYTES` | `131072` | Max WebSocket message size |
+| `FASTR_MAX_MESSAGE_BYTES` | `2097152` | Max WebSocket message size (2 MiB) |
+| `FASTR_MAX_CONTENT_LENGTH` | `51200` | Max event `content` length in characters |
+| `FASTR_MAX_CONTENT_LENGTH_PER_KIND` | `444:1572864,445:1572864,1059:1572864` | Per-kind `content` limits as `kind:chars` pairs; entries replace the default for their kind. Marmot Welcomes (444, delivered in 1059 gift wraps) and group messages (445) get 1.5 MiB by default |
 | `FASTR_COMPACT_INTERVAL` | `21600` | Compaction interval in seconds |
 | `FASTR_SYNC_PEERS` | unset | Comma-separated `ws(s)://` relay URLs to pull-sync from (NIP-77). Empty = disabled |
 | `FASTR_SYNC_INTERVAL` | `3600` | Seconds between sync passes |

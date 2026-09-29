@@ -159,10 +159,20 @@ test_config_subid_clamp_and_kind_limits :: proc(t: ^testing.T) {
 	testing.expect_value(t, cfg.max_subid_length, 1)
 	os.unset_env("FASTR_MAX_SUBID_LENGTH")
 
-	os.set_env("FASTR_MAX_CONTENT_LENGTH_PER_KIND", "1053:102400, 30023:204800")
+	// Marmot defaults apply without configuration; KeyPackages do not get them.
+	cfg = load_config(context.temp_allocator)
+	testing.expect_value(t, content_limit_for_kind(&cfg, 444), 1536 * 1024)
+	testing.expect_value(t, content_limit_for_kind(&cfg, 445), 1536 * 1024)
+	testing.expect_value(t, content_limit_for_kind(&cfg, 1059), 1536 * 1024)
+	testing.expect_value(t, content_limit_for_kind(&cfg, 30443), 50 * 1024)
+
+	// Env entries replace a Marmot default for the same kind only.
+	os.set_env("FASTR_MAX_CONTENT_LENGTH_PER_KIND", "1053:102400, 30023:204800, 445:4096")
 	cfg = load_config(context.temp_allocator)
 	testing.expect_value(t, content_limit_for_kind(&cfg, 1053), 102400)
 	testing.expect_value(t, content_limit_for_kind(&cfg, 30023), 204800)
+	testing.expect_value(t, content_limit_for_kind(&cfg, 445), 4096)
+	testing.expect_value(t, content_limit_for_kind(&cfg, 444), 1536 * 1024)
 	testing.expect_value(t, content_limit_for_kind(&cfg, 1), 50 * 1024)
 	os.unset_env("FASTR_MAX_CONTENT_LENGTH_PER_KIND")
 }
