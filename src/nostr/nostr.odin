@@ -224,7 +224,9 @@ parse_event_obj :: proc(
 			}
 			fields[fi] = strings.clone(s, allocator)
 		}
-		tags[ti] = pack.Tag{fields = fields}
+		tags[ti] = pack.Tag {
+			fields = fields,
+		}
 	}
 	ev.tags = tags
 
@@ -370,7 +372,10 @@ parse_sub_and_filters :: proc(
 	ok: bool,
 ) {
 	if len(arr) < 3 {
-		return "", nil, fmt.tprintf("invalid: %s requires sub_id and at least one filter", verb), false
+		return "",
+			nil,
+			fmt.tprintf("invalid: %s requires sub_id and at least one filter", verb),
+			false
 	}
 	sid, sid_ok := arr[1].(json.String)
 	if !sid_ok {
@@ -416,6 +421,25 @@ try_extract_event_id_from_msg :: proc(raw: string) -> (id: [32]u8, ok: bool) {
 	return id, true
 }
 
+// Best-effort extraction of the subscription id from a raw REQ or COUNT
+// message. Used on the error path of parse_client_msg: per NIP-01 a refused
+// subscription gets CLOSED, not NOTICE. A NOTICE leaves the subscription
+// open from the client's view, so it waits for an EOSE that never comes
+// (e.g. ngit fetches with hundreds of #E values time out after 7s).
+try_extract_sub_id_from_msg :: proc(raw: string) -> (sub_id: string, ok: bool) {
+	val := json_parse_temp(raw) or_return
+	arr, arr_ok := val.(json.Array)
+	if !arr_ok || len(arr) < 2 {
+		return
+	}
+	verb, verb_ok := arr[0].(json.String)
+	if !verb_ok || (verb != "REQ" && verb != "COUNT") {
+		return
+	}
+	sid, sid_ok := arr[1].(json.String)
+	return sid, sid_ok
+}
+
 // Parse a raw WebSocket text frame into a Client_Msg.
 // On failure returns a NOTICE-ready reason string.
 // Event/filter data is allocated from `allocator`; the JSON tree and reason
@@ -448,11 +472,15 @@ parse_client_msg :: proc(
 	switch verb {
 	case "EVENT", "AUTH":
 		if len(arr) < 2 {
-			return nil, "invalid: EVENT missing event object" if verb == "EVENT" else "invalid: AUTH missing event object", false
+			return nil,
+				"invalid: EVENT missing event object" if verb == "EVENT" else "invalid: AUTH missing event object",
+				false
 		}
 		obj, obj_ok := arr[1].(json.Object)
 		if !obj_ok {
-			return nil, "invalid: EVENT payload not an object" if verb == "EVENT" else "invalid: AUTH payload not an object", false
+			return nil,
+				"invalid: EVENT payload not an object" if verb == "EVENT" else "invalid: AUTH payload not an object",
+				false
 		}
 		ev, ev_why, ev_ok := parse_event_obj(obj, allocator)
 		if !ev_ok {
@@ -463,13 +491,23 @@ parse_client_msg :: proc(
 		}
 		return Msg_Auth{ev = ev}, "", true
 	case "REQ":
-		sub_id, filters, why, sf_ok := parse_sub_and_filters(arr, "REQ", max_filter_values, allocator)
+		sub_id, filters, why, sf_ok := parse_sub_and_filters(
+			arr,
+			"REQ",
+			max_filter_values,
+			allocator,
+		)
 		if !sf_ok {
 			return nil, why, false
 		}
 		return Msg_Req{sub_id = sub_id, filters = filters}, "", true
 	case "COUNT":
-		sub_id, filters, why, sf_ok := parse_sub_and_filters(arr, "COUNT", max_filter_values, allocator)
+		sub_id, filters, why, sf_ok := parse_sub_and_filters(
+			arr,
+			"COUNT",
+			max_filter_values,
+			allocator,
+		)
 		if !sf_ok {
 			return nil, why, false
 		}
@@ -499,7 +537,13 @@ parse_client_msg :: proc(
 		if !m_ok {
 			return nil, m_why, false
 		}
-		return Msg_Neg_Open{sub_id = strings.clone(sid, allocator), filter = filter, msg = neg_msg}, "", true
+		return Msg_Neg_Open {
+				sub_id = strings.clone(sid, allocator),
+				filter = filter,
+				msg = neg_msg,
+			},
+			"",
+			true
 	case "NEG-MSG":
 		if len(arr) < 3 {
 			return nil, "invalid: NEG-MSG requires sub_id and message", false
@@ -842,10 +886,21 @@ single_filter_matches :: proc(f: ^Filter, ev: ^pack.Event) -> bool {
 //
 // Plain words between directives are joined by single spaces into one needle.
 @(private)
-parse_search :: proc(s: string, f: ^Filter, allocator := context.allocator) -> (reason: string, ok: bool) {
+parse_search :: proc(
+	s: string,
+	f: ^Filter,
+	allocator := context.allocator,
+) -> (
+	reason: string,
+	ok: bool,
+) {
 	needles := make([dynamic]string, allocator)
 	plain := strings.builder_make(context.temp_allocator)
-	flush_plain :: proc(b: ^strings.Builder, needles: ^[dynamic]string, allocator := context.allocator) {
+	flush_plain :: proc(
+		b: ^strings.Builder,
+		needles: ^[dynamic]string,
+		allocator := context.allocator,
+	) {
 		t := strings.trim_space(strings.to_string(b^))
 		if len(t) > 0 {
 			append(needles, strings.clone(t, allocator))
@@ -883,7 +938,8 @@ parse_search :: proc(s: string, f: ^Filter, allocator := context.allocator) -> (
 			}
 			ts, ts_ok := parse_search_time(word[:end])
 			if !ts_ok {
-				return "invalid: search since/until not unix seconds, YYYY-MM-DD or RFC 3339", false
+				return "invalid: search since/until not unix seconds, YYYY-MM-DD or RFC 3339",
+					false
 			}
 			if rest[0] == 's' {
 				f.since = ts

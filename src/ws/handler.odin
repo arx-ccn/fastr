@@ -42,7 +42,7 @@ Conn_State :: struct {
 	conn:      Conn,
 	outbox:    ^Outbox,
 	auth:      Auth_State,
-	live_subs: map[string]struct {}, // heap-owned keys
+	live_subs: map[string]struct{}, // heap-owned keys
 	neg_subs:  map[string]^Neg_Session, // heap-owned keys and sessions
 }
 
@@ -218,7 +218,11 @@ live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
 		return false
 	}
 	if cs.relay.hooks.check_read != nil {
-		principal := policy.Principal{source = .Client, conn_id = cs.outbox.conn_id, auth_pks = auth[:n]}
+		principal := policy.Principal {
+			source   = .Client,
+			conn_id  = cs.outbox.conn_id,
+			auth_pks = auth[:n],
+		}
 		view := pack.view_event(ev)
 		return cs.relay.hooks.check_read(cs.relay.hooks.user, &principal, &view) == .Show
 	}
@@ -243,10 +247,10 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 	assert(ch_err == nil)
 	cs.outbox.ch = ch
 	cs.outbox.conn_id = conn_id
-	cs.outbox.auth_pks = make(map[[32]u8]struct {})
+	cs.outbox.auth_pks = make(map[[32]u8]struct{})
 
 	auth_state_init(&cs.auth)
-	cs.live_subs = make(map[string]struct {})
+	cs.live_subs = make(map[string]struct{})
 	cs.neg_subs = make(map[string]^Neg_Session)
 
 	writer := thread.create_and_start_with_poly_data(cs, writer_loop)
@@ -332,9 +336,12 @@ dispatch_text :: proc(cs: ^Conn_State, raw: string) {
 
 	msg, reason, ok := parse_msg(raw, cfg.max_filter_values)
 	if !ok {
-		// NIP-01: OK (not NOTICE) for identifiable EVENT submissions.
+		// NIP-01: OK for identifiable EVENT submissions and CLOSED for
+		// identifiable REQ/COUNT subscriptions; NOTICE only otherwise.
 		if id, id_ok := nostr.try_extract_event_id_from_msg(raw); id_ok {
 			send_ok(cs, &id, false, reason)
+		} else if sub_id, sub_ok := nostr.try_extract_sub_id_from_msg(raw); sub_ok {
+			send_closed(cs, sub_id, reason)
 		} else {
 			send_notice(cs, reason)
 		}
@@ -448,7 +455,11 @@ handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 		auth[n] = pk
 		n += 1
 	}
-	principal := policy.Principal{source = .Client, conn_id = cs.outbox.conn_id, auth_pks = auth[:n]}
+	principal := policy.Principal {
+		source   = .Client,
+		conn_id  = cs.outbox.conn_id,
+		auth_pks = auth[:n],
+	}
 	err, reason := ingest_event(cs.relay, principal, ev)
 	send_ok(cs, &ev.id, err == .None || err == .Duplicate || err == .Duplicate_Newer, reason)
 }
@@ -467,7 +478,7 @@ Req_Hit :: struct {
 Req_Query_Ctx :: struct {
 	sub_id: string,
 	hits:   ^[dynamic]Req_Hit,
-	seen:   ^map[[32]u8]struct {},
+	seen:   ^map[[32]u8]struct{},
 }
 
 @(private)
@@ -507,14 +518,23 @@ collect_auth_pks :: proc(cs: ^Conn_State) -> [][32]u8 {
 @(private)
 read_access :: proc(cs: ^Conn_State) -> policy.Read_Access {
 	return {
-		principal = {source = .Client, conn_id = cs.outbox.conn_id, auth_pks = collect_auth_pks(cs)},
+		principal = {
+			source = .Client,
+			conn_id = cs.outbox.conn_id,
+			auth_pks = collect_auth_pks(cs),
+		},
 		user = cs.relay.hooks.user,
 		check = cs.relay.hooks.check_read,
 	}
 }
 
 @(private)
-request_denial :: proc(cs: ^Conn_State, access: policy.Read_Access, op: policy.Operation, filters: []nostr.Filter) -> string {
+request_denial :: proc(
+	cs: ^Conn_State,
+	access: policy.Read_Access,
+	op: policy.Operation,
+	filters: []nostr.Filter,
+) -> string {
 	if cs.relay.hooks.check_request == nil {
 		return ""
 	}
@@ -563,7 +583,7 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 	fanout_subscribe(&cs.relay.fanout, sub_id, filters, cs.outbox)
 
 	hits := make([dynamic]Req_Hit)
-	seen: map[[32]u8]struct {}
+	seen: map[[32]u8]struct{}
 	qctx := Req_Query_Ctx {
 		sub_id = sub_id,
 		hits   = &hits,
@@ -571,13 +591,20 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 	for &filter, i in filters {
 		if i == 1 {
 			// Seed the union from the already-unique first query.
-			seen = make(map[[32]u8]struct {}, len(hits), context.temp_allocator)
+			seen = make(map[[32]u8]struct{}, len(hits), context.temp_allocator)
 			for hit in hits {
 				seen[hit.id] = {}
 			}
 			qctx.seen = &seen
 		}
-		if err := store.query_authed(cs.relay.store, &filter, access.principal.auth_pks, &qctx, req_emit, access); err != .None {
+		if err := store.query_authed(
+			cs.relay.store,
+			&filter,
+			access.principal.auth_pks,
+			&qctx,
+			req_emit,
+			access,
+		); err != .None {
 			// #73: roll back and tell the client instead of a lying EOSE.
 			remove_live_sub(cs, sub_id)
 			for hit in hits {
@@ -736,8 +763,15 @@ handle_neg_open :: proc(cs: ^Conn_State, sub_id: string, filter: ^nostr.Filter, 
 	fill := Neg_Fill_Ctx {
 		storage = &session.storage,
 	}
-	if err, reason := store.iter_negentropy(cs.relay.store, filter, access.principal.auth_pks, cfg.max_neg_records, &fill, neg_fill, access);
-	   err != .None {
+	if err, reason := store.iter_negentropy(
+		cs.relay.store,
+		filter,
+		access.principal.auth_pks,
+		cfg.max_neg_records,
+		&fill,
+		neg_fill,
+		access,
+	); err != .None {
 		// #79: record-cap rejections carry "blocked:" and max_records.
 		max_records := cfg.max_neg_records if strings.has_prefix(reason, "blocked:") else -1
 		send_neg_err(cs, sub_id, reason, max_records)
@@ -756,7 +790,10 @@ handle_neg_open :: proc(cs: ^Conn_State, sub_id: string, filter: ^nostr.Filter, 
 		return
 	}
 
-	neg, make_err := negentropy.negentropy_make(&session.storage, neg_binary_frame_budget(cfg.max_message_bytes))
+	neg, make_err := negentropy.negentropy_make(
+		&session.storage,
+		neg_binary_frame_budget(cfg.max_message_bytes),
+	)
 	if make_err != .None {
 		send_neg_err(cs, sub_id, neg_error_reason(make_err))
 		neg_session_destroy(session)

@@ -68,7 +68,11 @@ test_parse_event_msg :: proc(t: ^testing.T) {
 
 @(test)
 test_parse_req_msg :: proc(t: ^testing.T) {
-	msg, reason, ok := parse_client_msg(`["REQ","sub1",{"kinds":[1]}]`, 256, context.temp_allocator)
+	msg, reason, ok := parse_client_msg(
+		`["REQ","sub1",{"kinds":[1]}]`,
+		256,
+		context.temp_allocator,
+	)
 	testing.expectf(t, ok, "parse failed: %s", reason)
 	req, is_req := msg.(Msg_Req)
 	testing.expect(t, is_req, "expected Msg_Req")
@@ -118,7 +122,13 @@ ev_msg :: proc(id, pk, sig, created_at, tags: string) -> string {
 test_parse_event_error_paths :: proc(t: ^testing.T) {
 	cases := [?]string {
 		ev_msg("deadbeef", PK64, SIG128, "0", "[]"), // id wrong length
-		ev_msg("DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF", PK64, SIG128, "0", "[]"), // uppercase
+		ev_msg(
+			"DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF",
+			PK64,
+			SIG128,
+			"0",
+			"[]",
+		), // uppercase
 		ev_msg(ID64, PK64, "bb", "0", "[]"), // sig wrong length
 		ev_msg(ID64, PK64, SIG128, `"oops"`, "[]"), // created_at string
 		ev_msg(ID64, PK64, SIG128, "0", `["bad"]`), // tag element not array
@@ -153,12 +163,53 @@ test_extract_id_negative_cases :: proc(t: ^testing.T) {
 		`["EVENT","not-an-object"]`,
 		fmt.tprintf(`["EVENT",{{"pubkey":"%s","sig":"%s"}}]`, PK64, SIG128),
 		ev_msg("deadbeef", PK64, SIG128, "0", "[]"),
-		ev_msg("DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF", PK64, SIG128, "0", "[]"),
+		ev_msg(
+			"DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF",
+			PK64,
+			SIG128,
+			"0",
+			"[]",
+		),
 		"not json",
 		"{}",
 	}
 	for raw in cases {
 		_, ok := try_extract_event_id_from_msg(raw)
+		testing.expectf(t, !ok, "must not extract from: %s", raw)
+	}
+}
+
+// --- try_extract_sub_id_from_msg (NIP-01 CLOSED-not-NOTICE) ---
+
+@(test)
+test_extract_sub_id_from_refused_req :: proc(t: ^testing.T) {
+	// Over the value cap: parse fails, but the sub id must still be found so
+	// the client gets CLOSED instead of waiting for EOSE.
+	raw := `["REQ","s1",{"ids":["aa","bb","cc"]}]`
+	_, _, parsed := parse_client_msg(raw, 2, context.temp_allocator)
+	testing.expect(t, !parsed, "3 ids over a cap of 2 must be refused")
+	sub_id, ok := try_extract_sub_id_from_msg(raw)
+	testing.expect(t, ok)
+	testing.expect_value(t, sub_id, "s1")
+
+	sub_id, ok = try_extract_sub_id_from_msg(`["COUNT","c1",{"kinds":"x"}]`)
+	testing.expect(t, ok)
+	testing.expect_value(t, sub_id, "c1")
+}
+
+@(test)
+test_extract_sub_id_negative_cases :: proc(t: ^testing.T) {
+	cases := [?]string {
+		`["REQ"]`,
+		`["REQ",7,{}]`,
+		`["CLOSE","s1"]`,
+		`["NEG-OPEN","s1",{},"00"]`,
+		`["EVENT","s1"]`,
+		"not json",
+		"{}",
+	}
+	for raw in cases {
+		_, ok := try_extract_sub_id_from_msg(raw)
 		testing.expectf(t, !ok, "must not extract from: %s", raw)
 	}
 }
@@ -346,7 +397,11 @@ test_server_msg_serializations :: proc(t: ^testing.T) {
 
 	clear(&buf)
 	write_ok_json(&buf, &id_aa, false, "invalid: bad signature")
-	testing.expect_value(t, string(buf[:]), fmt.tprintf(`["OK","%s",false,"invalid: bad signature"]`, aa_hex))
+	testing.expect_value(
+		t,
+		string(buf[:]),
+		fmt.tprintf(`["OK","%s",false,"invalid: bad signature"]`, aa_hex),
+	)
 
 	clear(&buf)
 	write_eose_json(&buf, "abc")
@@ -617,7 +672,11 @@ test_event_expiry_and_p_tag :: proc(t: ^testing.T) {
 
 @(test)
 test_parse_filter_search :: proc(t: ^testing.T) {
-	msg, _, ok := parse_client_msg(`["REQ","s",{"search":"purple ostrich"}]`, 256, context.temp_allocator)
+	msg, _, ok := parse_client_msg(
+		`["REQ","s",{"search":"purple ostrich"}]`,
+		256,
+		context.temp_allocator,
+	)
 	testing.expect(t, ok)
 	req := msg.(Msg_Req)
 	search, present := req.filters[0].search.?
@@ -663,43 +722,75 @@ test_parse_filter_search_directives :: proc(t: ^testing.T) {
 	f := msg.(Msg_Req).filters[0]
 
 	authors, has_authors := f.authors.?
-	testing.expect(t, has_authors && len(authors) == 1 && authors[0].length == 32, "from: must desugar into authors")
+	testing.expect(
+		t,
+		has_authors && len(authors) == 1 && authors[0].length == 32,
+		"from: must desugar into authors",
+	)
 	pvals, has_p := f.tags['p']
 	testing.expect(t, has_p && len(pvals) == 1, "tags: must desugar into #p")
 	testing.expect(t, "04c915daefee38317fa734444acee390a8269fe5810b2241e5e6dd343dfbecc9" in pvals)
 	search, has_search := f.search.?
-	testing.expect(t, has_search && len(search) == 3, "content.includes + plain text become needles")
+	testing.expect(
+		t,
+		has_search && len(search) == 3,
+		"content.includes + plain text become needles",
+	)
 	testing.expect_value(t, search[0], "TIL")
 	testing.expect_value(t, search[1], "million")
 	testing.expect_value(t, search[2], "odell")
 
 	// Directive-only search leaves `search` absent so the index fast path stays.
-	msg2, _, ok2 := parse_client_msg(`["REQ","s",{"search":"from:32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245"}]`, 256, context.temp_allocator)
+	msg2, _, ok2 := parse_client_msg(
+		`["REQ","s",{"search":"from:32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245"}]`,
+		256,
+		context.temp_allocator,
+	)
 	testing.expect(t, ok2)
 	_, has_search2 := msg2.(Msg_Req).filters[0].search.?
 	testing.expect(t, !has_search2)
 
 	_, _, bad := parse_client_msg(`["REQ","s",{"search":"from:zz"}]`, 256, context.temp_allocator)
 	testing.expect(t, !bad)
-	_, _, bad2 := parse_client_msg(`["REQ","s",{"search":"tags:[[\"p\"]"}]`, 256, context.temp_allocator)
+	_, _, bad2 := parse_client_msg(
+		`["REQ","s",{"search":"tags:[[\"p\"]"}]`,
+		256,
+		context.temp_allocator,
+	)
 	testing.expect(t, !bad2)
 }
 
 @(test)
 test_parse_filter_search_since_until :: proc(t: ^testing.T) {
-	msg, reason, ok := parse_client_msg(`["REQ","s",{"search":"since:2026-09-03 until:2026-09-03T18:21:02+02:00 odell"}]`, 256, context.temp_allocator)
+	msg, reason, ok := parse_client_msg(
+		`["REQ","s",{"search":"since:2026-09-03 until:2026-09-03T18:21:02+02:00 odell"}]`,
+		256,
+		context.temp_allocator,
+	)
 	testing.expect(t, ok, reason)
 	f := msg.(Msg_Req).filters[0]
 	testing.expect_value(t, f.since.?, i64(1788393600))
 	testing.expect_value(t, f.until.?, i64(1788452462))
 	testing.expect_value(t, f.search.?[0], "odell")
 
-	msg2, _, ok2 := parse_client_msg(`["REQ","s",{"search":"since:1780239482"}]`, 256, context.temp_allocator)
+	msg2, _, ok2 := parse_client_msg(
+		`["REQ","s",{"search":"since:1780239482"}]`,
+		256,
+		context.temp_allocator,
+	)
 	testing.expect(t, ok2)
 	testing.expect_value(t, msg2.(Msg_Req).filters[0].since.?, i64(1780239482))
 
-	_, _, bad := parse_client_msg(`["REQ","s",{"search":"since:yesterday"}]`, 256, context.temp_allocator)
+	_, _, bad := parse_client_msg(
+		`["REQ","s",{"search":"since:yesterday"}]`,
+		256,
+		context.temp_allocator,
+	)
 	testing.expect(t, !bad)
-	_, _, bad2 := parse_client_msg(`["REQ","s",{"search":"since:2026-09-03T18:21"}]`, 256, context.temp_allocator)
+	_, _, bad2 := parse_client_msg(
+		`["REQ","s",{"search":"since:2026-09-03T18:21"}]`,
+		256,
+		context.temp_allocator,
+	)
 	testing.expect(t, !bad2)
 }
