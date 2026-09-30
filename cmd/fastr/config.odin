@@ -20,7 +20,7 @@ Config :: struct {
 	max_connections:             int,
 	// Maximum active subscriptions per connection. Default: 20
 	max_subscriptions_per_conn:  int,
-	// Maximum filters per REQ message. Default: 10
+	// Maximum filters per REQ message. Default: 32 (ngit sends ~14 per fetch)
 	max_filters_per_req:         int,
 	// Maximum events returned per filter. Default: 500
 	max_limit:                   int,
@@ -28,7 +28,8 @@ Config :: struct {
 	max_message_bytes:           int,
 	// Maximum subscription ID length in characters (NIP-01: max 64). Default: 64
 	max_subid_length:            int,
-	// Maximum number of values in a single filter field. Default: 256
+	// Maximum number of values in a single filter field. Default: 4096
+	// (ngit puts every PR and issue id of a repo into one filter)
 	max_filter_values:           int,
 	// Directory where the store files live. Default: "./data"
 	data_dir:                    string,
@@ -88,12 +89,12 @@ Config :: struct {
 	// Seconds an unclaimed refs/nostr/<event-id> ref survives before GC.
 	// FASTR_GRASP_NOSTR_REF_TTL. Default: 1200 (20 minutes per GRASP-01).
 	grasp_nostr_ref_ttl:         i64,
-	grasp_sync:                 bool,
-	grasp_sync_plus:            bool,
-	grasp_archive:              bool,
-	grasp_private:              bool,
-	grasp_whitelist:            [][32]u8,
-	grasp_secret:               [32]u8,
+	grasp_sync:                  bool,
+	grasp_sync_plus:             bool,
+	grasp_archive:               bool,
+	grasp_private:               bool,
+	grasp_whitelist:             [][32]u8,
+	grasp_secret:                [32]u8,
 	// Relay-to-relay pull sync. FASTR_SYNC_PEERS: comma-separated ws(s)://
 	// relay URLs. Empty = disabled (default).
 	sync_peers:                  []string,
@@ -226,7 +227,10 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		grasp_acceptance = "archive: any repository announcement with a safe identifier is accepted"
 	}
 	if !grasp_acceptance_found && private {
-		grasp_acceptance = strings.concatenate({"whitelisted authenticated users only; ", grasp_acceptance}, allocator)
+		grasp_acceptance = strings.concatenate(
+			{"whitelisted authenticated users only; ", grasp_acceptance},
+			allocator,
+		)
 	}
 	whitelist := make([dynamic][32]u8, allocator)
 	if raw, found := os.lookup_env("FASTR_GRASP_WHITELIST", context.temp_allocator); found {
@@ -245,51 +249,56 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		raw := os.get_env("FASTR_GRASP_SECRET", context.temp_allocator)
 		key, ok := grasp_hex_key(raw)
 		if !ok || key == ([32]u8{}) || len(whitelist) == 0 {
-			panic("private GRASP requires FASTR_GRASP_SECRET (32-byte hex) and FASTR_GRASP_WHITELIST")
+			panic(
+				"private GRASP requires FASTR_GRASP_SECRET (32-byte hex) and FASTR_GRASP_WHITELIST",
+			)
 		}
 		secret = key
 	}
 
 	return Config {
-		listen_host                 = host,
-		listen_port                 = u16(port),
-		max_connections             = env_int("FASTR_MAX_CONNECTIONS", 1024),
-		max_subscriptions_per_conn  = env_int("FASTR_MAX_SUBSCRIPTIONS", 20),
-		max_filters_per_req         = env_int("FASTR_MAX_FILTERS", 10),
-		max_limit                   = env_int("FASTR_MAX_LIMIT", 500),
-		max_message_bytes           = env_int("FASTR_MAX_MESSAGE_BYTES", ws.DEFAULT_MAX_MESSAGE_BYTES),
-		max_subid_length            = clamp(env_int("FASTR_MAX_SUBID_LENGTH", 64), 1, 64),
-		max_filter_values           = env_int("FASTR_MAX_FILTER_VALUES", 256),
-		data_dir                    = data_dir,
-		relay_url                   = relay_url,
-		compact_interval            = env_u64("FASTR_COMPACT_INTERVAL", 21600),
-		stats_interval              = env_u64("FASTR_STATS_INTERVAL", 3600),
-		max_neg_records             = env_int("FASTR_MAX_NEG_RECORDS", 500_000),
-		max_event_tags              = env_int("FASTR_MAX_EVENT_TAGS", 2000),
-		max_content_length          = env_int("FASTR_MAX_CONTENT_LENGTH", 50 * 1024),
-		max_content_length_per_kind = parse_kind_limits("FASTR_MAX_CONTENT_LENGTH_PER_KIND", allocator),
-		pubkey                      = pubkey,
-		contact                     = contact,
-		icon                        = icon,
-		banner                      = banner,
-		tos_url                     = tos_url,
-		tos_text                    = tos_text,
-		min_pow_difficulty          = min_pow,
-		grasp_enabled               = grasp_enabled,
-		grasp_dir                   = grasp_dir,
-		grasp_max_pack_bytes        = env_int("FASTR_GRASP_MAX_PACK_BYTES", 256 * 1024 * 1024),
-		grasp_urls                  = grasp_urls,
-		grasp_acceptance            = grasp_acceptance,
-		grasp_curation              = grasp_curation,
-		grasp_nostr_ref_ttl         = i64(env_int("FASTR_GRASP_NOSTR_REF_TTL", 1200)),
-		grasp_sync                 = archive || env_int("FASTR_GRASP_SYNC", 1) == 1,
-		grasp_sync_plus            = env_int("FASTR_GRASP_SYNC_PLUS", 1) == 1,
-		grasp_archive              = archive,
-		grasp_private              = private,
-		grasp_whitelist            = whitelist[:],
-		grasp_secret               = secret,
-		sync_peers                  = parse_sync_peers(allocator),
-		sync_interval               = env_u64("FASTR_SYNC_INTERVAL", 3600),
+		listen_host = host,
+		listen_port = u16(port),
+		max_connections = env_int("FASTR_MAX_CONNECTIONS", 1024),
+		max_subscriptions_per_conn = env_int("FASTR_MAX_SUBSCRIPTIONS", 20),
+		max_filters_per_req = env_int("FASTR_MAX_FILTERS", 32),
+		max_limit = env_int("FASTR_MAX_LIMIT", 500),
+		max_message_bytes = env_int("FASTR_MAX_MESSAGE_BYTES", ws.DEFAULT_MAX_MESSAGE_BYTES),
+		max_subid_length = clamp(env_int("FASTR_MAX_SUBID_LENGTH", 64), 1, 64),
+		max_filter_values = env_int("FASTR_MAX_FILTER_VALUES", 4096),
+		data_dir = data_dir,
+		relay_url = relay_url,
+		compact_interval = env_u64("FASTR_COMPACT_INTERVAL", 21600),
+		stats_interval = env_u64("FASTR_STATS_INTERVAL", 3600),
+		max_neg_records = env_int("FASTR_MAX_NEG_RECORDS", 500_000),
+		max_event_tags = env_int("FASTR_MAX_EVENT_TAGS", 2000),
+		max_content_length = env_int("FASTR_MAX_CONTENT_LENGTH", 50 * 1024),
+		max_content_length_per_kind = parse_kind_limits(
+			"FASTR_MAX_CONTENT_LENGTH_PER_KIND",
+			allocator,
+		),
+		pubkey = pubkey,
+		contact = contact,
+		icon = icon,
+		banner = banner,
+		tos_url = tos_url,
+		tos_text = tos_text,
+		min_pow_difficulty = min_pow,
+		grasp_enabled = grasp_enabled,
+		grasp_dir = grasp_dir,
+		grasp_max_pack_bytes = env_int("FASTR_GRASP_MAX_PACK_BYTES", 256 * 1024 * 1024),
+		grasp_urls = grasp_urls,
+		grasp_acceptance = grasp_acceptance,
+		grasp_curation = grasp_curation,
+		grasp_nostr_ref_ttl = i64(env_int("FASTR_GRASP_NOSTR_REF_TTL", 1200)),
+		grasp_sync = archive || env_int("FASTR_GRASP_SYNC", 1) == 1,
+		grasp_sync_plus = env_int("FASTR_GRASP_SYNC_PLUS", 1) == 1,
+		grasp_archive = archive,
+		grasp_private = private,
+		grasp_whitelist = whitelist[:],
+		grasp_secret = secret,
+		sync_peers = parse_sync_peers(allocator),
+		sync_interval = env_u64("FASTR_SYNC_INTERVAL", 3600),
 	}
 }
 
