@@ -3,8 +3,112 @@
 // again at the end of store_compact.
 package store
 
+import "core:os"
+import "core:strings"
+
 import "../nostr"
 import "../pack"
+import secp "../secp256k1"
+
+// Upgrade pre-support records before deriving any deletion state. Stored
+// blobs are trusted for decoding, but a previously ignored marker is not
+// trusted until both the canonical ID and signature have been verified.
+@(private)
+load_protection :: proc(s: ^Store, idx, data: []u8) -> Error {
+	for i in 0 ..< index_entry_count(idx) {
+		e := index_entry_at(idx, i)
+		if e.no_delete || e.kind == 0 || e.kind == 3 || (e.kind >= 10000 && e.kind < 40000) {
+			continue
+		}
+		start, end, ok := blob_bounds(idx, i, index_entry_count(idx), len(data), e.offset)
+		if !ok {
+			continue
+		}
+		// The literal marker is never hex-compressed by the pack format.
+		// A cheap prefilter avoids decoding ordinary unmarked blobs.
+		if !strings.contains(string(data[start:end]), "no_delete") {
+			continue
+		}
+		ev, err := pack.deserialize_trusted(data[start:end], context.temp_allocator)
+		if err != .None {
+			continue
+		}
+		marked, _ := nostr.deletion_protection(&ev)
+		if marked &&
+		   ev.id == e.id &&
+		   ev.pubkey == e.pubkey &&
+		   ev.kind == e.kind &&
+		   ev.created_at == e.created_at {
+			if nostr.event_id_hash(&ev) == ev.id && secp.verify(&ev.sig, &ev.id, &ev.pubkey) {
+				flag := [1]u8{idx[i * INDEX_ENTRY_SIZE + 26] | NO_DELETE_FLAG}
+				if _, err := os.seek(
+					s.writer.index.file,
+					i64(HEADER_SIZE + i * INDEX_ENTRY_SIZE + 26),
+					.Start,
+				); err != nil {
+					return .Io
+				}
+				write_exact(s.writer.index.file, flag[:]) or_return
+			}
+		}
+		pack.event_destroy(&ev, context.temp_allocator)
+	}
+	if _, err := os.seek(
+		s.writer.index.file,
+		i64(HEADER_SIZE) + i64(s.writer.index.offset),
+		.Start,
+	); err != nil {
+		return .Io
+	}
+	return .None
+}
+
+// Keep effective recipient deletions independently of request records.
+// Sweeps apply to existing records, not unrelated wraps published later.
+@(private)
+load_recipients :: proc(s: ^Store, idx, tags: []u8) -> Error {
+	set, err := vanish_load(path_join(s.dir, "recipient.r"), s.allocator)
+	defer delete(set)
+	if err != .None {
+		return err
+	}
+	for id in set {
+		s.recipients[id] = {}
+	}
+	// Walk backwards: a request sweeps only records that preceded it in
+	// storage arrival order. No created_at cutoff is introduced.
+	keys := make(Key_Set, context.temp_allocator)
+	defer delete(keys)
+	tag_end := len(tags) / TAG_ENTRY_SIZE
+	for i := index_entry_count(idx) - 1; i >= 0; i -= 1 {
+		e := index_entry_at(idx, i)
+		if e.id in s.recipients {
+			tombstone_insert_confirmed(&s.tombstones, e.id)
+		}
+		if e.kind == nostr.KIND_DELETION ||
+		   (e.kind == nostr.KIND_VANISH && e.pubkey in s.vanished) {
+			keys[e.pubkey] = {}
+		}
+		for tag_end > 0 {
+			t := tag_entry_from_bytes(
+				tags[(tag_end - 1) * TAG_ENTRY_SIZE:tag_end * TAG_ENTRY_SIZE],
+			)
+			if t.data_offset < e.offset {
+				break
+			}
+			tag_end -= 1
+			if e.kind == nostr.KIND_GIFT_WRAP &&
+			   t.data_offset == e.offset &&
+			   t.tag_name == 'p' &&
+			   t.value_len == 32 &&
+			   t.tag_value in keys {
+				s.recipients[e.id] = {}
+				tombstone_insert_confirmed(&s.tombstones, e.id)
+			}
+		}
+	}
+	return .None
+}
 
 // Scan all stored kind-5 events and populate the tombstone map.
 //
@@ -19,6 +123,7 @@ import "../pack"
 load_tombstones :: proc(
 	index_buf, data_buf, tags_buf, dtags_buf: []u8,
 	allocator := context.allocator,
+	recipient_ids: ^Key_Set = nil,
 ) -> (
 	tracker: Tombstone_Tracker,
 ) {
@@ -32,7 +137,7 @@ load_tombstones :: proc(
 	defer delete(id_map)
 	for i in 0 ..< total {
 		e := index_entry_at(index_buf, i)
-		id_map[e.id] = Deletion_Target{e.kind, e.pubkey, e.offset}
+		id_map[e.id] = Deletion_Target{e.kind, e.pubkey, e.offset, e.no_delete}
 	}
 
 	for i in 0 ..< total {
@@ -51,7 +156,15 @@ load_tombstones :: proc(
 		// Boot-time path: counter rebuild happens via boot_rebuild, so the
 		// newly-confirmed ids produced here are discarded (#140).
 		discard := make([dynamic][32]u8, context.temp_allocator)
-		process_e_tag_deletion_core(&ev, id_map, tags_buf, &tracker, MAX_PREEMPTIVE_TOMBSTONES, &discard)
+		process_e_tag_deletion_core(
+			&ev,
+			id_map,
+			tags_buf,
+			&tracker,
+			MAX_PREEMPTIVE_TOMBSTONES,
+			&discard,
+			recipient_ids,
+		)
 		// a-tag id-tombstone (only resolves targets still in dtags). The
 		// coordinate-tombstone map below is the compaction-resilient source
 		// of truth.
@@ -107,7 +220,13 @@ load_a_tag_coord_tombstones :: proc(
 // (kind in the addressable range, coordinate pubkey matches the deletion
 // author, and - if `k` tags are present - the coordinate's kind appears in
 // that set).
-parse_a_tag_coord :: proc(k5: ^pack.Event, tag: ^pack.Tag) -> (coord: Addressable_Coord, ok: bool) {
+parse_a_tag_coord :: proc(
+	k5: ^pack.Event,
+	tag: ^pack.Tag,
+) -> (
+	coord: Addressable_Coord,
+	ok: bool,
+) {
 	if len(tag.fields) < 2 || tag.fields[0] != "a" {
 		return
 	}

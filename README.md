@@ -36,6 +36,7 @@ data/
   tags.s       49-byte records: tag name, value hash, event offset
   dtags.t      74-byte records: d-tag hash + kind + pubkey (addressable events)
   vanished.r   32-byte pubkey records (NIP-62)
+  recipient.r  32-byte gift-wrap IDs deleted by recipient authority
 ```
 
 **Query path:** scan index records newest-first with cheapest-first filter
@@ -99,6 +100,17 @@ Transcoding to JSON wire format is one pass, zero heap allocations. The event ne
 | 62 | Request to vanish |
 | 70 | Protected events |
 | 77 | Negentropy sync (server + pull client) |
+
+fastr implements the unassigned [deletion-protection proposal](https://github.com/nostr-protocol/nips/pull/2531).
+An eligible event signed with exactly one `["no_delete"]` tag survives
+same-author deletion requests and author-based vanish purges, including
+request-first publication, restart, and compaction. Recipient gift-wrap
+deletion, signed expiration, and independent relay policies still apply.
+Malformed markers or protected expiration tags receive `invalid:`;
+ineligible kinds and protected expiration timestamps above `9223372036854775807`
+receive `restricted:`. Existing stored markers are verified before gaining
+protection. The proposal has no assigned NIP number, so it is not listed in
+NIP-11's `supported_nips`.
 
 ---
 

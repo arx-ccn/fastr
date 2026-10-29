@@ -55,7 +55,7 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 				continue
 			}
 			// Skip vanished (except kind-62 vanish events themselves).
-			if entry.pubkey in s.vanished && entry.kind != nostr.KIND_VANISH {
+			if entry.pubkey in s.vanished && entry.kind != nostr.KIND_VANISH && !entry.no_delete {
 				continue
 			}
 			// Skip expired (#118).
@@ -148,6 +148,7 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 			kind       = entry.kind,
 			id         = entry.id,
 			pubkey     = entry.pubkey,
+			no_delete  = entry.no_delete,
 		}
 		ie_bytes := index_entry_to_bytes(&new_ie)
 		if writer_file_write(&new_data, blob) != .None ||
@@ -253,7 +254,9 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 			delta_dtags := cur_dtags_g.data[snap_dtags_len:w.dtags.offset]
 			delta_dtags_count := len(delta_dtags) / DTAG_ENTRY_SIZE
 			for j in 0 ..< delta_dtags_count {
-				de := dtag_entry_from_bytes(delta_dtags[j * DTAG_ENTRY_SIZE:(j + 1) * DTAG_ENTRY_SIZE])
+				de := dtag_entry_from_bytes(
+					delta_dtags[j * DTAG_ENTRY_SIZE:(j + 1) * DTAG_ENTRY_SIZE],
+				)
 				de.data_offset = u64(i64(de.data_offset) + data_shift)
 				de_bytes := dtag_entry_to_bytes(&de)
 				if writer_file_write(&new_dtags, de_bytes[:]) != .None {
@@ -271,6 +274,9 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 	tmp_files_cleanup(&new_data, &new_index, &new_tags, &new_dtags)
 
 	// Rename temp files over originals.
+	// Persist recipient-deleted IDs first: once request records are removed, this
+	// file is the durable source of their recipient authority.
+	save_recipients(s) or_return
 	if os.rename(tmp_data_path, path_join(s.dir, "data.n")) != nil ||
 	   os.rename(tmp_index_path, path_join(s.dir, "index.o")) != nil ||
 	   os.rename(tmp_tags_path, path_join(s.dir, "tags.s")) != nil ||
@@ -331,7 +337,21 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 		defer slice_release(tags2_g)
 		dtags2_g := mapped_file_slice(&s.dtags)
 		defer slice_release(dtags2_g)
-		new_tombstones := load_tombstones(idx2_g.data, data2_g.data, tags2_g.data, dtags2_g.data, s.allocator)
+		sync.guard(&s.recipients_mu)
+		new_tombstones := load_tombstones(
+			idx2_g.data,
+			data2_g.data,
+			tags2_g.data,
+			dtags2_g.data,
+			s.allocator,
+			&s.recipients,
+		)
+		for i in 0 ..< index_entry_count(idx2_g.data) {
+			e := index_entry_at(idx2_g.data, i)
+			if e.id in s.recipients {
+				tombstone_insert_confirmed(&new_tombstones, e.id)
+			}
+		}
 		// Issue #76: rebuild a-tag coordinate tombstones from the compacted
 		// kind-5 events.
 		new_addr_tombs := load_a_tag_coord_tombstones(idx2_g.data, data2_g.data, s.allocator)
@@ -379,7 +399,11 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 			sync.shared_guard(&s.vanished_mu)
 			if len(s.vanished) > 0 {
 				rewrite = true
-				vf, oerr := os.open(tmp_vanish, {.Read, .Write, .Create, .Trunc}, os.Permissions_Default)
+				vf, oerr := os.open(
+					tmp_vanish,
+					{.Read, .Write, .Create, .Trunc},
+					os.Permissions_Default,
+				)
 				if oerr != nil {
 					return 0, .Io
 				}

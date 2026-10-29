@@ -41,7 +41,11 @@ test_nip09_cross_pubkey_deletion_ignored :: proc(t: ^testing.T) {
 
 	f: nostr.Filter
 	c := test_query_collect(t, s, &f)
-	testing.expect(t, ids_contain(c.ids[:], target.id), "cross-pubkey deletion must not remove event")
+	testing.expect(
+		t,
+		ids_contain(c.ids[:], target.id),
+		"cross-pubkey deletion must not remove event",
+	)
 }
 
 @(test)
@@ -394,7 +398,7 @@ test_preemptive_tombstone_cap_allows_confirmed :: proc(t: ^testing.T) {
 	}
 	k5c := test_make_event(1, 5, 2_000, test_tags(test_tag("e", test_hex(confirmed_id[:]))))
 	resolved := make(map[[32]u8]Deletion_Target, context.temp_allocator)
-	resolved[confirmed_id] = Deletion_Target{1, k5c.pubkey, 0}
+	resolved[confirmed_id] = Deletion_Target{1, k5c.pubkey, 0, false}
 	process_e_tag_deletion_core(&k5c, resolved, nil, &tracker, max_p, &newly)
 	testing.expect_value(t, len(tracker.map_), 3)
 	v, ok := tracker.map_[confirmed_id]
@@ -415,7 +419,12 @@ test_nip59_recipient_deletes_stored_gift_wrap :: proc(t: ^testing.T) {
 	defer store_close(s)
 
 	recipient_pk := test_pubkey(1)
-	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+	gw := test_make_event(
+		2,
+		nostr.KIND_GIFT_WRAP,
+		1_000,
+		test_tags(test_tag("p", test_hex(recipient_pk[:]))),
+	)
 	test_append_ok(t, s, &gw)
 
 	k5 := test_kind5_event(1, gw.id)
@@ -432,7 +441,12 @@ test_nip59_non_recipient_cannot_delete_gift_wrap :: proc(t: ^testing.T) {
 	defer store_close(s)
 
 	recipient_pk := test_pubkey(1)
-	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+	gw := test_make_event(
+		2,
+		nostr.KIND_GIFT_WRAP,
+		1_000,
+		test_tags(test_tag("p", test_hex(recipient_pk[:]))),
+	)
 	test_append_ok(t, s, &gw)
 
 	// sk=3 is neither the throwaway author nor the p-tag recipient.
@@ -444,14 +458,19 @@ test_nip59_non_recipient_cannot_delete_gift_wrap :: proc(t: ^testing.T) {
 
 @(test)
 test_nip59_recipient_deletion_respects_k_tag :: proc(t: ^testing.T) {
-	// A k-tag on the kind-5 that excludes 1059 must skip the gift wrap.
+	// k-tags constrain e-tag deletion, not the independent recipient sweep.
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
 	s := test_open(t, dir)
 	defer store_close(s)
 
 	recipient_pk := test_pubkey(1)
-	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+	gw := test_make_event(
+		2,
+		nostr.KIND_GIFT_WRAP,
+		1_000,
+		test_tags(test_tag("p", test_hex(recipient_pk[:]))),
+	)
 	test_append_ok(t, s, &gw)
 
 	k5 := test_make_event(
@@ -461,7 +480,11 @@ test_nip59_recipient_deletion_respects_k_tag :: proc(t: ^testing.T) {
 		test_tags(test_tag("e", test_hex(gw.id[:])), test_tag("k", "1")),
 	)
 	test_append_ok(t, s, &k5)
-	testing.expect(t, !store_is_tombstoned(s, gw.id), "k-tag excluding 1059 must skip deletion")
+	testing.expect(
+		t,
+		store_is_tombstoned(s, gw.id),
+		"recipient p-tag sweep is independent of k-tags",
+	)
 
 	k5b := test_make_event(
 		1,
@@ -484,7 +507,12 @@ test_nip59_deletion_before_gift_wrap_blocks_ingest :: proc(t: ^testing.T) {
 	defer store_close(s)
 
 	recipient_pk := test_pubkey(1)
-	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+	gw := test_make_event(
+		2,
+		nostr.KIND_GIFT_WRAP,
+		1_000,
+		test_tags(test_tag("p", test_hex(recipient_pk[:]))),
+	)
 
 	k5 := test_kind5_event(1, gw.id)
 	test_append_ok(t, s, &k5)
@@ -505,7 +533,12 @@ test_nip59_deletion_before_unrelated_gift_wrap_ingests :: proc(t: ^testing.T) {
 	defer store_close(s)
 
 	other_pk := test_pubkey(9)
-	gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(other_pk[:]))))
+	gw := test_make_event(
+		2,
+		nostr.KIND_GIFT_WRAP,
+		1_000,
+		test_tags(test_tag("p", test_hex(other_pk[:]))),
+	)
 
 	k5 := test_kind5_event(1, gw.id)
 	test_append_ok(t, s, &k5)
@@ -525,7 +558,12 @@ test_nip59_recipient_tombstone_survives_restart :: proc(t: ^testing.T) {
 	{
 		s := test_open(t, dir)
 		recipient_pk := test_pubkey(1)
-		gw := test_make_event(2, nostr.KIND_GIFT_WRAP, 1_000, test_tags(test_tag("p", test_hex(recipient_pk[:]))))
+		gw := test_make_event(
+			2,
+			nostr.KIND_GIFT_WRAP,
+			1_000,
+			test_tags(test_tag("p", test_hex(recipient_pk[:]))),
+		)
 		test_append_ok(t, s, &gw)
 		gw_id = gw.id
 		k5 := test_kind5_event(1, gw.id)

@@ -14,8 +14,8 @@ import "core:strconv"
 
 import "../../src/nostr"
 import "../../src/pack"
-import "../wsclient"
 import secp "../../src/secp256k1"
+import "../wsclient"
 
 @(private)
 fail :: proc(msg: string, args: ..any) {
@@ -51,7 +51,21 @@ client_event_json :: proc(ev: ^pack.Event) -> string {
 	append(&buf, `,"kind":`)
 	kd: [6]u8
 	append(&buf, strconv.write_int(kd[:], i64(ev.kind), 10))
-	append(&buf, `,"tags":[],"content":`)
+	append(&buf, `,"tags":[`)
+	for tag, ti in ev.tags {
+		if ti > 0 {
+			append(&buf, ',')
+		}
+		append(&buf, '[')
+		for field, fi in tag.fields {
+			if fi > 0 {
+				append(&buf, ',')
+			}
+			pack.write_json_str(field, &buf)
+		}
+		append(&buf, ']')
+	}
+	append(&buf, `],"content":`)
 	pack.write_json_str(ev.content, &buf)
 	append(&buf, `,"sig":"`)
 	pack.hex_encode_into(ev.sig[:], &buf)
@@ -171,6 +185,11 @@ main :: proc() {
 		fail("count must be >= 1, got: %s", count_msg)
 	}
 	fmt.printfln("COUNT -> %d", count)
+
+	if err := wsclient.send_frame(conn.sock, `["CLOSE","smoke"]`); err != .None {
+		fail("websocket close subscription: %v", err)
+	}
+	smoke_deletion_protection(&conn)
 
 	fmt.println("SMOKE PASS")
 }

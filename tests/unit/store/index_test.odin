@@ -32,25 +32,30 @@ test_index_entry_roundtrip :: proc(t: ^testing.T) {
 // #118: ["expiration","0"] must survive as (expiry=0, has_expiry=true).
 @(test)
 test_index_entry_zero_expiry_flag_roundtrip :: proc(t: ^testing.T) {
-	e := Index_Entry{1, 2, 0, true, 3, fill(0x11), fill(0x22)}
+	e := Index_Entry{1, 2, 0, true, 3, fill(0x11), fill(0x22), true}
 	b := index_entry_to_bytes(&e)
 	e2 := index_entry_from_bytes(b[:])
 	testing.expect_value(t, e2.expiry, i64(0))
 	testing.expect(t, e2.has_expiry, "explicit has_expiry must persist even when expiry=0")
+	testing.expect(t, e2.no_delete, "protection is independent of expiration")
 }
 
 @(test)
 test_is_expired_semantics :: proc(t: ^testing.T) {
-	no_tag := Index_Entry{0, 0, 0, false, 0, {}, {}}
+	no_tag := Index_Entry{0, 0, 0, false, 0, {}, {}, false}
 	testing.expect(t, !index_entry_is_expired(&no_tag, 0))
 	testing.expect(t, !index_entry_is_expired(&no_tag, max(i64)))
 
-	zero_exp := Index_Entry{0, 0, 0, true, 0, {}, {}}
+	zero_exp := Index_Entry{0, 0, 0, true, 0, {}, {}, false}
 	testing.expect(t, index_entry_is_expired(&zero_exp, 1))
 	testing.expect(t, index_entry_is_expired(&zero_exp, max(i64)))
-	testing.expect(t, index_entry_is_expired(&zero_exp, 0), "expiry <= now is inclusive per NIP-40")
+	testing.expect(
+		t,
+		index_entry_is_expired(&zero_exp, 0),
+		"expiry <= now is inclusive per NIP-40",
+	)
 
-	future := Index_Entry{0, 0, 1_000, true, 0, {}, {}}
+	future := Index_Entry{0, 0, 1_000, true, 0, {}, {}, false}
 	testing.expect(t, !index_entry_is_expired(&future, 999))
 	testing.expect(t, index_entry_is_expired(&future, 1_000))
 	testing.expect(t, index_entry_is_expired(&future, 1_001))

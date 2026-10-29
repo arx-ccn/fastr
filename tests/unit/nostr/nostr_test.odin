@@ -634,6 +634,130 @@ test_has_protected_tag :: proc(t: ^testing.T) {
 	testing.expect(t, has_protected_tag(mixed[:]))
 }
 
+// --- Deletion request protection ---
+
+@(test)
+test_deletion_marker_tags :: proc(t: ^testing.T) {
+	cases := []struct {
+		tags:    []pack.Tag,
+		marked:  bool,
+		invalid: bool,
+	} {
+		{nil, false, false},
+		{{{fields = {}}}, false, false},
+		{{{fields = {"NO_DELETE"}}}, false, false},
+		{{{fields = {"No_Delete"}}}, false, false},
+		{{{fields = {"no_delete"}}}, true, false},
+		{{{fields = {"no_delete"}}, {fields = {"NO_DELETE"}}}, true, false},
+		{{{fields = {"no_delete", ""}}}, false, true},
+		{{{fields = {"no_delete", "1"}}}, false, true},
+		{{{fields = {"no_delete"}}, {fields = {"no_delete"}}}, false, true},
+		{{{fields = {"no_delete"}}, {fields = {"no_delete", "1"}}}, false, true},
+	}
+	for c, i in cases {
+		ev := pack.Event {
+			kind = 1,
+			tags = c.tags,
+		}
+		marked, reason := deletion_protection(&ev)
+		testing.expectf(t, marked == c.marked, "marker case %d: %s", i, reason)
+		if c.invalid {
+			testing.expectf(t, strings.has_prefix(reason, "invalid: "), "case %d: %s", i, reason)
+		} else {
+			testing.expect_value(t, reason, "")
+		}
+	}
+}
+
+@(test)
+test_deletion_marker_kinds :: proc(t: ^testing.T) {
+	for kind in ([]u16{0, 3, 10000, 10002, 19999, 20000, 22242, 29999, 30000, 30023, 39999}) {
+		ev := pack.Event {
+			kind = kind,
+			tags = {{fields = {"no_delete"}}},
+		}
+		marked, reason := deletion_protection(&ev)
+		testing.expect(t, !marked)
+		testing.expectf(t, strings.has_prefix(reason, "restricted: "), "kind %d: %s", kind, reason)
+	}
+	for kind in ([]u16{1, 2, 4, 5, 62, 1059, 9999, 40000, 65535}) {
+		ev := pack.Event {
+			kind = kind,
+			tags = {{fields = {"no_delete"}}},
+		}
+		marked, reason := deletion_protection(&ev)
+		testing.expectf(t, marked, "kind %d: %s", kind, reason)
+		testing.expect_value(t, reason, "")
+	}
+}
+
+@(test)
+test_deletion_marker_expiry :: proc(t: ^testing.T) {
+	for value in ([]string{"", "-1", "+1", "01", "00", " 1", "1 ", "1\n", "1.0", "1e3", "１２", "١", "18446744073709551616", "999999999999999999999999999999999999999"}) {
+		ev := pack.Event {
+			kind = 1,
+			tags = {{fields = {"no_delete"}}, {fields = {"expiration", value}}},
+		}
+		marked, reason := deletion_protection(&ev)
+		testing.expect(t, !marked)
+		testing.expectf(
+			t,
+			strings.has_prefix(reason, "invalid: "),
+			"expiration %q: %s",
+			value,
+			reason,
+		)
+	}
+	for tags in ([][]pack.Tag{{{fields = {"no_delete"}}, {fields = {"expiration"}}}, {{fields = {"no_delete"}}, {fields = {"expiration", "1", "extra"}}}, {{fields = {"no_delete"}}, {fields = {"expiration", "1"}}, {fields = {"expiration", "2"}}}}) {
+		ev := pack.Event {
+			kind = 1,
+			tags = tags,
+		}
+		marked, reason := deletion_protection(&ev)
+		testing.expect(t, !marked)
+		testing.expect(t, strings.has_prefix(reason, "invalid: "))
+	}
+	for value in ([]string{"0", "1", "1800000000", "9223372036854775807"}) {
+		ev := pack.Event {
+			kind = 1,
+			tags = {{fields = {"expiration", value}}, {fields = {"no_delete"}}},
+		}
+		marked, reason := deletion_protection(&ev)
+		testing.expectf(t, marked, "expiration %q: %s", value, reason)
+		testing.expect_value(t, reason, "")
+		_, has_expiry := event_expiry(&ev)
+		testing.expect(t, has_expiry, "every accepted marked expiration must remain effective")
+	}
+	for value in ([]string{"9223372036854775808", "18446744073709551615"}) {
+		ev := pack.Event {
+			kind = 1,
+			tags = {{fields = {"no_delete"}}, {fields = {"expiration", value}}},
+		}
+		marked, reason := deletion_protection(&ev)
+		testing.expect(t, !marked)
+		testing.expectf(
+			t,
+			strings.has_prefix(reason, "restricted: "),
+			"expiration %q: %s",
+			value,
+			reason,
+		)
+	}
+}
+
+@(test)
+test_unmarked_expiry_compat :: proc(t: ^testing.T) {
+	for value in ([]string{"-1", "01", "notanumber", "18446744073709551615"}) {
+		ev := pack.Event {
+			kind = 20000,
+			tags = {{fields = {"expiration", value, "extra"}}},
+		}
+		marked, reason := deletion_protection(&ev)
+		testing.expect(t, !marked)
+		testing.expect_value(t, reason, "")
+	}
+}
+
 // --- NIP-40 / NIP-17 helpers ---
 
 @(test)

@@ -3,6 +3,33 @@
 package store
 
 import "core:os"
+import "core:sync"
+
+// recipient.r uses the same header/32-byte-record encoding as vanished.r,
+// but records effective recipient-deleted event IDs, never recipient keys.
+// Caller holds writer_mu, excluding both deletion appends and vanish.
+@(private)
+save_recipients :: proc(s: ^Store) -> Error {
+	sync.shared_guard(&s.recipients_mu)
+	tmp := path_join(s.dir, "recipient.r.tmp")
+	f, err := os.open(tmp, {.Write, .Create, .Trunc}, os.Permissions_Default)
+	if err != nil {
+		return .Io
+	}
+	{
+		defer os.close(f)
+		header := FILE_HEADER
+		write_exact(f, header[:]) or_return
+		for id in s.recipients {
+			key := id
+			write_exact(f, key[:]) or_return
+		}
+	}
+	if os.rename(tmp, path_join(s.dir, "recipient.r")) != nil {
+		return .Io
+	}
+	return .None
+}
 
 PUBKEY_SIZE :: 32
 

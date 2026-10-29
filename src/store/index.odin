@@ -10,7 +10,7 @@ import "../nostr"
 //    8-15  created_at  i64 LE
 //   16-23  expiry      i64 LE  (NIP-40 expiration timestamp; see flag below)
 //   24-25  kind        u16 LE
-//   26     flags       u8      bit 0 = HAS_EXPIRY (#118)
+//   26     flags       u8      bit 0 = HAS_EXPIRY, bit 1 = NO_DELETE
 //   27     _pad
 //   28-59  id          [u8;32]
 //   60-91  pubkey      [u8;32]
@@ -27,6 +27,8 @@ Index_Entry :: struct {
 	kind:       u16,
 	id:         [32]u8,
 	pubkey:     [32]u8,
+	// Verified signed deletion-protection marker; independent of expiry.
+	no_delete:  bool,
 }
 
 INDEX_ENTRY_SIZE :: 92
@@ -39,6 +41,9 @@ OLD_INDEX_ENTRY_SIZE :: 84
 @(private)
 HAS_EXPIRY_FLAG: u8 : 0x01
 
+@(private)
+NO_DELETE_FLAG: u8 : 0x02
+
 // Construct a new entry, inferring `has_expiry` from the `expiry` value
 // (`expiry != 0` ⇒ flag set). Set `has_expiry` directly to represent an
 // explicit `["expiration", "0"]` tag (#118).
@@ -50,7 +55,7 @@ index_entry_new :: proc "contextless" (
 	id: [32]u8,
 	pubkey: [32]u8,
 ) -> Index_Entry {
-	return {offset, created_at, expiry, expiry != 0, kind, id, pubkey}
+	return {offset, created_at, expiry, expiry != 0, kind, id, pubkey, false}
 }
 
 // Serialize to the 92-byte on-disk record.
@@ -62,6 +67,9 @@ index_entry_to_bytes :: proc "contextless" (e: ^Index_Entry) -> (b: [INDEX_ENTRY
 	// byte 26 = flags; byte 27 reserved for future use.
 	if e.has_expiry {
 		b[26] |= HAS_EXPIRY_FLAG
+	}
+	if e.no_delete {
+		b[26] |= NO_DELETE_FLAG
 	}
 	copy(b[28:60], e.id[:])
 	copy(b[60:92], e.pubkey[:])
@@ -76,6 +84,7 @@ index_entry_from_bytes :: proc "contextless" (b: []u8) -> (e: Index_Entry) {
 	e.expiry = i64(endian.unchecked_get_u64le(b[16:24]))
 	e.kind = endian.unchecked_get_u16le(b[24:26])
 	e.has_expiry = (b[26] & HAS_EXPIRY_FLAG) != 0
+	e.no_delete = (b[26] & NO_DELETE_FLAG) != 0
 	copy(e.id[:], b[28:60])
 	copy(e.pubkey[:], b[60:92])
 	return

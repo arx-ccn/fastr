@@ -26,8 +26,8 @@ parse_u16 :: proc(s: string) -> (v: u16, ok: bool) {
 extract_k_tag_kinds :: proc(
 	k5: ^pack.Event,
 	allocator := context.temp_allocator,
-) -> map[u16]struct {} {
-	out := make(map[u16]struct {}, allocator)
+) -> map[u16]struct{} {
+	out := make(map[u16]struct{}, allocator)
 	for tag in k5.tags {
 		if len(tag.fields) < 2 || tag.fields[0] != "k" {
 			continue
@@ -43,9 +43,10 @@ extract_k_tag_kinds :: proc(
 // needed for the NIP-59 gift-wrap recipient check, which resolves the
 // target's p-tag via the tags index.
 Deletion_Target :: struct {
-	kind:   u16,
-	pubkey: [32]u8,
-	offset: u64,
+	kind:      u16,
+	pubkey:    [32]u8,
+	offset:    u64,
+	no_delete: bool,
 }
 
 // Core e-tag deletion logic: iterate a kind-5 event's `e` tags and resolve
@@ -68,6 +69,7 @@ process_e_tag_deletion_core :: proc(
 	tracker: ^Tombstone_Tracker,
 	max_preemptive: int,
 	newly_confirmed: ^[dynamic][32]u8,
+	recipient_ids: ^Key_Set = nil,
 ) {
 	// NIP-09 (#67): build the k-tag allow-list once; empty = no restriction.
 	k_kinds := extract_k_tag_kinds(k5)
@@ -103,15 +105,25 @@ process_e_tag_deletion_core :: proc(
 				// NIP-09 (#67): target kind not in the declared set - skip.
 				continue
 			}
-			authorised := kp.pubkey == k5.pubkey
-			if !authorised && kp.kind == nostr.KIND_GIFT_WRAP {
+			authorised := kp.pubkey == k5.pubkey && !kp.no_delete
+			if kp.kind == nostr.KIND_GIFT_WRAP {
 				// NIP-59: the recipient (p-tag) may delete a gift wrap even
 				// though it was signed by a random one-time key.
 				if !recipient_offsets_ready {
-					recipient_offsets = matching_offsets(tags_buf, 'p', k5.pubkey[:], context.temp_allocator)
+					recipient_offsets = matching_offsets(
+						tags_buf,
+						'p',
+						k5.pubkey[:],
+						context.temp_allocator,
+					)
 					recipient_offsets_ready = true
 				}
-				authorised = kp.offset in recipient_offsets
+				if kp.offset in recipient_offsets {
+					authorised = true
+					if recipient_ids != nil {
+						recipient_ids^[id_bytes] = {}
+					}
+				}
 			}
 			if authorised && tombstone_insert_confirmed(tracker, id_bytes) {
 				append(newly_confirmed, id_bytes)
@@ -158,6 +170,7 @@ process_deletion_into :: proc(
 	dtags_buf: []u8,
 	tracker: ^Tombstone_Tracker,
 	allocator := context.temp_allocator,
+	recipient_ids: ^Key_Set = nil,
 ) -> [dynamic][32]u8 {
 	newly_confirmed := make([dynamic][32]u8, allocator)
 
@@ -186,18 +199,41 @@ process_deletion_into :: proc(
 		for i in 0 ..< total {
 			e := index_entry_at(index_buf, i)
 			if e.id in targets {
-				resolved[e.id] = Deletion_Target{e.kind, e.pubkey, e.offset}
+				resolved[e.id] = Deletion_Target{e.kind, e.pubkey, e.offset, e.no_delete}
 				if len(resolved) == len(targets) {
 					break
 				}
 			}
 		}
-		process_e_tag_deletion_core(k5, resolved, tags_buf, tracker, MAX_PREEMPTIVE_TOMBSTONES, &newly_confirmed)
+		process_e_tag_deletion_core(
+			k5,
+			resolved,
+			tags_buf,
+			tracker,
+			MAX_PREEMPTIVE_TOMBSTONES,
+			&newly_confirmed,
+			recipient_ids,
+		)
 	}
 
 	for &tag in k5.tags {
 		if len(tag.fields) >= 1 && tag.fields[0] == "a" {
 			process_a_tag_deletion(k5, &tag, index_buf, dtags_buf, tracker, &newly_confirmed)
+		}
+	}
+	// NIP-59 recipient authority is a p-tag sweep, not an e-tag operation.
+	pk := k5.pubkey
+	offsets := matching_offsets(tags_buf, 'p', pk[:], context.temp_allocator)
+	defer delete(offsets)
+	for i in 0 ..< index_entry_count(index_buf) {
+		e := index_entry_at(index_buf, i)
+		if e.kind == nostr.KIND_GIFT_WRAP && e.offset in offsets {
+			if recipient_ids != nil {
+				recipient_ids^[e.id] = {}
+			}
+			if tombstone_insert_confirmed(tracker, e.id) {
+				append(&newly_confirmed, e.id)
+			}
 		}
 	}
 

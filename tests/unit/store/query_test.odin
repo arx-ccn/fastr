@@ -533,8 +533,10 @@ test_count_decrements_for_vanish :: proc(t: ^testing.T) {
 	kf := test_kind_filter(nostr.KIND_VANISH)
 	testing.expect_value(t, store_count(s, &kf), 1)
 
-	af := test_author_filter(vanish_ev.pubkey)
-	testing.expect_value(t, store_count(s, &af), 0)
+	for kind in ([2]u16{1, 7}) {
+		f := test_kind_filter(kind)
+		testing.expect_value(t, store_count(s, &f), u64(0))
+	}
 }
 
 // scan_count fallback path: tag / time / ids filters route through the

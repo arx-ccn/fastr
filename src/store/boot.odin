@@ -71,8 +71,10 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 			s.authors_with_expiry[entry.pubkey] = {}
 		}
 
-		// Skip vanished pubkeys.
-		if entry.pubkey in s.vanished {
+		// Preserve marked records and the vanish request itself. Rebuild
+		// author tombstones too, since ordinary queries use that map.
+		if entry.pubkey in s.vanished && !entry.no_delete && entry.kind != nostr.KIND_VANISH {
+			tombstone_insert_confirmed(&s.tombstones, entry.id)
 			continue
 		}
 		// Skip expired (#118).
@@ -128,7 +130,11 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 							tombstone_insert_confirmed(&s.tombstones, old.id)
 							decrement_kind_counter(&s.kind_counts, entry.kind)
 							decrement_author_counter(&s.author_counts, entry.pubkey)
-							s.addressable_live[key] = Live_Entry{entry.created_at, entry.id, index_offset}
+							s.addressable_live[key] = Live_Entry {
+								entry.created_at,
+								entry.id,
+								index_offset,
+							}
 						} else {
 							// Older addressable lost the dedup race:
 							// tombstone it (#88) and skip counting.
@@ -136,7 +142,11 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 							addressable_loser = true
 						}
 					} else {
-						s.addressable_live[key] = Live_Entry{entry.created_at, entry.id, index_offset}
+						s.addressable_live[key] = Live_Entry {
+							entry.created_at,
+							entry.id,
+							index_offset,
+						}
 					}
 					dtag_cursor += 1
 					found_dtag = true

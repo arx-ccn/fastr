@@ -93,7 +93,10 @@ p_tag_offsets_union :: proc(
 	}
 	values := make([]Tag_Value, len(auth_pks), context.temp_allocator)
 	for pk, i in auth_pks {
-		values[i] = Tag_Value{bytes = pk, length = 32}
+		values[i] = Tag_Value {
+			bytes  = pk,
+			length = 32,
+		}
 	}
 	specs := [1]Tag_Spec{{name = 'p', values = values}}
 	sets := multi_matching_offsets(tags_buf, specs[:], allocator)
@@ -256,7 +259,13 @@ query_authed :: proc(
 	// the last-N appended (#57, #108). Bounded heap whose root is the worst
 	// survivor; complexity O(M log N).
 	heap: pq.Priority_Queue(Heap_Item)
-	pq.init(&heap, heap_item_worse, pq.default_swap_proc(Heap_Item), limit + 1, context.temp_allocator)
+	pq.init(
+		&heap,
+		heap_item_worse,
+		pq.default_swap_proc(Heap_Item),
+		limit + 1,
+		context.temp_allocator,
+	)
 	defer pq.destroy(&heap)
 
 	// Pre-extract filter fields to avoid repeated Maybe-unwrapping in the hot loop.
@@ -415,7 +424,10 @@ query_authed :: proc(
 				}
 				tag_end -= 1
 			}
-			if !event_tags_match_specs(tags_g.data[tag_end * TAG_ENTRY_SIZE:end * TAG_ENTRY_SIZE], specs) {
+			if !event_tags_match_specs(
+				tags_g.data[tag_end * TAG_ENTRY_SIZE:end * TAG_ENTRY_SIZE],
+				specs,
+			) {
 				continue
 			}
 		}
@@ -512,7 +524,8 @@ query_authed :: proc(
 			stop: bool
 			{
 				sync.shared_guard(&s.scan_ceiling_mu)
-				stop = i - 1 < len(s.scan_ceiling) && s.scan_ceiling[i - 1] < pq.peek(heap).created_at
+				stop =
+					i - 1 < len(s.scan_ceiling) && s.scan_ceiling[i - 1] < pq.peek(heap).created_at
 			}
 			if stop {
 				break
@@ -543,13 +556,24 @@ store_count :: proc(s: ^Store, filter: ^nostr.Filter) -> u64 {
 	return count_authors(s, filter, nil, unix_now())
 }
 
-count_filters :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, access: policy.Read_Access = {}) -> u64 {
+count_filters :: proc(
+	s: ^Store,
+	filters: []nostr.Filter,
+	auth_pks: [][32]u8,
+	access: policy.Read_Access = {},
+) -> u64 {
 	return count_filters_at(s, filters, auth_pks, unix_now(), access)
 }
 
 // Same as count_filters but with an explicit `now`; used by the #117 expiry
 // fast-path fallback tests.
-count_filters_at :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, now: i64, access: policy.Read_Access = {}) -> u64 {
+count_filters_at :: proc(
+	s: ^Store,
+	filters: []nostr.Filter,
+	auth_pks: [][32]u8,
+	now: i64,
+	access: policy.Read_Access = {},
+) -> u64 {
 	if len(filters) == 0 {
 		return 0
 	}
@@ -647,7 +671,13 @@ count_authors :: proc(s: ^Store, filter: ^nostr.Filter, auth_pks: [][32]u8, now:
 }
 
 @(private)
-scan_count_at :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, now: i64, access: policy.Read_Access = {}) -> u64 {
+scan_count_at :: proc(
+	s: ^Store,
+	filters: []nostr.Filter,
+	auth_pks: [][32]u8,
+	now: i64,
+	access: policy.Read_Access = {},
+) -> u64 {
 	idx_g := mapped_file_slice(&s.index)
 	defer slice_release(idx_g)
 	data_g := mapped_file_slice(&s.data)
@@ -685,7 +715,11 @@ scan_count_at :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, no
 	for &f, fi in filters {
 		specs := build_tag_specs(&f)
 		if len(specs) > 0 {
-			per_filter_sets[fi] = multi_matching_offsets(tags_g.data, specs, context.temp_allocator)
+			per_filter_sets[fi] = multi_matching_offsets(
+				tags_g.data,
+				specs,
+				context.temp_allocator,
+			)
 		}
 	}
 	defer {
@@ -707,7 +741,7 @@ scan_count_at :: proc(s: ^Store, filters: []nostr.Filter, auth_pks: [][32]u8, no
 		if v, ok := s.tombstones.map_[entry.id]; ok && v.confirmed {
 			continue
 		}
-		if entry.pubkey in s.vanished {
+		if entry.pubkey in s.vanished && !entry.no_delete && entry.kind != nostr.KIND_VANISH {
 			continue
 		}
 		if entry.kind == nostr.KIND_GIFT_WRAP {
@@ -848,7 +882,7 @@ iter_negentropy :: proc(
 				continue
 			}
 			// NIP-62: skip events from vanished pubkeys.
-			if entry.pubkey in s.vanished {
+			if entry.pubkey in s.vanished && !entry.no_delete && entry.kind != nostr.KIND_VANISH {
 				continue
 			}
 			// NIP-17: kind-1059 only served to the p-tag recipient.

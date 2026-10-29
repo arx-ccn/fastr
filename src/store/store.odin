@@ -52,6 +52,9 @@ Store :: struct {
 	// NIP-62: set of vanished pubkeys (banned from future events).
 	vanished_mu:            sync.RW_Mutex,
 	vanished:               Key_Set,
+	// NIP-59/62 recipient-deleted event IDs, retained across request pruning.
+	recipients_mu:          sync.RW_Mutex,
+	recipients:             Key_Set,
 	// NIP-62: append-only file persisting vanished pubkeys.
 	vanish_file_mu:         sync.Mutex,
 	vanish_file:            ^os.File,
@@ -63,7 +66,7 @@ Store :: struct {
 	// #117: kinds/authors that have ever ingested an expiration-tagged event.
 	// Membership taints the COUNT fast path into scan_count_at.
 	kinds_with_expiry_mu:   sync.RW_Mutex,
-	kinds_with_expiry:      map[u16]struct {},
+	kinds_with_expiry:      map[u16]struct{},
 	authors_with_expiry_mu: sync.RW_Mutex,
 	authors_with_expiry:    Key_Set,
 	// Full dedup map: every event ID currently in the index -> its index
@@ -299,6 +302,8 @@ store_open :: proc(dir: string, allocator := context.allocator) -> (s: ^Store, e
 	}
 
 	// NIP-09: rebuild tombstone set from all stored kind-5 events.
+	s.recipients = make(Key_Set)
+	protection_err: Error
 	{
 		idx_g := mapped_file_slice(&s.index)
 		defer slice_release(idx_g)
@@ -308,10 +313,22 @@ store_open :: proc(dir: string, allocator := context.allocator) -> (s: ^Store, e
 		defer slice_release(tags_g)
 		dtags_g := mapped_file_slice(&s.dtags)
 		defer slice_release(dtags_g)
-		s.tombstones = load_tombstones(idx_g.data, data_g.data, tags_g.data, dtags_g.data, allocator)
+		protection_err = load_protection(s, idx_g.data, data_g.data)
+		s.tombstones = load_tombstones(
+			idx_g.data,
+			data_g.data,
+			tags_g.data,
+			dtags_g.data,
+			allocator,
+			&s.recipients,
+		)
 		// Issue #76: rebuild a-tag coordinate tombstones. Independent of
 		// `tombstones` because it survives compaction pruning the target.
 		s.addressable_tombstones = load_a_tag_coord_tombstones(idx_g.data, data_g.data, allocator)
+	}
+	if protection_err != .None {
+		store_close(s)
+		return nil, protection_err
 	}
 
 	// NIP-62: load vanished pubkeys from the persistent file.
@@ -327,12 +344,24 @@ store_open :: proc(dir: string, allocator := context.allocator) -> (s: ^Store, e
 		return nil, vferr
 	}
 	s.vanish_file = vf
+	recipient_err: Error
+	{
+		idx_g := mapped_file_slice(&s.index)
+		defer slice_release(idx_g)
+		tags_g := mapped_file_slice(&s.tags)
+		defer slice_release(tags_g)
+		recipient_err = load_recipients(s, idx_g.data, tags_g.data)
+	}
+	if recipient_err != .None {
+		store_close(s)
+		return nil, recipient_err
+	}
 
 	s.replaceable_live = make(map[Replaceable_Key]Live_Entry)
 	s.addressable_live = make(map[Addressable_Key]Live_Entry)
 	s.kind_counts = make(map[u16]u64)
 	s.author_counts = make(map[[32]u8]u64)
-	s.kinds_with_expiry = make(map[u16]struct {})
+	s.kinds_with_expiry = make(map[u16]struct{})
 	s.authors_with_expiry = make(Key_Set)
 	s.known_ids = make(map[[32]u8]u32)
 	s.scan_ceiling = make([dynamic]i64)
@@ -375,6 +404,7 @@ store_close :: proc(s: ^Store) {
 	delete(s.replaceable_live)
 	delete(s.addressable_live)
 	delete(s.vanished)
+	delete(s.recipients)
 	delete(s.kind_counts)
 	delete(s.author_counts)
 	delete(s.kinds_with_expiry)
@@ -389,6 +419,12 @@ store_close :: proc(s: ^Store) {
 // Only confirmed tombstones suppress events; preemptive tombstones are
 // pending verification.
 store_is_tombstoned :: proc(s: ^Store, id: [32]u8) -> bool {
+	{
+		sync.shared_guard(&s.recipients_mu)
+		if id in s.recipients {
+			return true
+		}
+	}
 	sync.shared_guard(&s.tombstones_mu)
 	v, ok := s.tombstones.map_[id]
 	return ok && v.confirmed

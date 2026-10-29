@@ -3,6 +3,7 @@
 package store
 
 import "core:os"
+import "core:strings"
 import "core:sync"
 
 import "../nostr"
@@ -56,7 +57,9 @@ tombstone_capture_prior :: proc(t: ^Tombstone_Tracker, id: [32]u8) -> Tombstone_
 // rollback record is no longer needed).
 @(private)
 dedup_rollback_commit :: proc(rb: ^Dedup_Rollback) {
-	if rb.tombstoned.active && rb.tombstoned.prior.present && !rb.tombstoned.prior.value.confirmed {
+	if rb.tombstoned.active &&
+	   rb.tombstoned.prior.present &&
+	   !rb.tombstoned.prior.value.confirmed {
 		delete(rb.tombstoned.prior.value.candidates)
 	}
 }
@@ -218,6 +221,13 @@ append_classified :: proc(
 	reason: string,
 ) {
 	context.allocator = s.allocator
+	marked, mark_reason := nostr.deletion_protection(ev)
+	if mark_reason != "" {
+		if strings.has_prefix(mark_reason, "invalid: ") {
+			return .Invalid_Event, mark_reason[len("invalid: "):]
+		}
+		return .Rejected, mark_reason
+	}
 
 	// NIP-40: reject events that are already expired. #118: `["expiration",
 	// "0"]` and negative values hit the expired branch; the has_expiry flag
@@ -237,6 +247,16 @@ append_classified :: proc(
 
 	sync.guard(&s.writer_mu)
 	w := &s.writer
+	// Recipient authority applies even when the signing key is protected.
+	{
+		sync.shared_guard(&s.recipients_mu)
+		if ev.id in s.recipients {
+			return .Duplicate, ""
+		}
+	}
+	if !marked && store_is_vanished(s, ev.pubkey) {
+		return .Rejected, "blocked: pubkey has vanished"
+	}
 
 	// Dedup: O(1) lookup against the full set of known event IDs.
 	{
@@ -252,14 +272,22 @@ append_classified :: proc(
 	// same pass). NIP-09 (#111): a kind-5 event cannot itself be
 	// tombstoned - clear the preemptive entry and let the append proceed.
 	{
+		sync.guard(&s.recipients_mu)
 		sync.guard(&s.tombstones_mu)
 		if v, ok := s.tombstones.map_[ev.id]; ok {
 			if v.confirmed {
-				return .Duplicate, ""
+				if !marked {
+					return .Duplicate, ""
+				}
+				tombstone_remove(&s.tombstones, ev.id)
 			}
 			// NIP-59: gift wraps are also matched by recipient (p-tag), since
 			// their signing key is one-time and never a deletion author.
-			if ev.pubkey in v.candidates || giftwrap_recipient_in_candidates(ev, v.candidates) {
+			recipient := giftwrap_recipient_in_candidates(ev, v.candidates)
+			if recipient {
+				s.recipients[ev.id] = {}
+			}
+			if (!marked && ev.pubkey in v.candidates) || recipient {
 				if ev.kind == nostr.KIND_DELETION {
 					tombstone_remove(&s.tombstones, ev.id)
 				} else {
@@ -339,6 +367,7 @@ append_classified :: proc(
 		kind       = ev.kind,
 		id         = ev.id,
 		pubkey     = ev.pubkey,
+		no_delete  = marked,
 	}
 	ie_bytes := index_entry_to_bytes(&ie)
 	tag_buf := make([dynamic]u8, context.temp_allocator)
@@ -351,7 +380,8 @@ append_classified :: proc(
 		dtag_slice = dtag_bytes[:]
 	}
 
-	if werr := append_writes(s, w, pack_buf[:], ie_bytes[:], tag_buf[:], dtag_slice); werr != .None {
+	if werr := append_writes(s, w, pack_buf[:], ie_bytes[:], tag_buf[:], dtag_slice);
+	   werr != .None {
 		// Roll back every file's tracked offset AND the underlying FD state
 		// so the next append targets exactly the pre-call position, then
 		// undo the dedup mutation. Rollback failures take precedence - the
@@ -384,11 +414,20 @@ append_classified :: proc(
 		dtags_g := mapped_file_slice(&s.dtags)
 		tombstoned := make([dynamic]Kind_Pubkey, context.temp_allocator)
 		{
+			sync.guard(&s.recipients_mu)
 			sync.guard(&s.tombstones_mu)
 			// Pre-publication index: targets of this deletion are already in
 			// the index from earlier appends; the kind-5 itself is not yet
 			// visible to readers.
-			newly := process_deletion_into(ev, idx_g.data, tags_g.data, dtags_g.data, &s.tombstones, context.temp_allocator)
+			newly := process_deletion_into(
+				ev,
+				idx_g.data,
+				tags_g.data,
+				dtags_g.data,
+				&s.tombstones,
+				context.temp_allocator,
+				&s.recipients,
+			)
 			// Resolve newly-confirmed ids to (kind, pubkey) in a single
 			// index pass under the same lock.
 			if len(newly) > 0 {
@@ -441,7 +480,8 @@ append_classified :: proc(
 		sync.guard(&s.tombstones_mu)
 		if v, ok := s.tombstones.map_[ev.id]; ok && !v.confirmed {
 			// NIP-59: gift wraps also match by recipient (p-tag).
-			if ev.pubkey in v.candidates || giftwrap_recipient_in_candidates(ev, v.candidates) {
+			if (!marked && ev.pubkey in v.candidates) ||
+			   giftwrap_recipient_in_candidates(ev, v.candidates) {
 				// Candidate pubkey matches: promote to confirmed tombstone.
 				tombstone_insert_confirmed(&s.tombstones, ev.id)
 				immediately_tombstoned = true
@@ -497,6 +537,7 @@ append_classified :: proc(
 // calling this.
 store_vanish :: proc(s: ^Store, ev: ^pack.Event) -> Error {
 	context.allocator = s.allocator
+	sync.guard(&s.writer_mu)
 
 	// 1. Add to in-memory set.
 	{
@@ -520,19 +561,25 @@ store_vanish :: proc(s: ^Store, ev: ^pack.Event) -> Error {
 	defer delete(giftwrap_offsets)
 	tombstoned := make([dynamic]Kind_Pubkey, context.temp_allocator)
 	{
+		sync.guard(&s.recipients_mu)
 		sync.guard(&s.tombstones_mu)
 		total := index_entry_count(idx_g.data)
 		for i in 0 ..< total {
 			e := index_entry_at(idx_g.data, i)
+			if e.kind == nostr.KIND_GIFT_WRAP && e.offset in giftwrap_offsets {
+				s.recipients[e.id] = {}
+			}
 			// Skip kind-62 events - they must remain queryable per NIP-62.
-			if e.pubkey == ev.pubkey && e.kind != nostr.KIND_VANISH {
-				tombstone_insert_confirmed(&s.tombstones, e.id)
-				append(&tombstoned, Kind_Pubkey{e.kind, e.pubkey})
+			if e.pubkey == ev.pubkey && e.kind != nostr.KIND_VANISH && !e.no_delete {
+				if tombstone_insert_confirmed(&s.tombstones, e.id) {
+					append(&tombstoned, Kind_Pubkey{e.kind, e.pubkey})
+				}
 				continue
 			}
 			if e.kind == nostr.KIND_GIFT_WRAP && e.offset in giftwrap_offsets {
-				tombstone_insert_confirmed(&s.tombstones, e.id)
-				append(&tombstoned, Kind_Pubkey{e.kind, e.pubkey})
+				if tombstone_insert_confirmed(&s.tombstones, e.id) {
+					append(&tombstoned, Kind_Pubkey{e.kind, e.pubkey})
+				}
 			}
 		}
 	}

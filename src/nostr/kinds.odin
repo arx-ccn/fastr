@@ -84,6 +84,60 @@ has_protected_tag :: proc(tags: []pack.Tag) -> bool {
 	return false
 }
 
+// Validate deletion-protection metadata only. Callers must verify the event
+// ID and signature before treating an event as marked. Reasons include the
+// complete NIP-01 prefix; unmarked events retain ordinary NIP-40 handling.
+deletion_protection :: proc(ev: ^pack.Event) -> (marked: bool, reason: string) {
+	for tag in ev.tags {
+		if len(tag.fields) == 0 || tag.fields[0] != "no_delete" {
+			continue
+		}
+		if marked || len(tag.fields) != 1 {
+			return false, "invalid: malformed no_delete tag"
+		}
+		marked = true
+	}
+	if !marked {
+		return false, ""
+	}
+
+	has_expiry := false
+	expiry: u64
+	for tag in ev.tags {
+		if len(tag.fields) == 0 || tag.fields[0] != "expiration" {
+			continue
+		}
+		if has_expiry || len(tag.fields) != 2 {
+			return false, "invalid: malformed protected expiration"
+		}
+		has_expiry = true
+		value := tag.fields[1]
+		if len(value) == 0 || (len(value) > 1 && value[0] == '0') {
+			return false, "invalid: malformed protected expiration"
+		}
+		for i in 0 ..< len(value) {
+			c := value[i]
+			if c < '0' || c > '9' {
+				return false, "invalid: malformed protected expiration"
+			}
+			digit := u64(c - '0')
+			if expiry > (max(u64) - digit) / 10 {
+				return false, "invalid: protected expiration exceeds u64"
+			}
+			expiry = expiry * 10 + digit
+		}
+	}
+	if ev.kind == 0 || ev.kind == 3 || (ev.kind >= 10000 && ev.kind <= 39999) {
+		return false, "restricted: no_delete is not allowed for this kind"
+	}
+	// The store's expiration index uses signed 64-bit seconds. Never let a
+	// valid unsigned timestamp wrap or fall through as absent expiration.
+	if has_expiry && expiry > u64(max(i64)) {
+		return false, "restricted: protected expiration exceeds supported range"
+	}
+	return true, ""
+}
+
 // Extract the NIP-40 expiration timestamp from an event's tags.
 // Returns (timestamp, true), or (0, false) if not present or unparseable.
 event_expiry :: proc(ev: ^pack.Event) -> (expiry: i64, has: bool) {

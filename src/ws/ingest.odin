@@ -31,7 +31,14 @@ vanish_targets_relay :: proc(ev: ^pack.Event, relay_url: string) -> bool {
 
 // Inputs are borrowed. Signature/auth checks precede policy; storage
 // invariants still apply after an allowed policy decision.
-ingest_event :: proc(relay: ^Relay, principal: policy.Principal, ev: ^pack.Event) -> (store.Error, string) {
+ingest_event :: proc(
+	relay: ^Relay,
+	principal: policy.Principal,
+	ev: ^pack.Event,
+) -> (
+	store.Error,
+	string,
+) {
 	principal := principal
 	cfg := &relay.cfg
 	if len(ev.tags) > cfg.max_event_tags {
@@ -48,7 +55,14 @@ ingest_event :: proc(relay: ^Relay, principal: policy.Principal, ev: ^pack.Event
 	if reason, valid := nostr.validate_event(ev); !valid {
 		return .Invalid_Event, reason
 	}
-	if store.store_is_vanished(relay.store, ev.pubkey) {
+	marked, protection_reason := nostr.deletion_protection(ev)
+	if protection_reason != "" {
+		if strings.has_prefix(protection_reason, "restricted:") {
+			return .Rejected, protection_reason
+		}
+		return .Invalid_Event, protection_reason
+	}
+	if !marked && store.store_is_vanished(relay.store, ev.pubkey) {
 		return .Rejected, "blocked: pubkey vanished"
 	}
 	if nostr.has_protected_tag(ev.tags) && !slice.contains(principal.auth_pks, ev.pubkey) {
@@ -71,6 +85,9 @@ ingest_event :: proc(relay: ^Relay, principal: policy.Principal, ev: ^pack.Event
 		case .Duplicate_Newer:
 			return err, "duplicate: have newer version"
 		case .Invalid_Event:
+			if strings.has_prefix(reason, "invalid:") {
+				return err, reason
+			}
 			return err, strings.concatenate({"invalid: ", reason}, context.temp_allocator)
 		case .Rejected:
 			return err, reason
@@ -88,7 +105,8 @@ ingest_event :: proc(relay: ^Relay, principal: policy.Principal, ev: ^pack.Event
 	}
 
 	// Imports have no subscribers. AUTH events are never broadcast.
-	if principal.source != .Import && ev.kind != nostr.KIND_AUTH &&
+	if principal.source != .Import &&
+	   ev.kind != nostr.KIND_AUTH &&
 	   !store.store_is_tombstoned(relay.store, ev.id) {
 		shared := shared_event_new(event_clone(ev, context.allocator))
 		fanout_broadcast(&relay.fanout, shared)
