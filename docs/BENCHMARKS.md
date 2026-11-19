@@ -206,3 +206,69 @@ driver. Each runner invocation chose its own dataset timestamp. Raw
 measurements, commands, and provenance are outside the checkout under
 `~/.cache/fastr-bench/multi-response/map-suite/` and
 `~/.cache/fastr-bench/multi-response/isolated-cpu/`.
+
+## Magnitude: reading gift wraps by recipient
+
+[Magnitude's published comparison](https://github.com/VectorPrivacy/magnitude-relay/blob/b710dc5f7882478d87ff26a466b5cf3b9decbb15/docs/BENCHMARKS.md)
+used strfry. Its client does not sign in as a gift-wrap recipient, so a
+successful EOSE from fastr could mean an empty inbox. This comparison uses
+the same signed fixture for both relays and checks every returned event,
+including its contents, signature, and position in the result. An empty or
+partial reply fails the run.
+
+Generate the fixture with `relay-bench` from Magnitude commit `b710dc5`:
+
+```sh
+relay-bench gen --events 100000 --seed 1 --out vector-100k.jsonl
+```
+
+The JSONL SHA-256 was `804088c2b154d7f88379ba0401752d439bd481258eee62f09d23c7ca382b2a3b`.
+Import the file into each relay's empty database using its `import` command.
+Use `[policy] kinds = "all"` and `[relay] compression = "off"` for Magnitude.
+Keep signature verification on. These are read measurements; import and write
+acknowledgments are not timed.
+
+Run one relay at a time on the same loopback address. With Bun and `nak` on
+`PATH`, run the client from this checkout:
+
+```sh
+bun --no-env-file tests/bench/mailbox.ts vector-100k.jsonl 1 ws://127.0.0.1:7804 fastr
+# After switching relays:
+bun --no-env-file tests/bench/mailbox.ts vector-100k.jsonl 1 ws://127.0.0.1:7804 magnitude
+```
+
+Each of eight persistent sockets reads a different mailbox (fixture recipients
+0–7, near the heavy end of the Zipf distribution). On fastr each signs its
+NIP-42 challenge before timing; Magnitude does not require AUTH. Each socket
+warms up once, then reads rotating individual IDs, rotating batches of 100 IDs,
+or the newest 500 wraps for its recipient. Rate includes client validation and
+CLOSE. Latency runs from REQ to decoded EOSE on a shared client event loop.
+One pass checks 32,000 single reads, 800 batches, and 800 inbox pages.
+
+The baseline was fastr `bdbc0bc`. Both fastr binaries were built with Odin
+`dev-2026-10:84bc3fc21 -o:speed`; Magnitude used a release build. On a
+Ryzen AI Max+ 395 the relay had CPUs `8,9,24,25` (two physical cores), and the
+client had `10,11,26,27`. The three passes rotated baseline, patched fastr,
+and Magnitude. The workstation was not otherwise isolated. These measurements
+do not cover cold reads, the 4.9-million-event production corpus, or NIP-77.
+
+Medians of three passes. Each inbox pass returned 386,000 events; a page
+contained fewer than 500 when its recipient had fewer wraps in the fixture.
+
+| Request | Relay | Requests/s (min–max) | p50 ms | p99 ms |
+|---|---|---:|---:|---:|
+| One wrap by ID | fastr before | 6,495 (6,453–6,666) | 1.187 | 3.109 |
+| | fastr after | 105,719 (104,889–106,817) | 0.058 | 0.156 |
+| | Magnitude | 97,940 (83,938–103,028) | 0.060 | 0.177 |
+| 100 wraps by ID | fastr before | 2,524 (2,464–2,620) | 2.183 | 5.402 |
+| | fastr after | 2,665 (2,641–2,679) | 2.441 | 5.754 |
+| | Magnitude | 2,511 (2,421–2,564) | 2.600 | 6.199 |
+| Inbox, limit 500 | fastr before | 461 (461–472) | 12.480 | 27.467 |
+| | fastr after | 471 (468–473) | 12.278 | 27.480 |
+| | Magnitude | 513 (498–514) | 13.357 | 28.668 |
+
+The single-ID change removed a full tag-file scan per authenticated REQ.
+The 100-ID batch gained throughput but its p50 rose versus the old fastr
+build. Magnitude served more inbox pages per second in every pass. Raw
+JSONL, binary hashes, and run commands are in
+`~/.cache/fastr-bench/magnitude-ieI3rD/` (passes 13–15).

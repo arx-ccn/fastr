@@ -24,8 +24,14 @@ A single-filter REQ already receives unique, ordered IDs from its store query.
 For multiple filters, the handler seeds a deduplication set from the first
 query's results before executing the second filter. This avoids a membership
 lookup for each first-filter result and sizes the set from actual hits.
-The union still sorts newest first. Recipient unions use the multi-value tag
-scanner; a single recipient key uses direct lookup.
+The union still sorts newest first.
+
+For a full-ID lookup, the store binary-searches the offset-ordered tag file
+only when the candidate needs a tag or recipient check. It no longer builds
+a set of every event addressed to the signed-in keys before reading one DM.
+Broad inbox reads still build a recipient offset set before scanning. For
+both paths, a `#p` filter must match independently of the recipient check.
+COUNT and negentropy keep their own scans.
 
 The in-process performance fixtures exercise fanout, exact-ID and broad store
 queries, REQ handling, subscription replacement, and recipient lookup. They

@@ -282,6 +282,43 @@ test_tag_cursor_order_compact :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_wrap_candidate_visibility :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	keys: [2][32]u8
+	keys[0][0], keys[1][0] = 1, 2
+	tag := test_tag("p", test_hex(keys[1][:]))
+	wrap :: nostr.KIND_GIFT_WRAP
+	visible := test_make_event(3, wrap, 10, test_tags(test_tag("p", "other"), tag, tag))
+	untagged := test_make_event(4, wrap, 20, nil)
+	wrong := test_make_event(
+		5,
+		wrap,
+		30,
+		test_tags(test_tag("p", "other"), test_tag("e", test_hex(keys[1][:]))),
+	)
+	note := test_make_event(6, 1, 40, test_tags(test_tag("p", "other"), tag))
+	ids := make([dynamic]nostr.Hex_Prefix, context.temp_allocator)
+	for ev in ([]^pack.Event{&visible, &untagged, &wrong, &note}) {
+		test_append_ok(t, s, ev)
+		append(&ids, nostr.Hex_Prefix{bytes = ev.id, length = 32})
+	}
+	f := test_tag_filter('p', "other")
+	f.kinds = test_kind_filter(wrap).kinds
+	for phase in 0 ..< 2 {
+		if phase == 1 {
+			f.ids = ids
+		}
+		c := collect_ctx_init()
+		testing.expect_value(t, query_authed(s, &f, keys[:], &c, collect_cb), Error.None)
+		testing.expect(t, slice.equal(c.ids[:], [][32]u8{visible.id}))
+		testing.expect_value(t, test_query_count(t, s, &f), 0)
+	}
+}
+
+@(test)
 test_tag_snapshot_ahead :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)

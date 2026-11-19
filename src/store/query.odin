@@ -81,6 +81,51 @@ event_tags_match_specs :: proc(tags: []u8, specs: []Tag_Spec) -> bool {
 	return true
 }
 
+@(private)
+Tag_Walk :: enum {
+	Sequential,
+	Sparse,
+}
+
+// Return this event's tag records and advance the descending cursor past them.
+@(private)
+candidate_tags :: proc(tags: []u8, cursor: ^int, offset: u64, walk: Tag_Walk) -> []u8 {
+	end := cursor^
+	if walk == .Sparse {
+		// Exact IDs may jump from the newest event to the oldest in one step.
+		lo := 0
+		for lo < end {
+			mid := lo + (end - lo) / 2
+			if endian.unchecked_get_u64le(tags[mid * TAG_ENTRY_SIZE:]) <= offset {
+				lo = mid + 1
+			} else {
+				end = mid
+			}
+		}
+	} else {
+		for end > 0 && endian.unchecked_get_u64le(tags[(end - 1) * TAG_ENTRY_SIZE:]) > offset {
+			end -= 1
+		}
+	}
+	start := end
+	for start > 0 && endian.unchecked_get_u64le(tags[(start - 1) * TAG_ENTRY_SIZE:]) == offset {
+		start -= 1
+	}
+	cursor^ = start
+	return tags[start * TAG_ENTRY_SIZE:end * TAG_ENTRY_SIZE]
+}
+
+@(private)
+has_recipient :: proc(tags: []u8, keys: [][32]u8) -> bool {
+	for pos := 0; pos < len(tags); pos += TAG_ENTRY_SIZE {
+		tag := tags[pos:pos + TAG_ENTRY_SIZE]
+		if tag[8] == 'p' && tag[41] == 32 && pk_in(keys, (cast(^[32]u8)&tag[9])^) {
+			return true
+		}
+	}
+	return false
+}
+
 // Union of tags.s p-tag offsets matching any auth pubkey (NIP-17 gate).
 @(private)
 p_tag_offsets_union :: proc(
@@ -236,24 +281,12 @@ query_authed :: proc(
 		return .None
 	}
 
-	// NIP-17: pre-compute the set of data_offsets where a p-tag matches any
-	// auth pubkey. Gift wraps are skipped entirely when not authed or when
-	// the filter cannot match kind 1059.
-	nip17_skip_all := len(auth_pks) == 0
-	nip17_set: Offset_Set
-	defer delete(nip17_set)
-	if !nip17_skip_all && filter_may_match_giftwrap(filter) {
-		nip17_set = p_tag_offsets_union(tags_g.data, auth_pks)
-	}
-
 	// Tag records follow increasing data offsets, including after compaction.
 	// Both scan branches visit descending slots (resolved ids are sorted below).
 	specs := build_tag_specs(filter)
 	tag_end := len(tags_g.data) / TAG_ENTRY_SIZE
 
 	now := unix_now()
-	// Snapshot tombstones once per query - held for the scan + emission.
-	sync.shared_guard(&s.tombstones_mu)
 
 	// NIP-01: results must be the top-N by (created_at desc, id asc), not
 	// the last-N appended (#57, #108). Bounded heap whose root is the worst
@@ -312,11 +345,18 @@ query_authed :: proc(
 		}
 	}
 	steps := total
+	recipient_offsets: Offset_Set
+	defer delete(recipient_offsets)
 	if use_slots {
 		slice.sort(cand[:])
 		steps = len(cand)
+	} else if len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
+		recipient_offsets = p_tag_offsets_union(tags_g.data, auth_pks)
 	}
+	walk: Tag_Walk = .Sparse if use_slots else .Sequential
 
+	// Hold the tombstone snapshot for the scan and emission.
+	sync.shared_guard(&s.tombstones_mu)
 	prev_slot := -1
 	for si := 0; si < steps; si += 1 {
 		i: int
@@ -400,34 +440,17 @@ query_authed :: proc(
 		offset := endian.unchecked_get_u64le(base[0:8])
 
 		// 6. NIP-17: kind-1059 events only served to the p-tag recipient.
-		if kind == nostr.KIND_GIFT_WRAP {
-			if nip17_skip_all || offset not_in nip17_set {
-				continue
-			}
+		wrap := kind == nostr.KIND_GIFT_WRAP
+		if wrap && (len(auth_pks) == 0 || (!use_slots && offset not_in recipient_offsets)) {
+			continue
 		}
 
-		// 7. Walk tags backwards with the index, comparing only this event's
-		// records. Skip newer offsets, including tags beyond the index snapshot.
-		if len(specs) > 0 {
-			for tag_end > 0 {
-				pos := (tag_end - 1) * TAG_ENTRY_SIZE
-				if endian.unchecked_get_u64le(tags_g.data[pos:pos + 8]) <= offset {
-					break
-				}
-				tag_end -= 1
-			}
-			end := tag_end
-			for tag_end > 0 {
-				pos := (tag_end - 1) * TAG_ENTRY_SIZE
-				if endian.unchecked_get_u64le(tags_g.data[pos:pos + 8]) != offset {
-					break
-				}
-				tag_end -= 1
-			}
-			if !event_tags_match_specs(
-				tags_g.data[tag_end * TAG_ENTRY_SIZE:end * TAG_ENTRY_SIZE],
-				specs,
-			) {
+		// 7. Check recipient visibility independently of the requested tags.
+		check_recipient := wrap && use_slots
+		if check_recipient || len(specs) > 0 {
+			tags := candidate_tags(tags_g.data, &tag_end, offset, walk)
+			if (check_recipient && !has_recipient(tags, auth_pks)) ||
+			   !event_tags_match_specs(tags, specs) {
 				continue
 			}
 		}
