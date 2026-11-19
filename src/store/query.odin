@@ -116,9 +116,10 @@ candidate_tags :: proc(tags: []u8, cursor: ^int, offset: u64, walk: Tag_Walk) ->
 }
 
 @(private)
-has_recipient :: proc(tags: []u8, keys: [][32]u8) -> bool {
-	for pos := 0; pos < len(tags); pos += TAG_ENTRY_SIZE {
+has_recipient :: proc(tags: []u8, offset: u64, keys: [][32]u8) -> bool {
+	for pos := len(tags) - TAG_ENTRY_SIZE; pos >= 0; pos -= TAG_ENTRY_SIZE {
 		tag := tags[pos:pos + TAG_ENTRY_SIZE]
+		if endian.unchecked_get_u64le(tag[:8]) != offset {break}
 		if tag[8] == 'p' && tag[41] == 32 && pk_in(keys, (cast(^[32]u8)&tag[9])^) {
 			return true
 		}
@@ -400,6 +401,25 @@ query_authed :: proc(
 	// Tag records follow increasing data offsets, including after compaction.
 	// Ordered reads reset the cursor from each candidate's stored tag_end.
 	specs := build_tag_specs(filter)
+	if use_mailbox {
+		// Every posting matches one authenticated p tag. The query's p
+		// predicate is redundant only if it accepts every source mailbox.
+		for spec, j in specs {
+			if spec.name != 'p' {continue}
+			covered := true
+			for pk in auth_pks {
+				if !slice.contains(spec.values, Tag_Value{bytes = pk, length = 32}) {
+					covered = false
+					break
+				}
+			}
+			if covered {
+				specs[j] = specs[len(specs) - 1]
+				specs = specs[:len(specs) - 1]
+			}
+			break
+		}
+	}
 	tag_end := len(tags_buf) / TAG_ENTRY_SIZE
 	walk: Tag_Walk = .Sparse if use_ids && !indexed_tags else .Sequential
 
@@ -533,8 +553,13 @@ query_authed :: proc(
 		//    ID slots still need that check, independently of requested tags.
 		check_recipient := wrap && use_ids
 		if check_recipient || len(specs) > 0 {
-			tags := candidate_tags(tags_buf, &tag_end, offset, walk)
-			if (check_recipient && !has_recipient(tags, auth_pks)) ||
+			// With a known end, the recipient check alone can stop at its
+			// first match without first walking back to find the start.
+			tags := tags_buf[:tag_end * TAG_ENTRY_SIZE]
+			if !indexed_tags || len(specs) > 0 {
+				tags = candidate_tags(tags_buf, &tag_end, offset, walk)
+			}
+			if (check_recipient && !has_recipient(tags, offset, auth_pks)) ||
 			   !event_tags_match_specs(tags, specs) {
 				continue
 			}

@@ -308,6 +308,14 @@ test_wrap_candidate_visibility :: proc(t: ^testing.T) {
 	}
 	f := test_tag_filter('p', "other")
 	f.kinds = test_kind_filter(wrap).kinds
+	by_id := nostr.Filter {
+		ids   = ids,
+		kinds = f.kinds,
+	}
+	exact := collect_ctx_init()
+	testing.expect_value(t, query_authed(s, &by_id, keys[:], &exact, collect_cb), Error.None)
+	// The untagged event follows a visible one: its tag end alone is not proof.
+	testing.expect(t, slice.equal(exact.ids[:], [][32]u8{visible.id}))
 	mailbox := s.mailbox
 	defer s.mailbox = mailbox
 	for phase in 0 ..< 5 {
@@ -346,8 +354,11 @@ test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
 	tag := test_tag("p", p)
 	other_tag := test_tag("p", test_hex(keys[1][:]))
 	wrap :: nostr.KIND_GIFT_WRAP
+	// This event is authorized, but the requested p tag excludes it.
+	other := test_make_event(9, wrap, 100, test_tags(other_tag))
+	test_append_ok(t, s, &other)
 	removed := test_make_event(2, wrap, 40, test_tags(tag, other_tag))
-	older := test_make_event(3, wrap, 20, test_tags(tag, other_tag, tag))
+	older := test_make_event(3, wrap, 20, test_tags(tag, other_tag, tag, test_tag("t", "topic")))
 	tied := test_make_event(4, wrap, 20, test_tags(tag))
 	protected := test_make_event(5, wrap, 50, test_tags(tag, test_tag("-")))
 	backdated := test_make_event(8, wrap, 10, test_tags(tag, other_tag))
@@ -358,6 +369,16 @@ test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
 	deletion := test_kind5_event(2, removed.id)
 	test_append_ok(t, s, &deletion)
 	testing.expect(t, store_is_tombstoned(s, removed.id))
+	compound := test_tag_filter('p', p)
+	compound.tags['t'] = test_tag_filter('t', "topic").tags['t']
+	compound.kinds = test_kind_filter(wrap).kinds
+	selected := collect_ctx_init()
+	testing.expect_value(
+		t,
+		query_authed(s, &compound, keys[:1], &selected, collect_cb),
+		Error.None,
+	)
+	testing.expect(t, slice.equal(selected.ids[:], [][32]u8{older.id}))
 	expected := [3][32]u8{{}, older.id, tied.id}
 	slice.sort_by(expected[1:], test_id_less)
 	f := test_tag_filter('p', p)
