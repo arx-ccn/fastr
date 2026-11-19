@@ -265,26 +265,102 @@ query_authed :: proc(
 	emit: Emit_Proc,
 	access: policy.Read_Access = {},
 ) -> Error {
-	idx_g := mapped_file_slice(&s.index)
-	defer slice_release(idx_g)
-	data_g := mapped_file_slice(&s.data)
-	defer slice_release(data_g)
-	tags_g := mapped_file_slice(&s.tags)
-	defer slice_release(tags_g)
-	idx := idx_g.data
-	data := data_g.data
-
-	total := index_entry_count(idx)
 	limit := filter.limit.? or_else 500
 	// limit == 0 is a no-op: the client asked for zero events.
 	if limit == 0 {
 		return .None
 	}
 
+	fkinds, has_kinds := filter.kinds.?
+	fids, has_ids := filter.ids.?
+	inbox := has_kinds && len(fkinds) == 1 && fkinds[0] == nostr.KIND_GIFT_WRAP
+	if inbox && len(auth_pks) == 0 {
+		return .None
+	}
+	use_ids := has_ids && len(fids) > 0
+	for fid in fids {
+		if fid.length != 32 {
+			use_ids = false
+			break
+		}
+	}
+
+	// Pin the three mappings and copy slots under the publication lock. No
+	// pointers into either lookup map escape the lock.
+	idx_g, data_g, tags_g: Slice_Guard
+	cand: [dynamic]Mailbox_Slot
+	use_mailbox: bool
+	{
+		sync.shared_guard(&s.known_ids_mu)
+		idx_g = mapped_file_slice(&s.index)
+		data_g = mapped_file_slice(&s.data)
+		tags_g = mapped_file_slice(&s.tags)
+		idx := idx_g.data
+		total := index_entry_count(idx)
+		if use_ids {
+			cand = make([dynamic]Mailbox_Slot, 0, len(fids), context.temp_allocator)
+			for fid in fids {
+				slot, ok := s.known_ids[fid.bytes]
+				if !ok {
+					continue
+				}
+				i := int(slot)
+				// Compaction may have swapped the mappings but not rebuilt known_ids.
+				if i >= total || (cast(^[32]u8)&idx[i * INDEX_ENTRY_SIZE + 28])^ != fid.bytes {
+					use_ids = false
+					break
+				}
+				append(&cand, Mailbox_Slot{slot = slot})
+			}
+		}
+		if !use_ids &&
+		   inbox &&
+		   total <= s.mailbox.entries &&
+		   len(tags_g.data) == s.mailbox.tag_bytes {
+			use_mailbox = true
+			clear(&cand)
+			for &pk in auth_pks {
+				slots := s.mailbox.by_recipient[pk]
+				n := len(slots)
+				for n > 0 && int(slots[n - 1].slot) >= total {
+					n -= 1
+				}
+				if n > 0 {
+					if cap(cand) == 0 {
+						cand = make([dynamic]Mailbox_Slot, 0, n, context.temp_allocator)
+					}
+					append(&cand, ..slots[:n])
+				}
+			}
+		}
+	}
+	defer slice_release(idx_g)
+	defer slice_release(data_g)
+	defer slice_release(tags_g)
+	idx := idx_g.data
+	data := data_g.data
+	total := index_entry_count(idx)
+	steps := total
+	use_slots := use_ids || use_mailbox
+	recipient_offsets: Offset_Set
+	defer delete(recipient_offsets)
+	if use_slots {
+		steps = len(cand)
+		if steps == 0 {
+			return .None
+		}
+		if steps > 1 && (use_ids || len(auth_pks) > 1) {
+			slice.sort_by(cand[:], proc(a, b: Mailbox_Slot) -> bool {return a.slot < b.slot})
+		}
+	} else if len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
+		recipient_offsets = p_tag_offsets_union(tags_g.data, auth_pks)
+	}
+
 	// Tag records follow increasing data offsets, including after compaction.
-	// Both scan branches visit descending slots (resolved ids are sorted below).
+	// All candidate paths visit descending slots.
 	specs := build_tag_specs(filter)
 	tag_end := len(tags_g.data) / TAG_ENTRY_SIZE
+	walk: Tag_Walk = .Sparse if use_ids else .Sequential
 
 	now := unix_now()
 
@@ -296,64 +372,16 @@ query_authed :: proc(
 		&heap,
 		heap_item_worse,
 		pq.default_swap_proc(Heap_Item),
-		limit + 1,
+		min(steps, limit),
 		context.temp_allocator,
 	)
 	defer pq.destroy(&heap)
 
 	// Pre-extract filter fields to avoid repeated Maybe-unwrapping in the hot loop.
-	fkinds, has_kinds := filter.kinds.?
 	fauthors, has_authors := filter.authors.?
-	fids, has_ids := filter.ids.?
 	fsince, has_since := filter.since.?
 	funtil, has_until := filter.until.?
 	fsearch, has_search := filter.search.?
-
-	// Resolved-ids fast path: when every requested id is full-length, the
-	// known_ids map pins each present id to its index slot and the scan
-	// visits |ids| slots instead of all of them. Every candidate is verified
-	// against the entry id up front: the map can be stale in the window
-	// between a compaction/append publishing the index and the map update,
-	// and any mismatch or out-of-range slot abandons the fast path before
-	// the scan starts, so the fallback needs no partial-state cleanup. Ids
-	// absent from the map are conclusively absent from the index.
-	cand: [dynamic]int
-	use_slots := false
-	if has_ids && len(fids) > 0 {
-		use_slots = true
-		for fid in fids {
-			if fid.length != 32 {
-				use_slots = false
-				break
-			}
-		}
-	}
-	if use_slots {
-		cand = make([dynamic]int, 0, len(fids), context.temp_allocator)
-		sync.shared_guard(&s.known_ids_mu)
-		for fid in fids {
-			slot, ok := s.known_ids[fid.bytes]
-			if !ok {
-				continue
-			}
-			i := int(slot)
-			if i >= total || (cast(^[32]u8)&idx[i * INDEX_ENTRY_SIZE + 28])^ != fid.bytes {
-				use_slots = false
-				break
-			}
-			append(&cand, i)
-		}
-	}
-	steps := total
-	recipient_offsets: Offset_Set
-	defer delete(recipient_offsets)
-	if use_slots {
-		slice.sort(cand[:])
-		steps = len(cand)
-	} else if len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
-		recipient_offsets = p_tag_offsets_union(tags_g.data, auth_pks)
-	}
-	walk: Tag_Walk = .Sparse if use_slots else .Sequential
 
 	// Hold the tombstone snapshot for the scan and emission.
 	sync.shared_guard(&s.tombstones_mu)
@@ -361,13 +389,15 @@ query_authed :: proc(
 	for si := 0; si < steps; si += 1 {
 		i: int
 		if use_slots {
-			// Descending slot order, duplicates skipped (the same id may
-			// appear more than once in the filter).
-			i = cand[len(cand) - 1 - si]
+			candidate := cand[steps - 1 - si]
+			i = int(candidate.slot)
 			if i == prev_slot {
 				continue
 			}
 			prev_slot = i
+			if use_mailbox {
+				tag_end = int(candidate.tag_end)
+			}
 		} else {
 			i = total - 1 - si
 		}
@@ -445,8 +475,9 @@ query_authed :: proc(
 			continue
 		}
 
-		// 7. Check recipient visibility independently of the requested tags.
-		check_recipient := wrap && use_slots
+		// 7. Mailbox slots and the fallback offsets were selected by auth key.
+		//    ID slots still need that check, independently of requested tags.
+		check_recipient := wrap && use_ids
 		if check_recipient || len(specs) > 0 {
 			tags := candidate_tags(tags_g.data, &tag_end, offset, walk)
 			if (check_recipient && !has_recipient(tags, auth_pks)) ||
@@ -464,7 +495,7 @@ query_authed :: proc(
 		// 9. IDs filter — before the tombstone lookup: a failed prefix
 		//    compare usually rejects on the first byte, far cheaper than
 		//    hashing a 32-byte map key. Resolved slots were already verified.
-		if has_ids && !use_slots {
+		if has_ids && !use_ids {
 			found := false
 			for fid in fids {
 				if nostr.hex_prefix_matches(fid, id) {
@@ -538,10 +569,19 @@ query_authed :: proc(
 			}
 		}
 
-		pq.push(&heap, Heap_Item{created_at, id^, i, offset})
-		if pq.len(heap) > limit {
-			pq.pop(&heap)
-		} else if pq.len(heap) == limit && i > 0 {
+		item := Heap_Item{created_at, id^, i, offset}
+		if steps <= limit {
+			// All candidates fit: no heap maintenance or early-exit test.
+			append(&heap.queue, item)
+			continue
+		}
+		if pq.len(heap) == limit {
+			heap.queue[0] = item
+			pq.fix(&heap, 0)
+			continue
+		}
+		pq.push(&heap, item)
+		if pq.len(heap) == limit && i > 0 {
 			// Check immediately on first fill instead of scanning to the
 			// next 1024-slot boundary. Ties still require further scanning.
 			stop: bool
@@ -556,14 +596,11 @@ query_authed :: proc(
 		}
 	}
 
-	// Drain the heap worst-first into a buffer, then emit in reverse:
-	// (created_at desc, id asc) - the NIP-01 emission order.
-	n := pq.len(heap)
-	out := make([]Heap_Item, n, context.temp_allocator)
-	for j := n - 1; j >= 0; j -= 1 {
-		out[j] = pq.pop(&heap)
+	// Selection is finished. Reuse its storage for NIP-01 emission order.
+	if pq.len(heap) > 1 {
+		slice.sort_by(heap.queue[:], proc(a, b: Heap_Item) -> bool {return heap_item_worse(b, a)})
 	}
-	for &item in out {
+	for &item in heap.queue {
 		start, end, bok := blob_bounds(idx, item.slot, total, len(data), item.offset)
 		if !bok {
 			return .Io

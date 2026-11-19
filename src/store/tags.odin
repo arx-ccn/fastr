@@ -34,6 +34,46 @@ Tag_Entry :: struct {
 
 TAG_ENTRY_SIZE :: 49
 
+@(private)
+Mailbox_Slot :: struct {
+	slot:    u32,
+	tag_end: u32, // One past this event's last record in tags.s.
+}
+
+@(private)
+Mailbox_Index :: struct {
+	by_recipient: map[[32]u8][dynamic]Mailbox_Slot,
+	entries:      int, // -1 until rebuilt after a compaction swap, or out of u32 range.
+	tag_bytes:    int,
+}
+
+@(private)
+mailbox_destroy :: proc(m: ^Mailbox_Index) {
+	for _, slots in m.by_recipient {
+		delete(slots)
+	}
+	delete(m.by_recipient)
+}
+
+@(private)
+mailbox_add :: proc(m: ^Mailbox_Index, slot, tag_end: u32, tags: []u8) {
+	for pos := 0; pos < len(tags); pos += TAG_ENTRY_SIZE {
+		tag := tags[pos:pos + TAG_ENTRY_SIZE]
+		if tag[8] != 'p' || tag[41] != 32 {
+			continue
+		}
+		pk := (cast(^[32]u8)&tag[9])^
+		slots, ok := &m.by_recipient[pk]
+		if !ok {
+			m.by_recipient[pk] = make([dynamic]Mailbox_Slot, 0, 1)
+			slots, _ = &m.by_recipient[pk]
+		}
+		if n := len(slots^); n == 0 || slots^[n - 1].slot != slot {
+			append(slots, Mailbox_Slot{slot, tag_end})
+		}
+	}
+}
+
 tag_entry_to_bytes :: proc "contextless" (e: ^Tag_Entry) -> (b: [TAG_ENTRY_SIZE]u8) {
 	endian.unchecked_put_u64le(b[0:8], e.data_offset)
 	b[8] = e.tag_name
@@ -53,11 +93,16 @@ tag_entry_from_bytes :: proc "contextless" (b: []u8) -> (e: Tag_Entry) {
 }
 
 // Offset set used by the query path.
-Offset_Set :: map[u64]struct {}
+Offset_Set :: map[u64]struct{}
 
 // Scan the mmap'd tags.s and collect all data_offset values where tag_name
 // and tag_value[0..value_len] match the query.
-matching_offsets :: proc(tags_mmap: []u8, tag_name: u8, value: []u8, allocator := context.allocator) -> Offset_Set {
+matching_offsets :: proc(
+	tags_mmap: []u8,
+	tag_name: u8,
+	value: []u8,
+	allocator := context.allocator,
+) -> Offset_Set {
 	set := make(Offset_Set, allocator)
 	n := len(tags_mmap) / TAG_ENTRY_SIZE
 	for i in 0 ..< n {
@@ -74,7 +119,11 @@ matching_offsets :: proc(tags_mmap: []u8, tag_name: u8, value: []u8, allocator :
 // Single-pass scan: for each spec, collect all data_offsets matching any
 // value in that spec. Returns one set per spec in the same order. Use this
 // instead of calling matching_offsets K times for K tag dimensions.
-multi_matching_offsets :: proc(tags_mmap: []u8, specs: []Tag_Spec, allocator := context.allocator) -> []Offset_Set {
+multi_matching_offsets :: proc(
+	tags_mmap: []u8,
+	specs: []Tag_Spec,
+	allocator := context.allocator,
+) -> []Offset_Set {
 	results := make([]Offset_Set, len(specs), allocator)
 	for &r in results {
 		r = make(Offset_Set, allocator)

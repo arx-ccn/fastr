@@ -3,6 +3,7 @@
 // at startup (and again after each compaction phase 4 rebuild).
 package store
 
+import "core:encoding/endian"
 import "core:sync"
 
 import "../nostr"
@@ -16,6 +17,8 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 
 	idx_g := mapped_file_slice(&s.index)
 	defer slice_release(idx_g)
+	tags_g := mapped_file_slice(&s.tags)
+	defer slice_release(tags_g)
 	dtags_g := mapped_file_slice(&s.dtags)
 	defer slice_release(dtags_g)
 	idx := idx_g.data
@@ -32,12 +35,37 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 		clear(&s.known_ids)
 		clear(&s.scan_ceiling)
 		reserve(&s.scan_ceiling, total)
+		mailbox_destroy(&s.mailbox)
+		tags := tags_g.data
+		s.mailbox = {
+			entries = -1,
+		}
+		if u64(total) <= u64(max(u32)) &&
+		   len(tags) % TAG_ENTRY_SIZE == 0 &&
+		   u64(len(tags) / TAG_ENTRY_SIZE) <= u64(max(u32)) {
+			s.mailbox = {
+				by_recipient = make(map[[32]u8][dynamic]Mailbox_Slot),
+				entries      = total,
+				tag_bytes    = len(tags),
+			}
+		}
+		tag_pos := 0
 		ceil := min(i64)
 		for i in 0 ..< total {
 			e := index_entry_at(idx, i)
 			s.known_ids[e.id] = u32(i)
 			ceil = max(ceil, e.created_at)
 			append(&s.scan_ceiling, ceil)
+			if e.kind == nostr.KIND_GIFT_WRAP && s.mailbox.entries >= 0 {
+				for tag_pos < len(tags) && endian.unchecked_get_u64le(tags[tag_pos:]) < e.offset {
+					tag_pos += TAG_ENTRY_SIZE
+				}
+				start := tag_pos
+				for tag_pos < len(tags) && endian.unchecked_get_u64le(tags[tag_pos:]) == e.offset {
+					tag_pos += TAG_ENTRY_SIZE
+				}
+				mailbox_add(&s.mailbox, u32(i), u32(tag_pos / TAG_ENTRY_SIZE), tags[start:tag_pos])
+			}
 		}
 	}
 

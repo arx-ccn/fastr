@@ -289,9 +289,10 @@ test_wrap_candidate_visibility :: proc(t: ^testing.T) {
 	defer store_close(s)
 	keys: [2][32]u8
 	keys[0][0], keys[1][0] = 1, 2
+	tag0 := test_tag("p", test_hex(keys[0][:]))
 	tag := test_tag("p", test_hex(keys[1][:]))
 	wrap :: nostr.KIND_GIFT_WRAP
-	visible := test_make_event(3, wrap, 10, test_tags(test_tag("p", "other"), tag, tag))
+	visible := test_make_event(3, wrap, 10, test_tags(test_tag("p", "other"), tag, tag0, tag))
 	untagged := test_make_event(4, wrap, 20, nil)
 	wrong := test_make_event(
 		5,
@@ -307,14 +308,93 @@ test_wrap_candidate_visibility :: proc(t: ^testing.T) {
 	}
 	f := test_tag_filter('p', "other")
 	f.kinds = test_kind_filter(wrap).kinds
-	for phase in 0 ..< 2 {
-		if phase == 1 {
+	mailbox := s.mailbox
+	defer s.mailbox = mailbox
+	for phase in 0 ..< 5 {
+		switch phase {
+		case 1:
 			f.ids = ids
+		case 2:
+			prefixes := make([dynamic]nostr.Hex_Prefix, context.temp_allocator)
+			append(&prefixes, nostr.Hex_Prefix{bytes = wrong.id, length = 4})
+			f.ids = prefixes
+			c := collect_ctx_init()
+			testing.expect_value(t, query_authed(s, &f, keys[:], &c, collect_cb), Error.None)
+			testing.expect_value(t, len(c.ids), 0)
+			f.ids = nil
+		case 3:
+			s.mailbox.tag_bytes -= TAG_ENTRY_SIZE
+		case 4:
+			s.mailbox = {}
+		case:
 		}
 		c := collect_ctx_init()
 		testing.expect_value(t, query_authed(s, &f, keys[:], &c, collect_cb), Error.None)
 		testing.expect(t, slice.equal(c.ids[:], [][32]u8{visible.id}))
 		testing.expect_value(t, test_query_count(t, s, &f), 0)
+	}
+}
+
+@(test)
+test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	keys := [1][32]u8{test_pubkey(1)}
+	p := test_hex(keys[0][:])
+	tag := test_tag("p", p)
+	wrap :: nostr.KIND_GIFT_WRAP
+	other_recipient := test_pubkey(7)
+	removed := test_make_event(
+		2,
+		wrap,
+		40,
+		test_tags(tag, test_tag("p", test_hex(other_recipient[:]))),
+	)
+	older := test_make_event(3, wrap, 20, test_tags(tag, tag))
+	tied := test_make_event(4, wrap, 20, test_tags(tag))
+	protected := test_make_event(5, wrap, 50, test_tags(tag, test_tag("-")))
+	for ev in ([]^pack.Event{&removed, &older, &tied, &protected}) {
+		test_append_ok(t, s, ev)
+	}
+	deletion := test_kind5_event(7, removed.id)
+	test_append_ok(t, s, &deletion)
+	testing.expect(t, store_is_tombstoned(s, removed.id))
+	expected := [3][32]u8{{}, older.id, tied.id}
+	slice.sort_by(expected[1:], test_id_less)
+	f := test_tag_filter('p', p)
+	f.kinds = test_kind_filter(wrap).kinds
+	f.limit = 2
+	for phase in 0 ..< 4 {
+		want := expected[1:]
+		switch phase {
+		case 1:
+			store_close(s)
+			s = test_open(t, dir)
+		case 2:
+			_, err := store_compact(s)
+			testing.expect_value(t, err, Error.None)
+		case 3:
+			newer := test_make_event(6, wrap, 60, test_tags(tag))
+			test_arm_fail(s, 3)
+			err, _ := store_append(s, &newer)
+			testing.expect_value(t, err, Error.Io)
+			test_append_ok(t, s, &newer)
+			expected[0] = newer.id
+			want = expected[:2]
+		case:
+		}
+		c := collect_ctx_init()
+		testing.expect_value(t, query_authed(s, &f, keys[:], &c, collect_cb), Error.None)
+		testing.expectf(
+			t,
+			slice.equal(c.ids[:], want),
+			"phase %d: got %v, want %v",
+			phase,
+			c.ids,
+			want,
+		)
 	}
 }
 

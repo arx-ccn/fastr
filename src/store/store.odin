@@ -77,6 +77,8 @@ Store :: struct {
 	// fall back to a full scan on mismatch or out-of-range.
 	known_ids_mu:           sync.RW_Mutex,
 	known_ids:              map[[32]u8]u32,
+	// known_ids_mu also protects mailbox postings and REQ snapshot publication.
+	mailbox:                Mailbox_Index,
 	// Query early-exit: scan_ceiling[i] is the maximum created_at over index
 	// entries [0..=i] (monotone in i). Scanning newest-slot-first, once the
 	// result heap is full and scan_ceiling[i] is strictly below the worst
@@ -410,6 +412,7 @@ store_close :: proc(s: ^Store) {
 	delete(s.kinds_with_expiry)
 	delete(s.authors_with_expiry)
 	delete(s.known_ids)
+	mailbox_destroy(&s.mailbox)
 	delete(s.scan_ceiling)
 	delete(s.dir)
 	free(s)

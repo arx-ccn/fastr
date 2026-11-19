@@ -492,13 +492,6 @@ append_classified :: proc(
 		}
 	}
 
-	// Register this event ID (and its index slot, for the resolved-ids query
-	// fast path) for future dedup checks.
-	{
-		sync.guard(&s.known_ids_mu)
-		s.known_ids[ev.id] = u32(before_index / INDEX_ENTRY_SIZE)
-	}
-
 	// Extend the query early-exit ceiling BEFORE publishing the index length
 	// so any reader that sees the new entry also sees its ceiling slot. All
 	// fallible writes are behind us: a rollback can no longer desync the
@@ -512,10 +505,27 @@ append_classified :: proc(
 		append(&s.scan_ceiling, ceil)
 	}
 
-	mapped_file_publish_len(&s.data, w.data.offset)
-	mapped_file_publish_len(&s.index, w.index.offset)
-	mapped_file_publish_len(&s.tags, w.tags.offset)
-	mapped_file_publish_len(&s.dtags, w.dtags.offset)
+	{
+		sync.guard(&s.known_ids_mu)
+		slot := before_index / INDEX_ENTRY_SIZE
+		s.known_ids[ev.id] = u32(slot)
+		if s.mailbox.entries == int(slot) &&
+		   s.mailbox.tag_bytes == int(before_tags) &&
+		   slot < u64(max(u32)) &&
+		   w.tags.offset / TAG_ENTRY_SIZE <= u64(max(u32)) {
+			if ev.kind == nostr.KIND_GIFT_WRAP {
+				mailbox_add(&s.mailbox, u32(slot), u32(w.tags.offset / TAG_ENTRY_SIZE), tag_buf[:])
+			}
+			s.mailbox.entries += 1
+			s.mailbox.tag_bytes = int(w.tags.offset)
+		} else {
+			s.mailbox.entries = -1
+		}
+		mapped_file_publish_len(&s.data, w.data.offset)
+		mapped_file_publish_len(&s.tags, w.tags.offset)
+		mapped_file_publish_len(&s.dtags, w.dtags.offset)
+		mapped_file_publish_len(&s.index, w.index.offset)
+	}
 
 	// NIP-45: update counters, compensating for replaceable/addressable
 	// replacement and immediately tombstoned appends.
