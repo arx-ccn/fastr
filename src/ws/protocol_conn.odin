@@ -8,7 +8,7 @@
 //     into it and stay valid as long as it does.
 //   - Conn: owns a fixed 16 KiB receive buffer and the Reader's message
 //     buffer (allocated from the allocator passed to conn_init; bounded
-//     by max_message_bytes). Incoming.data points into Reader storage and
+//     by max_message_bytes). Incoming.data points into Conn storage and
 //     is valid until the next conn_next call.
 //   - Writers: payloads <= WRITE_STACK_LIMIT are framed into a stack
 //     buffer and sent with one syscall, zero heap allocation; larger
@@ -105,20 +105,23 @@ conn_destroy :: proc(c: ^Conn) {
 conn_next :: proc(c: ^Conn) -> (msg: Incoming, err: Error) {
 	for {
 		if c.rstart < c.rend {
-			event, n, ferr := reader_feed(&c.reader, c.rbuf[c.rstart:c.rend])
+			data: []u8
+			event, n, ferr := reader_feed(&c.reader, c.rbuf[c.rstart:c.rend], &data)
 			c.rstart += n
 			if ferr != .None {
 				return {}, ferr
 			}
 			switch event {
 			case .Message:
-				return {.Message, c.reader.msg_type, reader_message(&c.reader), 0}, .None
+				return {.Message, c.reader.msg_type, data, 0}, .None
 			case .Ping:
 				return {.Ping, .Binary, reader_control(&c.reader), 0}, .None
 			case .Close:
 				return {.Close, .Binary, reader_control(&c.reader), c.reader.close_code}, .None
-			case .Pong, .None:
-				// Fall through to recv for more bytes.
+			case .Pong:
+				continue
+			case .None:
+			// Fall through to recv for more bytes.
 			}
 		}
 		if c.rstart == c.rend {

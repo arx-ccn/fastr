@@ -256,8 +256,7 @@ Event :: enum {
 
 // Reader assembles complete messages from possibly-fragmented frames.
 // It owns one growable message buffer (bounded by max_message_bytes);
-// frame payloads are unmasked as they are copied in, so the input buffer
-// is never modified and can be any size.
+// fragmented payloads are unmasked as they are copied in.
 Reader :: struct {
 	max_message_bytes: int,
 	// Server mode requires masked client frames; client mode requires
@@ -311,8 +310,18 @@ reader_control :: proc(r: ^Reader) -> []u8 {
 // buf[consumed:] for the next call. event == .None with err == .None means
 // more input is needed. Any err other than .None is fatal: the caller
 // should send a close frame with close_code_for_error(err) and drop the
-// connection. Returned payload views are valid until the next call.
-reader_feed :: proc(r: ^Reader, buf: []u8) -> (event: Event, consumed: int, err: Error) {
+// connection. With view supplied, complete data frames may be unmasked in
+// buf; use view rather than reader_message until the next call. Without
+// view, buf stays untouched.
+reader_feed :: proc(
+	r: ^Reader,
+	buf: []u8,
+	view: ^[]u8 = nil,
+) -> (
+	event: Event,
+	consumed: int,
+	err: Error,
+) {
 	pos := 0
 	for {
 		if !r.have_header {
@@ -327,6 +336,17 @@ reader_feed :: proc(r: ^Reader, buf: []u8) -> (event: Event, consumed: int, err:
 				return .None, pos, verr
 			}
 			pos += hdr.header_len
+			if view != nil &&
+			   hdr.fin &&
+			   (hdr.opcode == .Text || hdr.opcode == .Binary) &&
+			   hdr.payload_len <= u64(len(buf) - pos) {
+				end := pos + int(hdr.payload_len)
+				payload := buf[pos:end]
+				if hdr.masked {apply_mask(payload, hdr.mask)}
+				r.msg_type = .Text if hdr.opcode == .Text else .Binary
+				view^ = payload
+				return .Message, end, .None
+			}
 			r.hdr = hdr
 			r.payload_read = 0
 			r.have_header = true
@@ -386,6 +406,7 @@ reader_feed :: proc(r: ^Reader, buf: []u8) -> (event: Event, consumed: int, err:
 		case:
 			if r.hdr.fin {
 				r.in_message = false
+				if view != nil {view^ = r.message[:]}
 				return .Message, pos, .None
 			}
 		// Non-final fragment: keep assembling.
