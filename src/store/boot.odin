@@ -4,6 +4,7 @@
 package store
 
 import "core:encoding/endian"
+import "core:slice"
 import "core:sync"
 
 import "../nostr"
@@ -44,7 +45,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 		   len(tags) % TAG_ENTRY_SIZE == 0 &&
 		   u64(len(tags) / TAG_ENTRY_SIZE) <= u64(max(u32)) {
 			s.mailbox = {
-				by_recipient = make(map[[32]u8][dynamic]Event_Slot),
+				by_recipient = make(map[[32]u8]Mailbox),
 				entries      = total,
 				tag_bytes    = len(tags),
 			}
@@ -76,6 +77,9 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 				slot    = u32(i),
 				tag_end = u32(tag_pos / TAG_ENTRY_SIZE),
 			}
+		}
+		for _, box in s.mailbox.by_recipient {
+			slice.sort_by_with_data(box.runs[0].slots[:], slot_newer, raw_data(idx))
 		}
 	}
 

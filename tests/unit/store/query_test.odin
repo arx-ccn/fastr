@@ -341,24 +341,21 @@ test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
 	defer test_rm_dir(dir)
 	s := test_open(t, dir)
 	defer store_close(s)
-	keys := [1][32]u8{test_pubkey(1)}
+	keys := [2][32]u8{test_pubkey(1), test_pubkey(7)}
 	p := test_hex(keys[0][:])
 	tag := test_tag("p", p)
+	other_tag := test_tag("p", test_hex(keys[1][:]))
 	wrap :: nostr.KIND_GIFT_WRAP
-	other_recipient := test_pubkey(7)
-	removed := test_make_event(
-		2,
-		wrap,
-		40,
-		test_tags(tag, test_tag("p", test_hex(other_recipient[:]))),
-	)
-	older := test_make_event(3, wrap, 20, test_tags(tag, tag))
+	removed := test_make_event(2, wrap, 40, test_tags(tag, other_tag))
+	older := test_make_event(3, wrap, 20, test_tags(tag, other_tag, tag))
 	tied := test_make_event(4, wrap, 20, test_tags(tag))
 	protected := test_make_event(5, wrap, 50, test_tags(tag, test_tag("-")))
-	for ev in ([]^pack.Event{&removed, &older, &tied, &protected}) {
+	backdated := test_make_event(8, wrap, 10, test_tags(tag, other_tag))
+	for ev in ([]^pack.Event{&removed, &older, &tied, &protected, &backdated}) {
 		test_append_ok(t, s, ev)
 	}
-	deletion := test_kind5_event(7, removed.id)
+	// Delete as the author; a recipient deletion would sweep the shared mailbox.
+	deletion := test_kind5_event(2, removed.id)
 	test_append_ok(t, s, &deletion)
 	testing.expect(t, store_is_tombstoned(s, removed.id))
 	expected := [3][32]u8{{}, older.id, tied.id}
@@ -404,11 +401,18 @@ test_tag_snapshot_ahead :: proc(t: ^testing.T) {
 	defer test_rm_dir(dir)
 	s := test_open(t, dir)
 	defer store_close(s)
-	old := test_make_event(1, 1, 10, test_tags(test_tag("t", "topic")))
+	keys := [1][32]u8{test_pubkey(4)}
+	p := test_tag("p", test_hex(keys[0][:]))
+	old := test_make_event(1, nostr.KIND_GIFT_WRAP, 10, test_tags(p, test_tag("t", "topic")))
 	test_append_ok(t, s, &old)
 	index_len := mapped_file_load_len(&s.index)
 	data_len := mapped_file_load_len(&s.data)
-	newer := test_make_event(2, 1, 20, test_tags(test_tag("t", "topic"), test_tag("x", "newer")))
+	newer := test_make_event(
+		2,
+		nostr.KIND_GIFT_WRAP,
+		20,
+		test_tags(p, test_tag("t", "topic"), test_tag("x", "newer")),
+	)
 	test_append_ok(t, s, &newer)
 	full_index_len := mapped_file_load_len(&s.index)
 	full_data_len := mapped_file_load_len(&s.data)
@@ -419,9 +423,13 @@ test_tag_snapshot_ahead :: proc(t: ^testing.T) {
 	mapped_file_publish_len(&s.data, data_len)
 	f := test_tag_filter('t', "topic")
 	f.limit = 1
-	c := test_query_collect(t, s, &f)
-	testing.expect_value(t, len(c.ids), 1)
-	testing.expect_value(t, c.ids[0], old.id)
+	for phase in 0 ..< 2 {
+		if phase == 1 do f.kinds = test_kind_filter(nostr.KIND_GIFT_WRAP).kinds
+		c := collect_ctx_init()
+		testing.expect_value(t, query_authed(s, &f, keys[:], &c, collect_cb), Error.None)
+		testing.expect_value(t, len(c.ids), 1)
+		testing.expect_value(t, c.ids[0], old.id)
+	}
 }
 
 @(test)

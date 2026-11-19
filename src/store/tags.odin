@@ -3,6 +3,8 @@ package store
 
 import "core:crypto/sha2"
 import "core:encoding/endian"
+import "core:slice"
+import "core:sync"
 
 // Sentinel value_len indicating that tag_value holds a SHA-256 hash of the
 // original (long) value, rather than the raw bytes.
@@ -41,36 +43,93 @@ Event_Slot :: struct {
 }
 
 @(private)
+Mailbox_Run :: struct {
+	slots: [dynamic]Event_Slot,
+	refs:  int,
+}
+
+@(private)
+Mailbox :: struct {
+	runs: [dynamic]^Mailbox_Run,
+	last: u32,
+}
+
+@(private)
 Mailbox_Index :: struct {
-	by_recipient: map[[32]u8][dynamic]Event_Slot,
+	by_recipient: map[[32]u8]Mailbox,
 	entries:      int, // -1 until rebuilt after a compaction swap, or out of u32 range.
 	tag_bytes:    int,
 }
 
 @(private)
+mailbox_release :: proc(run: ^Mailbox_Run) {
+	if sync.atomic_sub(&run.refs, 1) == 1 {
+		allocator := run.slots.allocator
+		delete(run.slots)
+		free(run, allocator)
+	}
+}
+
+@(private)
 mailbox_destroy :: proc(m: ^Mailbox_Index) {
-	for _, slots in m.by_recipient {
-		delete(slots)
+	for _, box in m.by_recipient {
+		for run in box.runs do mailbox_release(run)
+		delete(box.runs)
 	}
 	delete(m.by_recipient)
 }
 
 @(private)
-mailbox_add :: proc(m: ^Mailbox_Index, slot, tag_end: u32, tags: []u8) {
+slot_newer :: proc(a, b: Event_Slot, data: rawptr) -> bool {
+	idx := cast([^][INDEX_ENTRY_SIZE]u8)data
+	x, y := &idx[a.slot], &idx[b.slot]
+	tx := i64(endian.unchecked_get_u64le(x[8:]))
+	ty := i64(endian.unchecked_get_u64le(y[8:]))
+	return tx > ty || (tx == ty && string(x[28:60]) < string(y[28:60]))
+}
+
+// Boot appends to one run and sorts it once. Live writes combine smaller
+// runs geometrically; a query can retain the old runs across publication.
+@(private)
+mailbox_add :: proc(m: ^Mailbox_Index, slot, tag_end: u32, tags: []u8, idx: rawptr = nil) {
 	for pos := 0; pos < len(tags); pos += TAG_ENTRY_SIZE {
 		tag := tags[pos:pos + TAG_ENTRY_SIZE]
 		if tag[8] != 'p' || tag[41] != 32 {
 			continue
 		}
 		pk := (cast(^[32]u8)&tag[9])^
-		slots, ok := &m.by_recipient[pk]
+		box, ok := &m.by_recipient[pk]
 		if !ok {
-			m.by_recipient[pk] = make([dynamic]Event_Slot, 0, 1)
-			slots, _ = &m.by_recipient[pk]
+			m.by_recipient[pk] = {
+				runs = make([dynamic]^Mailbox_Run, 0, 1),
+			}
+			box, _ = &m.by_recipient[pk]
+		} else if box.last == slot {
+			continue
 		}
-		if n := len(slots^); n == 0 || slots^[n - 1].slot != slot {
-			append(slots, Event_Slot{slot, tag_end})
+		box.last = slot
+		if idx == nil && len(box.runs) > 0 {
+			append(&box.runs[0].slots, Event_Slot{slot, tag_end})
+			continue
 		}
+		n, count := len(box.runs), 1
+		for n > 0 && len(box.runs[n - 1].slots) <= count {
+			n -= 1
+			count += len(box.runs[n].slots)
+		}
+		run := new(Mailbox_Run)
+		run^ = {
+			slots = make([dynamic]Event_Slot, 0, count),
+			refs  = 1,
+		}
+		append(&run.slots, Event_Slot{slot, tag_end})
+		for old in box.runs[n:] {
+			append(&run.slots, ..old.slots[:])
+			mailbox_release(old)
+		}
+		resize(&box.runs, n)
+		if count > 1 do slice.sort_by_with_data(run.slots[:], slot_newer, idx)
+		append(&box.runs, run)
 	}
 }
 

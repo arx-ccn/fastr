@@ -232,6 +232,27 @@ event_matches_filter :: proc(f: ^nostr.Filter, ev: ^pack.Event) -> bool {
 	return true
 }
 
+@(private)
+Mailbox_Cursor :: struct {
+	run:  ^Mailbox_Run,
+	next: int,
+}
+
+@(private)
+mailbox_next :: proc(cursors: []Mailbox_Cursor, idx: rawptr) -> Event_Slot {
+	best := -1
+	result: Event_Slot
+	for &c, i in cursors {
+		if c.next == len(c.run.slots) do continue
+		slot := c.run.slots[c.next]
+		if best < 0 || slot_newer(slot, result, idx) {
+			best, result = i, slot
+		}
+	}
+	cursors[best].next += 1
+	return result
+}
+
 // One candidate kept by the query top-N selection.
 @(private)
 Heap_Item :: struct {
@@ -285,10 +306,15 @@ query_authed :: proc(
 		}
 	}
 
-	// Pin the three mappings and copy slots under the publication lock. No
-	// pointers into either lookup map escape the lock.
+	// Pin the mappings and mailbox runs under the publication lock. No
+	// pointers into the lookup maps escape the lock.
 	idx_g, data_g, tags_g: Slice_Guard
-	cand: [dynamic]Event_Slot
+	local_id: [1]Event_Slot
+	cand: []Event_Slot
+	local_run: [1]Mailbox_Cursor
+	run_storage := local_run[:]
+	cursors := run_storage[:0]
+	mailbox_steps := 0
 	use_mailbox: bool
 	indexed_tags: bool
 	{
@@ -298,9 +324,11 @@ query_authed :: proc(
 		tags_g = mapped_file_slice(&s.tags)
 		idx := idx_g.data
 		total := index_entry_count(idx)
-		indexed_tags = total <= s.mailbox.entries && len(tags_g.data) == s.mailbox.tag_bytes
+		indexed_tags = total == s.mailbox.entries && len(tags_g.data) == s.mailbox.tag_bytes
 		if use_ids {
-			cand = make([dynamic]Event_Slot, 0, len(fids), context.temp_allocator)
+			cand = local_id[:]
+			if len(fids) > len(cand) do cand = make([]Event_Slot, len(fids), context.temp_allocator)
+			n := 0
 			for fid in fids {
 				slot, ok := s.known_ids[fid.bytes]
 				if !ok {
@@ -312,23 +340,27 @@ query_authed :: proc(
 					use_ids = false
 					break
 				}
-				append(&cand, slot)
+				cand[n] = slot
+				n += 1
 			}
+			cand = cand[:n]
 		}
 		if !use_ids && inbox && indexed_tags {
 			use_mailbox = true
-			clear(&cand)
 			for &pk in auth_pks {
-				slots := s.mailbox.by_recipient[pk]
-				n := len(slots)
-				for n > 0 && int(slots[n - 1].slot) >= total {
-					n -= 1
-				}
-				if n > 0 {
-					if cap(cand) == 0 {
-						cand = make([dynamic]Event_Slot, 0, n, context.temp_allocator)
+				for run in s.mailbox.by_recipient[pk].runs {
+					n := len(cursors)
+					if n == len(run_storage) {
+						grown := make([]Mailbox_Cursor, n * 2, context.temp_allocator)
+						copy(grown, cursors)
+						run_storage = grown
 					}
-					append(&cand, ..slots[:n])
+					sync.atomic_add(&run.refs, 1)
+					cursors = run_storage[:n + 1]
+					cursors[n] = {
+						run = run,
+					}
+					mailbox_steps += len(run.slots)
 				}
 			}
 		}
@@ -336,27 +368,38 @@ query_authed :: proc(
 	defer slice_release(idx_g)
 	defer slice_release(data_g)
 	defer slice_release(tags_g)
+	defer for &c in cursors do mailbox_release(c.run)
 	idx := idx_g.data
 	data := data_g.data
 	total := index_entry_count(idx)
 	steps := total
 	use_slots := use_ids || use_mailbox
+	ordered := use_mailbox || use_ids && indexed_tags
 	recipient_offsets: Offset_Set
 	defer delete(recipient_offsets)
 	if use_slots {
-		steps = len(cand)
+		steps = mailbox_steps if use_mailbox else len(cand)
 		if steps == 0 {
 			return .None
 		}
-		if steps > 1 && (use_ids || len(auth_pks) > 1) {
-			slice.sort_by(cand[:], proc(a, b: Event_Slot) -> bool {return a.slot < b.slot})
+		if use_ids && steps > 1 {
+			if ordered {
+				for j in 1 ..< steps {
+					if slot_newer(cand[j], cand[j - 1], raw_data(idx)) {
+						slice.sort_by_with_data(cand, slot_newer, raw_data(idx))
+						break
+					}
+				}
+			} else {
+				slice.sort_by(cand, proc(a, b: Event_Slot) -> bool {return a.slot < b.slot})
+			}
 		}
 	} else if len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
 		recipient_offsets = p_tag_offsets_union(tags_g.data, auth_pks)
 	}
 
 	// Tag records follow increasing data offsets, including after compaction.
-	// All candidate paths visit descending slots.
+	// Ordered reads reset the cursor from each candidate's stored tag_end.
 	specs := build_tag_specs(filter)
 	tag_end := len(tags_g.data) / TAG_ENTRY_SIZE
 	walk: Tag_Walk = .Sparse if use_ids && !indexed_tags else .Sequential
@@ -367,14 +410,19 @@ query_authed :: proc(
 	// the last-N appended (#57, #108). Bounded heap whose root is the worst
 	// survivor; complexity O(M log N).
 	heap: pq.Priority_Queue(Heap_Item)
+	hits: [dynamic][]u8
 	if steps > 1 {
-		pq.init(
-			&heap,
-			heap_item_worse,
-			pq.default_swap_proc(Heap_Item),
-			min(steps, limit),
-			context.temp_allocator,
-		)
+		if ordered {
+			hits = make([dynamic][]u8, 0, min(steps, limit), context.temp_allocator)
+		} else {
+			pq.init(
+				&heap,
+				heap_item_worse,
+				pq.default_swap_proc(Heap_Item),
+				min(steps, limit),
+				context.temp_allocator,
+			)
+		}
 	}
 	defer pq.destroy(&heap)
 
@@ -390,7 +438,12 @@ query_authed :: proc(
 	for si := 0; si < steps; si += 1 {
 		i: int
 		if use_slots {
-			candidate := cand[steps - 1 - si]
+			candidate: Event_Slot
+			if use_mailbox {
+				candidate = mailbox_next(cursors, raw_data(idx))
+			} else {
+				candidate = cand[si if ordered else steps - 1 - si]
+			}
 			i = int(candidate.slot)
 			if i == prev_slot {
 				continue
@@ -442,6 +495,7 @@ query_authed :: proc(
 		// 2. Time bounds — 8-byte read. created_at i64le at offset 8.
 		created_at := i64(endian.unchecked_get_u64le(base[8:16]))
 		if has_since && created_at < fsince {
+			if ordered do break
 			continue
 		}
 		if has_until && created_at > funtil {
@@ -547,7 +601,7 @@ query_authed :: proc(
 		//     - NIP-50: content substring match.
 		//     - NIP-70: protected events only served to the author.
 		authed := pk_in(auth_pks, pubkey^)
-		if steps == 1 || has_search || !authed || access.check != nil {
+		if ordered || steps == 1 || has_search || !authed || access.check != nil {
 			start, end, bok := blob_bounds(idx, i, total, len(data), offset)
 			if !bok {
 				return .Io
@@ -570,6 +624,11 @@ query_authed :: proc(
 			}
 			if steps == 1 {
 				return emit(user, dp)
+			}
+			if ordered {
+				append(&hits, dp)
+				if len(hits) == limit do break
+				continue
 			}
 		}
 
@@ -598,6 +657,11 @@ query_authed :: proc(
 				break
 			}
 		}
+	}
+
+	if ordered {
+		for dp in hits do emit(user, dp) or_return
+		return .None
 	}
 
 	// Selection is finished. Reuse its storage for NIP-01 emission order.
