@@ -508,13 +508,17 @@ append_classified :: proc(
 	{
 		sync.guard(&s.known_ids_mu)
 		slot := before_index / INDEX_ENTRY_SIZE
-		s.known_ids[ev.id] = u32(slot)
+		pos := Event_Slot {
+			slot    = u32(slot),
+			tag_end = u32(w.tags.offset / TAG_ENTRY_SIZE),
+		}
+		s.known_ids[ev.id] = pos
 		if s.mailbox.entries == int(slot) &&
 		   s.mailbox.tag_bytes == int(before_tags) &&
 		   slot < u64(max(u32)) &&
 		   w.tags.offset / TAG_ENTRY_SIZE <= u64(max(u32)) {
 			if ev.kind == nostr.KIND_GIFT_WRAP {
-				mailbox_add(&s.mailbox, u32(slot), u32(w.tags.offset / TAG_ENTRY_SIZE), tag_buf[:])
+				mailbox_add(&s.mailbox, pos.slot, pos.tag_end, tag_buf[:])
 			}
 			s.mailbox.entries += 1
 			s.mailbox.tag_bytes = int(w.tags.offset)

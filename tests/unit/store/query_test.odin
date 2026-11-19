@@ -1097,12 +1097,15 @@ test_query_ids_fast_path_exact :: proc(t: ^testing.T) {
 	testing.expect_value(t, c.ids[1], want_old)
 
 	// A stale slot must retain the ID check on the fallback scan.
-	s.known_ids[want_old] = 101
+	saved := s.known_ids[want_old]
+	s.known_ids[want_old] = {
+		slot = 101,
+	}
 	stale := test_query_collect(t, s, &f)
 	testing.expect_value(t, len(stale.ids), 2)
 	testing.expect_value(t, stale.ids[0], want_new)
 	testing.expect_value(t, stale.ids[1], want_old)
-	s.known_ids[want_old] = 100
+	s.known_ids[want_old] = saved
 
 	// Other gates still apply on the fast path: kind mismatch yields nothing.
 	f2 := test_kind_filter(42)

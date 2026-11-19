@@ -22,7 +22,7 @@ event_by_id :: proc(
 	{
 		sync.shared_guard(&s.known_ids_mu)
 		if raw, present := s.known_ids[id]; present {
-			slot, found = int(raw), true
+			slot, found = int(raw.slot), true
 		}
 	}
 	// Membership in known_ids is exact: absent means not stored.

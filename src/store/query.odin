@@ -288,8 +288,9 @@ query_authed :: proc(
 	// Pin the three mappings and copy slots under the publication lock. No
 	// pointers into either lookup map escape the lock.
 	idx_g, data_g, tags_g: Slice_Guard
-	cand: [dynamic]Mailbox_Slot
+	cand: [dynamic]Event_Slot
 	use_mailbox: bool
+	indexed_tags: bool
 	{
 		sync.shared_guard(&s.known_ids_mu)
 		idx_g = mapped_file_slice(&s.index)
@@ -297,26 +298,24 @@ query_authed :: proc(
 		tags_g = mapped_file_slice(&s.tags)
 		idx := idx_g.data
 		total := index_entry_count(idx)
+		indexed_tags = total <= s.mailbox.entries && len(tags_g.data) == s.mailbox.tag_bytes
 		if use_ids {
-			cand = make([dynamic]Mailbox_Slot, 0, len(fids), context.temp_allocator)
+			cand = make([dynamic]Event_Slot, 0, len(fids), context.temp_allocator)
 			for fid in fids {
 				slot, ok := s.known_ids[fid.bytes]
 				if !ok {
 					continue
 				}
-				i := int(slot)
+				i := int(slot.slot)
 				// Compaction may have swapped the mappings but not rebuilt known_ids.
 				if i >= total || (cast(^[32]u8)&idx[i * INDEX_ENTRY_SIZE + 28])^ != fid.bytes {
 					use_ids = false
 					break
 				}
-				append(&cand, Mailbox_Slot{slot = slot})
+				append(&cand, slot)
 			}
 		}
-		if !use_ids &&
-		   inbox &&
-		   total <= s.mailbox.entries &&
-		   len(tags_g.data) == s.mailbox.tag_bytes {
+		if !use_ids && inbox && indexed_tags {
 			use_mailbox = true
 			clear(&cand)
 			for &pk in auth_pks {
@@ -327,7 +326,7 @@ query_authed :: proc(
 				}
 				if n > 0 {
 					if cap(cand) == 0 {
-						cand = make([dynamic]Mailbox_Slot, 0, n, context.temp_allocator)
+						cand = make([dynamic]Event_Slot, 0, n, context.temp_allocator)
 					}
 					append(&cand, ..slots[:n])
 				}
@@ -350,7 +349,7 @@ query_authed :: proc(
 			return .None
 		}
 		if steps > 1 && (use_ids || len(auth_pks) > 1) {
-			slice.sort_by(cand[:], proc(a, b: Mailbox_Slot) -> bool {return a.slot < b.slot})
+			slice.sort_by(cand[:], proc(a, b: Event_Slot) -> bool {return a.slot < b.slot})
 		}
 	} else if len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
 		recipient_offsets = p_tag_offsets_union(tags_g.data, auth_pks)
@@ -360,7 +359,7 @@ query_authed :: proc(
 	// All candidate paths visit descending slots.
 	specs := build_tag_specs(filter)
 	tag_end := len(tags_g.data) / TAG_ENTRY_SIZE
-	walk: Tag_Walk = .Sparse if use_ids else .Sequential
+	walk: Tag_Walk = .Sparse if use_ids && !indexed_tags else .Sequential
 
 	now := unix_now()
 
@@ -368,13 +367,15 @@ query_authed :: proc(
 	// the last-N appended (#57, #108). Bounded heap whose root is the worst
 	// survivor; complexity O(M log N).
 	heap: pq.Priority_Queue(Heap_Item)
-	pq.init(
-		&heap,
-		heap_item_worse,
-		pq.default_swap_proc(Heap_Item),
-		min(steps, limit),
-		context.temp_allocator,
-	)
+	if steps > 1 {
+		pq.init(
+			&heap,
+			heap_item_worse,
+			pq.default_swap_proc(Heap_Item),
+			min(steps, limit),
+			context.temp_allocator,
+		)
+	}
 	defer pq.destroy(&heap)
 
 	// Pre-extract filter fields to avoid repeated Maybe-unwrapping in the hot loop.
@@ -395,7 +396,7 @@ query_authed :: proc(
 				continue
 			}
 			prev_slot = i
-			if use_mailbox {
+			if indexed_tags {
 				tag_end = int(candidate.tag_end)
 			}
 		} else {
@@ -546,7 +547,7 @@ query_authed :: proc(
 		//     - NIP-50: content substring match.
 		//     - NIP-70: protected events only served to the author.
 		authed := pk_in(auth_pks, pubkey^)
-		if has_search || !authed || access.check != nil {
+		if steps == 1 || has_search || !authed || access.check != nil {
 			start, end, bok := blob_bounds(idx, i, total, len(data), offset)
 			if !bok {
 				return .Io
@@ -566,6 +567,9 @@ query_authed :: proc(
 			}
 			if !visible {
 				continue
+			}
+			if steps == 1 {
+				return emit(user, dp)
 			}
 		}
 

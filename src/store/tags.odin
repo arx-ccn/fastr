@@ -35,14 +35,14 @@ Tag_Entry :: struct {
 TAG_ENTRY_SIZE :: 49
 
 @(private)
-Mailbox_Slot :: struct {
+Event_Slot :: struct {
 	slot:    u32,
 	tag_end: u32, // One past this event's last record in tags.s.
 }
 
 @(private)
 Mailbox_Index :: struct {
-	by_recipient: map[[32]u8][dynamic]Mailbox_Slot,
+	by_recipient: map[[32]u8][dynamic]Event_Slot,
 	entries:      int, // -1 until rebuilt after a compaction swap, or out of u32 range.
 	tag_bytes:    int,
 }
@@ -65,11 +65,11 @@ mailbox_add :: proc(m: ^Mailbox_Index, slot, tag_end: u32, tags: []u8) {
 		pk := (cast(^[32]u8)&tag[9])^
 		slots, ok := &m.by_recipient[pk]
 		if !ok {
-			m.by_recipient[pk] = make([dynamic]Mailbox_Slot, 0, 1)
+			m.by_recipient[pk] = make([dynamic]Event_Slot, 0, 1)
 			slots, _ = &m.by_recipient[pk]
 		}
 		if n := len(slots^); n == 0 || slots^[n - 1].slot != slot {
-			append(slots, Mailbox_Slot{slot, tag_end})
+			append(slots, Event_Slot{slot, tag_end})
 		}
 	}
 }
