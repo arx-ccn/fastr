@@ -315,3 +315,42 @@ Magnitude served more single-ID requests with parallel clients. Raw results
 are in the same cache directory, passes 21–25
 (`-parallel` for the three diagnostic passes). `25pct/` holds the commands,
 diagnostic clients and binary hashes.
+
+### Single-ID replay under parallel load
+
+This run compares fastr `3037b36750` with `6105e081fb`. The latter sends a replay
+directly when its socket is idle. A nonblocking short write queues the unsent
+bytes before any later frames. Live subscriptions are split across eight
+locks by connection. Exact-ID lookups now also return the end of the event's
+tag records (four additional bytes per ID). Plain REQ and CLOSE messages
+with supported filter fields no longer need an intermediate JSON tree.
+
+With the original client, five passes per binary gave these median requests/s.
+The fixture, validation, core assignments and Magnitude build were unchanged.
+
+| Request | fastr before | fastr after | Magnitude | After vs. Magnitude |
+|---|---:|---:|---:|---:|
+| One wrap by ID | 105,135 | 105,291 | 100,890 | +4.4% |
+| 100 wraps by ID | 2,692 | 2,748 | 2,456 | +11.9% |
+| Inbox, limit 500 | 565 | 560 | 486 | +15.1% |
+
+None met the 25% target. For the sustained test, each of eight workers
+validated one socket and ran ten times as many requests as the original
+client. Each pass checked 320,000 single reads, 800,000 events in ID batches
+and 3,860,000 events in inbox pages. The relay still had two physical cores.
+The three binaries rotated through all three run positions.
+
+| Request | fastr before, req/s | fastr after, req/s | Magnitude, req/s | Relay CPU µs/req: before / after / Magnitude |
+|---|---:|---:|---:|---:|
+| One wrap by ID | 99,572 | 226,421 | 263,352 | 30.9 / 10.0 / 9.0 |
+| 100 wraps by ID | 9,232 | 10,077 | 9,808 | 197.5 / 148.8 / 117.5 |
+| Inbox, limit 500 | 2,319 | 2,326 | 2,429 | 481.3 / 477.5 / 170.0 |
+
+CPU figures are process CPU ticks per completed request, not latency.
+Parallel single-ID throughput rose 127%; inbox throughput changed less than
+1%. We did not keep a 32 MiB encoded-response cache: in two paired trials
+it increased relay CPU per 100-ID request from 114–116 µs to 150–159 µs.
+
+Raw JSONL: `~/.cache/fastr-bench/magnitude-ieI3rD/`, passes 51–55 for the
+original client, 51–53 with suffix `-long` for the sustained test. The
+`sched/` directory contains the diagnostic clients, commands and binary hashes.
