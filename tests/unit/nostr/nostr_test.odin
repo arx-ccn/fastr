@@ -99,6 +99,104 @@ test_parse_close_and_unknown :: proc(t: ^testing.T) {
 	testing.expect(t, !bad3)
 }
 
+@(test)
+test_plain_req_decodes_and_owns_fields :: proc(t: ^testing.T) {
+	sid := strings.repeat("x/[0]", 32, context.temp_allocator)
+	hex := strings.repeat("ab", 32, context.temp_allocator)
+	frame := fmt.tprintf(
+		" \r\n[ \"REQ\",\t\"%s\", {{\"until\":9223372036854775807,\"ids\":[\"%s\",\"bb\"],\"limit\":0,\"since\":-42,\"kinds\":[0,65535],\"authors\":[]}}, {{\"authors\":[\"ccdd\"]}}, {{}} ] \n",
+		sid,
+		hex,
+	)
+	raw := make([]u8, len(frame), context.temp_allocator)
+	copy(raw, frame)
+	msg, ok := try_plain_subscription(string(raw), 2, context.temp_allocator)
+	testing.expect(t, ok)
+	if !ok {return}
+	for &b in raw {b = 0}
+	req := msg.(Msg_Req)
+	testing.expect_value(t, req.sub_id, sid)
+	testing.expect_value(t, len(req.filters), 3)
+	if len(req.filters) != 3 {return}
+	f := req.filters[0]
+	testing.expect_value(t, f.until.?, max(i64))
+	testing.expect_value(t, f.since.?, i64(-42))
+	testing.expect_value(t, f.limit.?, 0)
+	testing.expect_value(t, f.ids.?[0].length, 32)
+	testing.expect_value(t, f.ids.?[0].bytes[31], u8(0xab))
+	testing.expect_value(t, f.ids.?[1].length, 1)
+	testing.expect_value(t, f.kinds.?[1], max(u16))
+	testing.expect_value(t, len(f.authors.?), 0)
+	testing.expect_value(t, req.filters[1].authors.?[0].bytes[1], u8(0xdd))
+	testing.expect(t, req.filters[2].authors == nil)
+}
+
+@(test)
+test_plain_close_owns_id :: proc(t: ^testing.T) {
+	sid := strings.repeat("._]", 39, context.temp_allocator)
+	frame := fmt.tprintf(`[ "CLOSE", "%s" ]`, sid)
+	raw := make([]u8, len(frame), context.temp_allocator)
+	copy(raw, frame)
+	msg, ok := try_plain_subscription(string(raw), 0, context.temp_allocator)
+	testing.expect(t, ok)
+	if !ok {return}
+	for &b in raw {b = 0}
+	testing.expect_value(t, msg.(Msg_Close).sub_id, sid)
+}
+
+@(test)
+test_subscription_fallback_decodes_extended_shapes :: proc(t: ^testing.T) {
+	msg, reason, ok := parse_client_msg(
+		` ["\u0052EQ","snow☃\"",{"id\u0073":["\u0061b"],"#t":["test"],"ext":{"v":[null,true]}}] `,
+		4,
+		context.temp_allocator,
+	)
+	testing.expect(t, ok, reason)
+	if ok {
+		req := msg.(Msg_Req)
+		testing.expect_value(t, req.sub_id, "snow☃\"")
+		testing.expect_value(t, req.filters[0].ids.?[0].bytes[0], u8(0xab))
+		testing.expect(t, "test" in req.filters[0].tags['t'])
+	}
+	msg, reason, ok = parse_client_msg(`["CLOSE","a\tb",{"ext":[1,2]}]`, 4, context.temp_allocator)
+	testing.expect(t, ok, reason)
+	if ok {testing.expect_value(t, msg.(Msg_Close).sub_id, "a\tb")}
+}
+
+@(test)
+test_subscription_fallback_preserves_reasons :: proc(t: ^testing.T) {
+	cases := [?]struct {
+		raw, reason: string,
+	} {
+		{`["REQ","s"]`, "invalid: REQ requires sub_id and at least one filter"},
+		{`["REQ","s",[]]`, "invalid: filter not an object"},
+		{`["REQ","s",{"ids":["aa","bb"]}]`, "invalid: too many values in ids"},
+		{`["REQ","s",{"ids":["AA"]}]`, "invalid: ids entry not lowercase hex"},
+		{`["REQ","s",{"kinds":[65536]}]`, "invalid: kind out of range for u16"},
+		{`["REQ","s",{"since":1e1}]`, "invalid: since not an integer"},
+		{`["REQ","s",{"limit":-1}]`, "invalid: limit not a non-negative integer"},
+		{`["REQ","s",{"ids":["aa"],"ids":["bb"]}]`, "invalid: not valid JSON"},
+		{`["REQ","s",{"ids":["aa"] "limit":1}]`, "invalid: not valid JSON"},
+		{`["REQ","s",{"ids":["aa"]},{"kinds":[1]}`, "invalid: not valid JSON"},
+		{`["CLOSE",7]`, "invalid: CLOSE sub_id not a string"},
+	}
+	for c in cases {
+		_, fast := try_plain_subscription(c.raw, 1, context.allocator)
+		testing.expectf(t, !fast, "fast decoder accepted %s", c.raw)
+		_, reason, ok := parse_client_msg(c.raw, 1, context.temp_allocator)
+		testing.expectf(t, !ok, "decoder accepted %s", c.raw)
+		testing.expect_value(t, reason, c.reason)
+	}
+}
+
+@(test)
+test_plain_subscription_requires_complete_frame :: proc(t: ^testing.T) {
+	for raw in ([?]string{`["REQ","s",{}] false`, `["REQ","s",{"kinds":[1,]}]`, `["REQ","s",{"limit":01}]`, `["CLOSE","s"] []`, `["CLOSE","s",]`, "[\"CLOSE\",\"a\x01b\"]"}) {
+		_, fast := try_plain_subscription(raw, 4, context.allocator)
+		testing.expectf(t, !fast, "fast decoder accepted %s", raw)
+	}
+}
+
 @(private = "file")
 ID64 :: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 @(private = "file")

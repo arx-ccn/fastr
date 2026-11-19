@@ -432,6 +432,9 @@ parse_client_msg :: proc(
 	reason: string,
 	ok: bool,
 ) {
+	if fast, parsed := try_plain_subscription(raw, max_filter_values, allocator); parsed {
+		return fast, "", true
+	}
 	val, parse_ok := json_parse_temp(raw)
 	if !parse_ok {
 		return nil, "invalid: not valid JSON", false
