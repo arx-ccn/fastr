@@ -256,8 +256,7 @@ test_kind_boundaries :: proc(t: ^testing.T) {
 // Transcoder equivalence tests - transcode_to_event_json must produce
 // identical output to deserialize_trusted + write_event_json_ref.
 
-// Reference writer for event JSON, deliberately using fmt for integers so
-// it is an independent code path from the transcoder's push_i64/push_u16.
+// The reference writer uses fmt to check the transcoder's decimal output.
 @(private = "file")
 write_event_json_ref :: proc(sub_id: string, event: ^Event, buf: ^[dynamic]u8) {
 	append(buf, "[\"EVENT\",")
@@ -355,6 +354,36 @@ test_transcode_content_escaping :: proc(t: ^testing.T) {
 test_transcode_empty_event :: proc(t: ^testing.T) {
 	e := make_ev(0, 0, nil, "")
 	testing.expect_value(t, transcode(t, &e, ""), via_event(t, &e, ""))
+}
+
+@(test)
+test_transcode_decimal_extrema :: proc(t: ^testing.T) {
+	for ts in ([3]i64{min(i64), -1, max(i64)}) {
+		e := make_ev(ts, max(u16), nil, "")
+		testing.expect_value(t, transcode(t, &e, "s"), via_event(t, &e, "s"))
+	}
+}
+
+@(test)
+test_transcode_rolls_back_owned_bytes :: proc(t: ^testing.T) {
+	e := make_ev(0, 1, []Tag{{fields = []string{"p", HEX64}}}, "payload")
+	dp := pack_blob(t, &e)
+	buf := make([dynamic]u8, 0, 1, context.temp_allocator)
+	append(&buf, 'x')
+	for n in 0 ..< len(dp) {
+		testing.expect_value(t, transcode_to_event_json(dp[:n], "s", &buf), Error.Invalid)
+		testing.expect_value(t, string(buf[:]), "x")
+	}
+	for tdl in ([2]u8{0, 2}) {
+		original := dp[FIXED_LEN]
+		dp[FIXED_LEN] = tdl
+		testing.expect_value(t, transcode_to_event_json(dp, "s", &buf), Error.Invalid)
+		testing.expect_value(t, string(buf[:]), "x")
+		dp[FIXED_LEN] = original
+	}
+	testing.expect_value(t, transcode_to_event_json(dp, "s", &buf), Error.None)
+	testing.expect_value(t, buf[0], u8('x'))
+	testing.expect_value(t, string(buf[1:]), via_event(t, &e, "s"))
 }
 
 @(test)
@@ -670,11 +699,11 @@ test_transcode_serialize_fast_equivalence :: proc(t: ^testing.T) {
 
 @(test)
 test_transcode_utf8_edges :: proc(t: ^testing.T) {
-	prefix: [48]u8
+	prefix: [80]u8
 	for &b in prefix {
 		b = 'x'
 	}
-	for n in ([10]int{0, 14, 15, 16, 17, 30, 31, 32, 47, 48}) {
+	for n in ([14]int{0, 14, 15, 16, 17, 30, 31, 32, 47, 48, 63, 64, 65, 80}) {
 		for suffix in ([3]string{"é", "€", "\xf0\x90\x8d\x88"}) {
 			for tail in ([2]string{"", "xxxxxxxxxxxxxxxxx"}) {
 				input := fmt.tprintf("%s%s%s", string(prefix[:n]), suffix, tail)
@@ -703,11 +732,11 @@ test_transcode_utf8_edges :: proc(t: ^testing.T) {
 
 @(test)
 test_transcode_invalid_utf8 :: proc(t: ^testing.T) {
-	prefix: [48]u8
+	prefix: [80]u8
 	for &b in prefix {
 		b = 'x'
 	}
-	for n in ([10]int{0, 14, 15, 16, 17, 30, 31, 32, 47, 48}) {
+	for n in ([14]int{0, 14, 15, 16, 17, 30, 31, 32, 47, 48, 63, 64, 65, 80}) {
 		for suffix in ([9]string{"\x80", "\xc2", "\xe2\x82", "\xf0\x9f\xa6", "\xe2x\xa1", "\xc0\xaf", "\xe0\x80\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80"}) {
 			input := fmt.tprintf("%s%s", string(prefix[:n]), suffix)
 			for in_tag in ([2]bool{false, true}) {
@@ -718,7 +747,9 @@ test_transcode_invalid_utf8 :: proc(t: ^testing.T) {
 				}
 				dp := pack_blob(t, &e)
 				buf := make([dynamic]u8, context.temp_allocator)
+				append(&buf, "prefix")
 				err := transcode_to_event_json(dp, "s", &buf)
+				testing.expect_value(t, string(buf[:]), "prefix")
 				testing.expectf(
 					t,
 					err == .Invalid,

@@ -497,42 +497,22 @@ json_escape_mask :: #force_inline proc(v: simd.u8x16) -> simd.u8x16 {
 write_field_as_json :: proc(dp: []u8, pos: ^int, buf: ^[dynamic]u8) -> Error {
 	length, hexed, fc := read_len_flag(dp[pos^:]) or_return
 	pos^ += fc
-	if length < 0 || pos^ + length > len(dp) {
+	if length < 0 || length > len(dp) - pos^ {
 		return .Invalid
 	}
 	data := dp[pos^:pos^ + length]
 	pos^ += length
 
 	if hexed {
-		// Binary bytes -> hex-encode directly (always valid ASCII, no escaping needed).
-		append(buf, '"')
-		hex_encode_into(data, buf)
-		append(buf, '"')
+		out := wire_span(buf, length * 2 + 2)
+		out[0], out[len(out) - 1] = '"', '"'
+		hex_encode(data, out[1:len(out) - 1])
+		return .None
+	}
+	ascii := plain_json_prefix(data)
+	if ascii == length {
+		write_quoted_bytes(data, buf)
 	} else {
-		// A plain ASCII field needs neither UTF-8 decoding nor JSON escapes.
-		ascii := 0
-		when simd.HAS_HARDWARE_SIMD {
-			for len(data) - ascii >= 16 {
-				v := simd.from_array((cast(^[16]u8)&data[ascii])^)
-				if simd.extract_msbs(v | json_escape_mask(v)) != {} {
-					break
-				}
-				ascii += 16
-			}
-		}
-		for ascii < len(data) {
-			b := data[ascii]
-			if b >= 0x80 || b < 0x20 || b == '"' || b == '\\' {
-				break
-			}
-			ascii += 1
-		}
-		if ascii == len(data) {
-			append(buf, '"')
-			append(buf, ..data)
-			append(buf, '"')
-			return .None
-		}
 		if !utf8.valid_string(string(data[ascii:])) {
 			return .Invalid
 		}
@@ -541,51 +521,78 @@ write_field_as_json :: proc(dp: []u8, pos: ^int, buf: ^[dynamic]u8) -> Error {
 	return .None
 }
 
-// Push a u16 as decimal digits into `buf` without fmt machinery.
 @(private)
-push_u16 :: proc(n: u16, buf: ^[dynamic]u8) {
-	if n == 0 {
-		append(buf, '0')
-		return
+plain_json_prefix :: proc(data: []u8) -> int {
+	i := 0
+	when simd.HAS_HARDWARE_SIMD {
+		#no_bounds_check for len(data) - i >= 64 {
+			a := simd.from_array((cast(^[16]u8)&data[i])^)
+			b := simd.from_array((cast(^[16]u8)&data[i + 16])^)
+			c := simd.from_array((cast(^[16]u8)&data[i + 32])^)
+			d := simd.from_array((cast(^[16]u8)&data[i + 48])^)
+			mask :=
+				(a | b | c | d) |
+				(json_escape_mask(a) |
+						json_escape_mask(b) |
+						json_escape_mask(c) |
+						json_escape_mask(d))
+			if simd.extract_msbs(mask) != {} {
+				break
+			}
+			i += 64
+		}
+		#no_bounds_check for len(data) - i >= 16 {
+			v := simd.from_array((cast(^[16]u8)&data[i])^)
+			if simd.extract_msbs(v | json_escape_mask(v)) != {} {
+				break
+			}
+			i += 16
+		}
 	}
-	tmp: [5]u8 // max 5 digits for u16
+	#no_bounds_check for ; i < len(data); i += 1 {
+		b := data[i]
+		if b >= 0x80 || b < 0x20 || b == '"' || b == '\\' {
+			break
+		}
+	}
+	return i
+}
+
+@(private)
+write_quoted_bytes :: #force_inline proc(data: []u8, buf: ^[dynamic]u8) {
+	out := wire_span(buf, len(data) + 2)
+	out[0], out[len(out) - 1] = '"', '"'
+	copy(out[1:], data)
+}
+
+@(private)
+wire_span :: #force_inline proc(buf: ^[dynamic]u8, size: int) -> []u8 {
+	start := len(buf)
+	end := start + size
+	if end > cap(buf) {
+		non_zero_reserve(buf, max(end, cap(buf) * 2))
+	}
+	non_zero_resize(buf, end)
+	return buf[start:end]
+}
+
+@(private)
+wire_decimal :: proc(n: i64, tmp: ^[20]u8) -> []u8 {
 	i := len(tmp)
-	v := n
-	for v > 0 {
+	v := ~u64(n) + 1 if n < 0 else u64(n)
+	for {
 		i -= 1
 		tmp[i] = '0' + u8(v % 10)
 		v /= 10
+		if v == 0 {
+			break
+		}
 	}
-	append(buf, ..tmp[i:])
-}
-
-// Push an i64 as decimal digits into `buf` without fmt machinery.
-@(private)
-push_i64 :: proc(n: i64, buf: ^[dynamic]u8) {
 	if n < 0 {
-		append(buf, '-')
-		abs := ~u64(n) + 1 // wrapping negate
-		push_u64(abs, buf)
-	} else {
-		push_u64(u64(n), buf)
-	}
-}
-
-@(private)
-push_u64 :: proc(n: u64, buf: ^[dynamic]u8) {
-	if n == 0 {
-		append(buf, '0')
-		return
-	}
-	tmp: [20]u8 // max 20 digits for u64
-	i := len(tmp)
-	v := n
-	for v > 0 {
 		i -= 1
-		tmp[i] = '0' + u8(v % 10)
-		v /= 10
+		tmp[i] = '-'
 	}
-	append(buf, ..tmp[i:])
+	return tmp[i:]
 }
 
 // Transcode a BASED blob directly to `["EVENT","<sub_id>",{<event>}]` JSON.
@@ -593,69 +600,101 @@ push_u64 :: proc(n: u64, buf: ^[dynamic]u8) {
 // Reads fixed fields from known byte offsets, walks the variable-length tag
 // section via varints, and writes JSON directly into `buf`. Zero intermediate
 // data structures, zero heap allocations (beyond `buf` growth).
-transcode_to_event_json :: proc(dp: []u8, sub_id: string, buf: ^[dynamic]u8) -> Error {
+transcode_to_event_json :: proc(dp: []u8, sub_id: string, buf: ^[dynamic]u8) -> (err: Error) {
 	if len(dp) < FIXED_LEN {
 		return .Invalid
 	}
-
-	append(buf, "[\"EVENT\",")
-	write_json_str(sub_id, buf)
-
-	append(buf, ",{\"id\":\"")
-	hex_encode_into(dp[0:32], buf)
-
-	append(buf, "\",\"pubkey\":\"")
-	hex_encode_into(dp[32:64], buf)
-
-	append(buf, "\",\"created_at\":")
-	created_at, _ := endian.get_i64(dp[128:136], .Little)
-	push_i64(created_at, buf)
-
-	append(buf, ",\"kind\":")
-	kind, _ := endian.get_u16(dp[136:138], .Little)
-	push_u16(kind, buf)
-
-	append(buf, ",\"tags\":[")
 	pos := FIXED_LEN
 	tdl, tc := varint_decode(dp[pos:]) or_return
 	pos += tc
-	tag_end := pos + int(tdl)
-	if tag_end > len(dp) {
+	if tdl > u64(len(dp) - pos) {
 		return .Invalid
 	}
-
-	tag_count, tc2 := varint_decode(dp[pos:]) or_return
+	tag_end := pos + int(tdl)
+	tag_blob := dp[:tag_end]
+	tag_count, tc2 := varint_decode(tag_blob[pos:]) or_return
 	pos += tc2
+
+	start := len(buf)
+	defer if err != .None {
+		non_zero_resize(buf, start)
+	}
+
+	non_zero_append(buf, "[\"EVENT\",")
+	sub := transmute([]u8)sub_id
+	if plain_json_prefix(sub) == len(sub) {
+		write_quoted_bytes(sub, buf)
+	} else {
+		write_json_str(sub_id, buf)
+	}
+
+	ID :: `,{"id":"`
+	PK :: `","pubkey":"`
+	TS :: `","created_at":`
+	KIND :: `,"kind":`
+	TAGS :: `,"tags":[`
+	created_at, _ := endian.get_i64(dp[128:136], .Little)
+	kind, _ := endian.get_u16(dp[136:138], .Little)
+	ts_tmp: [20]u8 = ---
+	kind_tmp: [20]u8 = ---
+	ts_digits := wire_decimal(created_at, &ts_tmp)
+	kind_digits := wire_decimal(i64(kind), &kind_tmp)
+	head := wire_span(
+		buf,
+		len(ID) +
+		64 +
+		len(PK) +
+		64 +
+		len(TS) +
+		len(ts_digits) +
+		len(KIND) +
+		len(kind_digits) +
+		len(TAGS),
+	)
+	i := copy(head, ID)
+	hex_encode(dp[:32], head[i:i + 64])
+	i += 64
+	i += copy(head[i:], PK)
+	hex_encode(dp[32:64], head[i:i + 64])
+	i += 64
+	i += copy(head[i:], TS)
+	i += copy(head[i:], ts_digits)
+	i += copy(head[i:], KIND)
+	i += copy(head[i:], kind_digits)
+	copy(head[i:], TAGS)
 
 	for t in 0 ..< tag_count {
 		if t > 0 {
-			append(buf, ',')
+			non_zero_append(buf, ',')
 		}
-		if pos >= len(dp) {
+		if pos >= tag_end {
 			return .Invalid
 		}
-		nf := int(dp[pos])
+		nf := int(tag_blob[pos])
 		pos += 1
-		append(buf, '[')
+		non_zero_append(buf, '[')
 		for f in 0 ..< nf {
 			if f > 0 {
-				append(buf, ',')
+				non_zero_append(buf, ',')
 			}
-			write_field_as_json(dp, &pos, buf) or_return
+			write_field_as_json(tag_blob, &pos, buf) or_return
 		}
-		append(buf, ']')
+		non_zero_append(buf, ']')
 	}
 
 	if pos != tag_end {
 		return .Invalid
 	}
 
-	append(buf, "],\"content\":")
+	non_zero_append(buf, "],\"content\":")
 	write_field_as_json(dp, &pos, buf) or_return
 
-	append(buf, ",\"sig\":\"")
-	hex_encode_into(dp[64:128], buf)
-	append(buf, "\"}]")
+	SIG :: `,"sig":"`
+	END :: `"}]`
+	tail := wire_span(buf, len(SIG) + 128 + len(END))
+	copy(tail, SIG)
+	hex_encode(dp[64:128], tail[len(SIG):len(SIG) + 128])
+	copy(tail[len(SIG) + 128:], END)
 
 	return .None
 }
