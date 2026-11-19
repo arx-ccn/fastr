@@ -15,6 +15,7 @@ import "base:runtime"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
+import "core:sys/linux"
 
 import "../nostr"
 import "../pack"
@@ -61,15 +62,15 @@ Out_Text :: struct {
 }
 
 Out_Batch :: struct {
-	wire: []u8, // complete frames, owned by the writer after enqueue
+	wire: [dynamic]u8, // retain the allocation base and its owning allocator
+	sent: int,
 }
 
 Out_Live :: struct {
 	live: Live_Event,
 }
 
-// Control frames must also flow through the writer thread — the reader and
-// writer threads share one TCP socket, so only the writer may send.
+// Control frames share the same ordered outbox as replay and live events.
 Out_Pong :: struct {
 	payload: []u8, // owned copy (max 125 bytes)
 }
@@ -91,9 +92,40 @@ Out_Msg :: union {
 // (reads for NIP-17/NIP-70 gating).
 Outbox :: struct {
 	ch:       chan.Chan(Out_Msg),
+	conn:     ^Conn,
+	send_mu:  sync.Mutex,
+	pending:  int, // queued plus currently being written
+	failed:   bool,
 	conn_id:  u64,
 	auth_mu:  sync.RW_Mutex,
 	auth_pks: map[[32]u8]struct{},
+}
+
+@(private)
+outbox_send :: proc(o: ^Outbox, msg: Out_Msg) -> bool {
+	sync.guard(&o.send_mu)
+	if o.failed {
+		return false
+	}
+	msg := msg
+	if batch, ok := &msg.(Out_Batch); ok && o.pending == 0 && o.conn != nil {
+		// No writer owns the socket. Don't block the reader on a slow client.
+		n, err := linux.send(linux.Fd(o.conn.sock), batch.wire[:], {.DONTWAIT, .NOSIGNAL})
+		if err == .NONE {
+			if int(n) == len(batch.wire) {
+				delete(batch.wire)
+				return true
+			}
+			batch.sent = int(n)
+		}
+	}
+	// With pending == 0 the channel is empty. A partial batch's suffix is
+	// therefore admitted before any later producer can acquire send_mu.
+	if !chan.try_send(o.ch, msg) {
+		return false
+	}
+	o.pending += 1
+	return true
 }
 
 @(private = "file")
@@ -113,6 +145,16 @@ Subscription_Key :: struct {
 }
 
 Fanout :: struct {
+	shards: [8]Fanout_Shard,
+}
+
+@(private)
+fanout_shard :: #force_inline proc(hub: ^Fanout, o: ^Outbox) -> ^Fanout_Shard {
+	return &hub.shards[o.conn_id % len(hub.shards)]
+}
+
+@(private)
+Fanout_Shard :: struct {
 	mu:        sync.RW_Mutex,
 	next_key:  u64,
 	subs:      map[u64]Subscription,
@@ -122,34 +164,44 @@ Fanout :: struct {
 	allocator: runtime.Allocator,
 }
 
-fanout_init :: proc(f: ^Fanout, allocator := context.allocator) {
-	f.allocator = allocator
-	f.subs = make(map[u64]Subscription, allocator)
-	f.by_kind = make(map[u16][dynamic]u64, allocator)
-	f.wildcard = make([dynamic]u64, allocator)
-	f.by_sub_id = make(map[Subscription_Key]u64, allocator)
+fanout_init :: proc(hub: ^Fanout, allocator := context.allocator) {
+	for &f in hub.shards {
+		f.allocator = allocator
+		f.subs = make(map[u64]Subscription, allocator)
+		f.by_kind = make(map[u16][dynamic]u64, allocator)
+		f.wildcard = make([dynamic]u64, allocator)
+		f.by_sub_id = make(map[Subscription_Key]u64, allocator)
+	}
 }
 
-fanout_destroy :: proc(f: ^Fanout) {
-	sync.guard(&f.mu)
-	keys := make([dynamic]u64, context.temp_allocator)
-	for key in f.subs {
-		append(&keys, key)
+fanout_destroy :: proc(hub: ^Fanout) {
+	for &f in hub.shards {
+		sync.guard(&f.mu)
+		keys := make([dynamic]u64, context.temp_allocator)
+		for key in f.subs {
+			append(&keys, key)
+		}
+		for key in keys {
+			remove_sub(&f, key)
+		}
+		delete(f.subs)
+		delete(f.by_kind)
+		delete(f.wildcard)
+		delete(f.by_sub_id)
 	}
-	for key in keys {
-		remove_sub(f, key)
-	}
-	delete(f.subs)
-	delete(f.by_kind)
-	delete(f.wildcard)
-	delete(f.by_sub_id)
 }
 
 // Compute which buckets a subscription with these filters lives in.
 // Any filter without a kinds constraint ⇒ wildcard. Otherwise the union of
 // all mentioned kinds. Only empty-kinds filters ⇒ neither (unreachable sub).
 @(private = "file")
-bucket_for :: proc(f: ^Fanout, filters: []nostr.Filter) -> (kinds: []u16, in_wildcard: bool) {
+bucket_for :: proc(
+	f: ^Fanout_Shard,
+	filters: []nostr.Filter,
+) -> (
+	kinds: []u16,
+	in_wildcard: bool,
+) {
 	for &filt in filters {
 		if _, present := filt.kinds.?; !present {
 			return nil, true
@@ -172,7 +224,7 @@ bucket_for :: proc(f: ^Fanout, filters: []nostr.Filter) -> (kinds: []u16, in_wil
 }
 
 @(private = "file")
-insert_sub :: proc(f: ^Fanout, sub: Subscription) {
+insert_sub :: proc(f: ^Fanout_Shard, sub: Subscription) {
 	key := f.next_key
 	f.next_key += 1
 	if sub.in_wildcard {
@@ -201,7 +253,7 @@ remove_key_from :: proc(bucket: ^[dynamic]u64, key: u64) {
 }
 
 @(private = "file")
-remove_sub :: proc(f: ^Fanout, key: u64) {
+remove_sub :: proc(f: ^Fanout_Shard, key: u64) {
 	sub, ok := f.subs[key]
 	if !ok {
 		return
@@ -233,7 +285,8 @@ remove_sub :: proc(f: ^Fanout, key: u64) {
 // Register or replace a subscription. A REQ with a duplicate sub_id on the
 // same connection replaces the previous one per NIP-01. Filters are deep-
 // cloned into the fanout's allocator; the caller keeps ownership of its own.
-fanout_subscribe :: proc(f: ^Fanout, sub_id: string, filters: []nostr.Filter, outbox: ^Outbox) {
+fanout_subscribe :: proc(hub: ^Fanout, sub_id: string, filters: []nostr.Filter, outbox: ^Outbox) {
+	f := fanout_shard(hub, outbox)
 	sync.guard(&f.mu)
 	cloned := make([]nostr.Filter, len(filters), f.allocator)
 	for &filt, i in filters {
@@ -256,7 +309,8 @@ fanout_subscribe :: proc(f: ^Fanout, sub_id: string, filters: []nostr.Filter, ou
 }
 
 // Remove a single subscription by sub_id + connection identity.
-fanout_unsubscribe :: proc(f: ^Fanout, sub_id: string, outbox: ^Outbox) {
+fanout_unsubscribe :: proc(hub: ^Fanout, sub_id: string, outbox: ^Outbox) {
+	f := fanout_shard(hub, outbox)
 	sync.guard(&f.mu)
 	if key, found := f.by_sub_id[Subscription_Key{outbox, sub_id}]; found {
 		remove_sub(f, key)
@@ -264,7 +318,8 @@ fanout_unsubscribe :: proc(f: ^Fanout, sub_id: string, outbox: ^Outbox) {
 }
 
 // Remove all subscriptions belonging to a connection (connection closed).
-fanout_unsubscribe_all :: proc(f: ^Fanout, outbox: ^Outbox) {
+fanout_unsubscribe_all :: proc(hub: ^Fanout, outbox: ^Outbox) {
+	f := fanout_shard(hub, outbox)
 	sync.guard(&f.mu)
 	victims := make([dynamic]u64, context.temp_allocator)
 	for key, sub in f.subs {
@@ -279,12 +334,19 @@ fanout_unsubscribe_all :: proc(f: ^Fanout, outbox: ^Outbox) {
 
 // Broadcast a freshly ingested event to all matching subscriptions.
 // Slow clients (full channel) are skipped; closed channels are pruned.
-fanout_broadcast :: proc(f: ^Fanout, shared: ^Shared_Event) {
+fanout_broadcast :: proc(hub: ^Fanout, shared: ^Shared_Event) {
 	// NIP-40: drop expired live events before delivery.
 	if exp, has := nostr.event_expiry(&shared.ev); has && exp <= nostr.unix_now() {
 		return
 	}
 
+	for &f in hub.shards {
+		broadcast_shard(&f, shared)
+	}
+}
+
+@(private)
+broadcast_shard :: proc(f: ^Fanout_Shard, shared: ^Shared_Event) {
 	needs_prune := false
 	{
 		sync.shared_guard(&f.mu)
@@ -315,7 +377,7 @@ fanout_broadcast :: proc(f: ^Fanout, shared: ^Shared_Event) {
 						shared = shared,
 					},
 				}
-				if !chan.try_send(sub.outbox.ch, Out_Msg(live)) {
+				if !outbox_send(sub.outbox, Out_Msg(live)) {
 					// Full (slow client) or closed: drop the event.
 					delete(live.live.sub_id)
 					shared_event_release(shared)

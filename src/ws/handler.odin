@@ -2,9 +2,8 @@
 // the EVENT/REQ/COUNT/AUTH/NEG-* handlers.
 //
 // Threading model: one reader thread (this proc) + one writer thread per
-// connection. ALL socket writes go through the writer via the outbox
-// channel — including pongs and closes — because two threads must never
-// interleave bytes on one TCP socket. The writer also applies the
+// connection. An idle outbox can send a replay without waking the writer.
+// Otherwise the writer sends queued frames in order. It also applies the
 // NIP-17/NIP-70 live-event visibility gates using the auth state shared
 // through the outbox.
 //
@@ -53,7 +52,7 @@ Conn_State :: struct {
 // closed or full (a dropped direct response means the socket is going away).
 @(private)
 send_text :: proc(cs: ^Conn_State, json: string) {
-	if !chan.try_send(cs.outbox.ch, Out_Msg(Out_Text{json = json})) {
+	if !outbox_send(cs.outbox, Out_Msg(Out_Text{json = json})) {
 		delete(json)
 	}
 }
@@ -125,6 +124,11 @@ writer_loop :: proc(cs: ^Conn_State) {
 		if !ok {
 			return
 		}
+		defer {
+			sync.guard(&cs.outbox.send_mu)
+			cs.outbox.pending -= 1
+			cs.outbox.failed = dead
+		}
 		if dead {
 			drop_msg(msg)
 			continue
@@ -136,7 +140,7 @@ writer_loop :: proc(cs: ^Conn_State) {
 			}
 			delete(m.json)
 		case Out_Batch:
-			dead = send_all(cs.conn.sock, m.wire) != .None
+			dead = send_all(cs.conn.sock, m.wire[m.sent:]) != .None
 			delete(m.wire)
 		case Out_Live:
 			ev := &m.live.shared.ev
@@ -167,8 +171,9 @@ writer_loop :: proc(cs: ^Conn_State) {
 @(private)
 live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
 	{
-		sync.shared_guard(&cs.relay.fanout.mu)
-		if sub, found := cs.relay.fanout.subs[live.key]; !found || sub.outbox != cs.outbox {
+		f := fanout_shard(&cs.relay.fanout, cs.outbox)
+		sync.shared_guard(&f.mu)
+		if sub, found := f.subs[live.key]; !found || sub.outbox != cs.outbox {
 			return false
 		}
 	}
@@ -226,6 +231,7 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 	ch, ch_err := chan.create(chan.Chan(Out_Msg), OUTBOX_CAPACITY, context.allocator)
 	assert(ch_err == nil)
 	cs.outbox.ch = ch
+	cs.outbox.conn = &cs.conn
 	cs.outbox.conn_id = conn_id
 	cs.outbox.auth_pks = make(map[[32]u8]struct{})
 
@@ -249,7 +255,7 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 		incoming, err := conn_next(&cs.conn)
 		if err != .None {
 			if code := close_code_for_error(err); code != 0 {
-				_ = chan.try_send(cs.outbox.ch, Out_Msg(Out_Close{code = code}))
+				_ = outbox_send(cs.outbox, Out_Msg(Out_Close{code = code}))
 			}
 			break read
 		}
@@ -262,12 +268,12 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 		case .Ping:
 			payload := make([]u8, len(incoming.data))
 			copy(payload, incoming.data)
-			if !chan.try_send(cs.outbox.ch, Out_Msg(Out_Pong{payload = payload})) {
+			if !outbox_send(cs.outbox, Out_Msg(Out_Pong{payload = payload})) {
 				delete(payload)
 			}
 		case .Close:
 			// CLOSE_NO_STATUS echoes as an empty close frame (see encode_close).
-			_ = chan.try_send(cs.outbox.ch, Out_Msg(Out_Close{code = incoming.close_code}))
+			_ = outbox_send(cs.outbox, Out_Msg(Out_Close{code = incoming.close_code}))
 			break read
 		case .Pong, .None:
 		}
@@ -648,12 +654,12 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 		qctx.wire = ordered
 	}
 
-	// One channel send for all stored events + EOSE.
+	// Keep all stored events and EOSE in one ordered outbox message.
 	start := len(qctx.wire)
 	non_zero_resize(&qctx.wire, start + 2)
 	nostr.write_eose_json(&qctx.wire, sub_id)
 	finish_text_frame(&qctx.wire, start, 2)
-	if !chan.try_send(cs.outbox.ch, Out_Msg(Out_Batch{wire = qctx.wire[:]})) {
+	if !outbox_send(cs.outbox, Out_Msg(Out_Batch{wire = qctx.wire})) {
 		delete(qctx.wire)
 	}
 }

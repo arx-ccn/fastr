@@ -36,11 +36,11 @@ relay_content_limit_for_kind :: proc(cfg: ^Relay_Config, kind: u16) -> int {
 }
 
 Relay :: struct {
-	store:           ^store.Store,
-	cfg:             Relay_Config,
-	fanout:          Fanout,
+	store:  ^store.Store,
+	cfg:    Relay_Config,
+	fanout: Fanout,
 	// Immutable after startup, before client or peer threads begin.
-	hooks:           policy.Hooks,
+	hooks:  policy.Hooks,
 }
 
 // Maximum number of pubkeys a single connection can authenticate as.
@@ -58,7 +58,9 @@ event_clone :: proc(ev: ^pack.Event, allocator: runtime.Allocator) -> (out: pack
 			for field, j in tag.fields {
 				fields[j] = strings.clone(field, allocator)
 			}
-			tags[i] = pack.Tag{fields = fields}
+			tags[i] = pack.Tag {
+				fields = fields,
+			}
 		}
 		out.tags = tags
 	} else {

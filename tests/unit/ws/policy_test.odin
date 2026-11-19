@@ -141,8 +141,8 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 	}
 	defer {delete(cs.live_subs); delete(cs.neg_subs)}
 	filter: nostr.Filter
-	key := r.fanout.next_key
 	fanout_subscribe(&r.fanout, "s", {filter}, o)
+	key := fanout_shard(&r.fanout, o).by_sub_id[{o, "s"}]
 	cs.live_subs[strings.clone("s")] = {}
 	ev := fixtures.test_make_event(1, 1, 1000, nil)
 	shared := shared_event_new(event_clone(&ev, context.allocator))
