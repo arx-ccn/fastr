@@ -272,3 +272,46 @@ The 100-ID batch gained throughput but its p50 rose versus the old fastr
 build. Magnitude served more inbox pages per second in every pass. Raw
 JSONL, binary hashes, and run commands are in
 `~/.cache/fastr-bench/magnitude-ieI3rD/` (passes 13–15).
+
+### Recipient index and replay buffer (`3037b36750`)
+
+The target was 25% more requests/s than Magnitude on **each** workload.
+None reached it. Five passes per relay used the same build flags, fixture,
+CPU assignments and unchanged `mailbox.ts` as above. The starting
+relay alternated. Rates are medians; the target uses Magnitude's unrounded
+median, rounded up to the next whole request/s.
+
+| Request | fastr requests/s (min–max) | Magnitude requests/s (min–max) | Target | Lead |
+|---|---:|---:|---:|---:|
+| One wrap by ID | 101,914 (84,123–108,007) | 99,412 (84,681–100,760) | 124,266 | 2.5% |
+| 100 wraps by ID | 2,596 (2,158–2,651) | 2,474 (2,400–2,555) | 3,093 | 4.9% |
+| Inbox, limit 500 | 530 (455–551) | 481 (469–496) | 602 | 10.2% |
+
+fastr now finds gift wraps through an in-memory index keyed by recipient.
+Each distinct wrap/recipient pair takes eight bytes of postings, plus map
+and array capacity. Expiry, deletion, protected-event and read-policy
+checks still run before emission. A single-filter replay writes its EVENT
+frames and EOSE into one buffer for the socket writer.
+
+In a separate profiled pass, relay CPU per inbox request fell from 2,650 µs
+on fastr `c04ac088a3` to 788 µs; Magnitude used 325 µs. The original
+client's main thread used about one full core for batch and inbox reads on
+both relays. These are process/thread CPU ticks divided by completed requests
+or wall time, not latency measurements.
+
+To separate client validation from relay capacity, a diagnostic gave each
+of the same eight sockets its own validation thread on CPUs `0–7`. Each
+thread checked the same events; timing started after all eight warmups and
+ended at the last completion. The relay kept its original two physical cores.
+Median requests/s over three passes:
+
+| Request | fastr | Magnitude |
+|---|---:|---:|
+| One wrap by ID | 92,904 | 145,610 |
+| 100 wraps by ID | 5,690 | 5,980 |
+| Inbox, limit 500 | 1,400 | 1,387 |
+
+Magnitude served more single-ID requests with parallel clients. Raw results
+are in the same cache directory, passes 21–25
+(`-parallel` for the three diagnostic passes). `25pct/` holds the commands,
+diagnostic clients and binary hashes.
