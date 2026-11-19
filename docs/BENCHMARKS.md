@@ -401,3 +401,51 @@ Raw results: `~/.cache/fastr-bench/magnitude-ieI3rD/`, passes 75–79 for
 the original client and 75–77 (`-long`) for the eight validators. `ordered/`
 contains the playback patch against `279528a5dd`, its hit counts and raw
 rates, the client and relay hashes, and the import timings.
+
+### Ten percent on each mailbox read
+
+The target here is 1.10 times Magnitude's median on **each** workload, not
+an average of the three gains. Passes 101–109 rotated three binaries through
+the same three run positions. The client, signed fixture, CPU assignments
+and Magnitude build were unchanged. Median validated requests/s:
+
+| Request | Previous fastr (`40cdae5170`) | fastr (`319bd4ffd4`) | Magnitude | Lead |
+|---|---:|---:|---:|---:|
+| One wrap by ID | 102,801 | 109,287 | 100,109 | +9.17% |
+| 100 wraps by ID | 2,787 | 2,857 | 2,459 | +16.16% |
+| Inbox, limit 500 | 572.5 | 569.4 | 497.7 | +14.41% |
+
+The single-ID path now decodes filter hex once, borrows a complete WebSocket
+frame, and reuses the connection's first live subscription. Queries pin one
+generation of the three store mappings. The relay still checks recipients,
+tombstones, expiry and read policy before returning events.
+
+A separate timing probe on the previous build sampled 1,276 single-ID
+requests. Median time from client send to server dispatch was 4.44 µs;
+dispatch through the replay write took 3.61 µs. From dispatch return to
+the first JavaScript message callback took 52.06 µs. That last interval
+includes waiting on the shared client event loop; it is not server CPU time.
+
+With eight independent validators, the three-pass medians for `319bd4ffd4`
+were 231,562 / 11,029 / 2,459 requests/s (single ID / 100 IDs / inbox).
+Magnitude served 271,686 / 9,913 / 2,477. The single-client results do not
+establish a 10% relay-capacity advantage.
+
+Raw JSONL is in `~/.cache/fastr-bench/magnitude-ieI3rD/`; passes 101–103
+with suffix `-long` used independent validators. `socket-replay/` holds
+the client and relay hashes, commands and sampled timestamps.
+
+Passes 111–122 compared the same fastr binary, Magnitude, and a candidate
+that unmasked frames 16 bytes at a time and copied plain JSON fields during
+validation. Each of the six run orders occurred twice. No pass was excluded.
+
+| Request | Retained fastr | Codec candidate | Magnitude | Retained lead |
+|---|---:|---:|---:|---:|
+| One wrap by ID | 103,865 | 101,471 | 97,803 | +6.20% |
+| 100 wraps by ID | 2,715 | 2,751 | 2,422 | +12.08% |
+| Inbox, limit 500 | 551.3 | 550.6 | 483.5 | +14.02% |
+
+We dropped the codec candidate: it traded 2.30% of single-ID throughput
+for 1.34% more batch throughput. On these twelve passes the retained build
+needed 107,584 single-ID requests/s to clear 10%. Neither build met all
+three thresholds.
