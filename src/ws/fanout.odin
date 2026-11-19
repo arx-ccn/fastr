@@ -102,7 +102,7 @@ Outbox :: struct {
 }
 
 @(private)
-outbox_send :: proc(o: ^Outbox, msg: Out_Msg) -> bool {
+outbox_send :: proc(o: ^Outbox, msg: Out_Msg, spare: ^[dynamic]u8 = nil) -> bool {
 	sync.guard(&o.send_mu)
 	if o.failed {
 		return false
@@ -113,7 +113,12 @@ outbox_send :: proc(o: ^Outbox, msg: Out_Msg) -> bool {
 		n, err := linux.send(linux.Fd(o.conn.sock), batch.wire[:], {.DONTWAIT, .NOSIGNAL})
 		if err == .NONE {
 			if int(n) == len(batch.wire) {
-				delete(batch.wire)
+				if spare != nil && cap(batch.wire) <= 256 * 1024 {
+					clear(&batch.wire)
+					spare^ = batch.wire
+				} else {
+					delete(batch.wire)
+				}
 				return true
 			}
 			batch.sent = int(n)
@@ -309,12 +314,14 @@ fanout_subscribe :: proc(hub: ^Fanout, sub_id: string, filters: []nostr.Filter, 
 }
 
 // Remove a single subscription by sub_id + connection identity.
-fanout_unsubscribe :: proc(hub: ^Fanout, sub_id: string, outbox: ^Outbox) {
+fanout_unsubscribe :: proc(hub: ^Fanout, sub_id: string, outbox: ^Outbox) -> bool {
 	f := fanout_shard(hub, outbox)
 	sync.guard(&f.mu)
 	if key, found := f.by_sub_id[Subscription_Key{outbox, sub_id}]; found {
 		remove_sub(f, key)
+		return true
 	}
+	return false
 }
 
 // Remove all subscriptions belonging to a connection (connection closed).

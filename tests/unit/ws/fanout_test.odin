@@ -375,15 +375,8 @@ test_perf_queries :: proc(t: ^testing.T) {
 	o := make_outbox(1, 1)
 	defer outbox_destroy(o)
 	cs := Conn_State {
-		relay     = &r,
-		outbox    = o,
-		live_subs = make(map[string]struct{}),
-	}
-	defer {
-		for key in cs.live_subs {
-			delete(key)
-		}
-		delete(cs.live_subs)
+		relay  = &r,
+		outbox = o,
 	}
 	last_id := make([dynamic]nostr.Hex_Prefix, 1)
 	defer delete(last_id)

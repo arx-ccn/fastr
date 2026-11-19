@@ -112,8 +112,25 @@ decode_frame_header :: proc(buf: []u8) -> (hdr: Frame_Header, err: Error) {
 // apply_mask XORs data in place with the RFC 6455 masking key, where data
 // starts at byte `offset` of the frame payload.
 apply_mask :: proc(data: []u8, mask: [4]u8, offset := u64(0)) {
-	for &b, i in data {
-		b ~= mask[(offset + u64(i)) & 3]
+	copy_masked(data, data, mask, offset)
+}
+
+@(private)
+copy_masked :: proc(dst, src: []u8, mask: [4]u8, offset: u64) {
+	key := [4]u8 {
+		mask[offset & 3],
+		mask[(offset + 1) & 3],
+		mask[(offset + 2) & 3],
+		mask[(offset + 3) & 3],
+	}
+	i := 0
+	for ; i + 4 <= len(src); i += 4 {
+		#unroll for j in 0 ..< 4 {
+			dst[i + j] = src[i + j] ~ key[j]
+		}
+	}
+	for ; i < len(src); i += 1 {
+		dst[i] = src[i] ~ key[i & 3]
 	}
 }
 
@@ -148,7 +165,13 @@ encode_frame_header :: proc(buf: []u8, opcode: Opcode, payload_len: int, fin := 
 // encode_frame_masked writes a complete masked client frame (RFC 6455
 // section 5.3: clients MUST mask every frame). out must have room for
 // len(payload) + MAX_CLIENT_FRAME_HEADER_LEN bytes.
-encode_frame_masked :: proc(out: []u8, opcode: Opcode, payload: []u8, mask: [4]u8, fin := true) -> []u8 {
+encode_frame_masked :: proc(
+	out: []u8,
+	opcode: Opcode,
+	payload: []u8,
+	mask: [4]u8,
+	fin := true,
+) -> []u8 {
 	assert(len(out) >= len(payload) + MAX_CLIENT_FRAME_HEADER_LEN)
 	b0 := u8(opcode)
 	if fin {
@@ -224,11 +247,11 @@ close_code_valid_on_wire :: proc(code: u16) -> bool {
 
 // Event is what reader_feed yields after consuming input.
 Event :: enum {
-	None,    // input consumed, no complete message yet — feed more bytes
+	None, // input consumed, no complete message yet — feed more bytes
 	Message, // reader_message() holds a complete text/binary message
-	Ping,    // reader_control() holds the ping payload; caller queues a pong
-	Pong,    // unsolicited pong; callers ignore it (RFC 6455 section 5.5.3)
-	Close,   // close_code/reader_control() hold the peer's close payload
+	Ping, // reader_control() holds the ping payload; caller queues a pong
+	Pong, // unsolicited pong; callers ignore it (RFC 6455 section 5.5.3)
+	Close, // close_code/reader_control() hold the peer's close payload
 }
 
 // Reader assembles complete messages from possibly-fragmented frames.
@@ -328,9 +351,12 @@ reader_feed :: proc(r: ^Reader, buf: []u8) -> (event: Event, consumed: int, err:
 			}
 		} else if take > 0 {
 			start := len(r.message)
-			resize(&r.message, start + int(take))
-			copy(r.message[start:], chunk)
-			apply_mask(r.message[start:], r.hdr.mask, r.payload_read)
+			non_zero_resize(&r.message, start + int(take))
+			if r.hdr.masked {
+				copy_masked(r.message[start:], chunk, r.hdr.mask, r.payload_read)
+			} else {
+				copy(r.message[start:], chunk)
+			}
 		}
 		pos += int(take)
 		r.payload_read += take
@@ -362,7 +388,7 @@ reader_feed :: proc(r: ^Reader, buf: []u8) -> (event: Event, consumed: int, err:
 				r.in_message = false
 				return .Message, pos, .None
 			}
-			// Non-final fragment: keep assembling.
+		// Non-final fragment: keep assembling.
 		}
 	}
 }

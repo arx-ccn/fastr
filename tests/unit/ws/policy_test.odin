@@ -119,7 +119,7 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 		reason = .Auth_Required,
 	}
 	r := Relay {
-		cfg = {max_subscriptions_per_conn = 10, max_filters_per_req = 10, max_limit = 100},
+		cfg = {max_subscriptions_per_conn = 1, max_filters_per_req = 10, max_limit = 100},
 		hooks = {user = &spy, check_request = spy_request, check_read = reader_is_author},
 	}
 	fanout_init(&r.fanout)
@@ -134,16 +134,15 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 	o := &outbox
 	defer {chan.destroy(o.ch); delete(o.auth_pks)}
 	cs := Conn_State {
-		relay     = &r,
-		outbox    = o,
-		live_subs = make(map[string]struct{}),
-		neg_subs  = make(map[string]^Neg_Session),
+		relay    = &r,
+		outbox   = o,
+		neg_subs = make(map[string]^Neg_Session),
 	}
-	defer {delete(cs.live_subs); delete(cs.neg_subs)}
+	defer delete(cs.neg_subs)
 	filter: nostr.Filter
 	fanout_subscribe(&r.fanout, "s", {filter}, o)
 	key := fanout_shard(&r.fanout, o).by_sub_id[{o, "s"}]
-	cs.live_subs[strings.clone("s")] = {}
+	cs.live_count = 1
 	ev := fixtures.test_make_event(1, 1, 1000, nil)
 	shared := shared_event_new(event_clone(&ev, context.allocator))
 	defer shared_event_release(shared)
@@ -160,8 +159,19 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 	o.auth_pks[shared.ev.pubkey] = {}
 
 	// A denied replacement must invalidate events already queued by the old REQ.
+	remove_live_sub(&cs, "missing")
+	handle_req(&cs, "other", {filter})
+	reply, got := chan.try_recv(o.ch)
+	assert(got)
+	testing.expect_value(
+		t,
+		reply.(Out_Text).json,
+		`["CLOSED","other","restricted: too many subscriptions"]`,
+	)
+	drop_msg(reply)
+	testing.expect(t, live_allowed(&cs, live))
 	handle_req(&cs, "s", {filter})
-	testing.expect(t, "s" not_in cs.live_subs)
+	testing.expect_value(t, cs.live_count, 0)
 	testing.expect(t, !live_allowed(&cs, live))
 	handle_count(&cs, "c", {filter})
 	handle_neg_open(&cs, "n", &filter, nil)

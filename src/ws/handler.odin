@@ -37,12 +37,13 @@ Neg_Session :: struct {
 
 @(private)
 Conn_State :: struct {
-	relay:     ^Relay,
-	conn:      Conn,
-	outbox:    ^Outbox,
-	auth:      Auth_State,
-	live_subs: map[string]struct{}, // heap-owned keys
-	neg_subs:  map[string]^Neg_Session, // heap-owned keys and sessions
+	relay:        ^Relay,
+	conn:         Conn,
+	outbox:       ^Outbox,
+	auth:         Auth_State,
+	live_count:   int, // reader owns admission; the fanout owns subscription IDs
+	replay_spare: [dynamic]u8, // empty unless the reader completed the last write
+	neg_subs:     map[string]^Neg_Session, // heap-owned keys and sessions
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +237,6 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 	cs.outbox.auth_pks = make(map[[32]u8]struct{})
 
 	auth_state_init(&cs.auth)
-	cs.live_subs = make(map[string]struct{})
 	cs.neg_subs = make(map[string]^Neg_Session)
 
 	writer := thread.create_and_start_with_poly_data(cs, writer_loop)
@@ -287,13 +287,10 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 	thread.join(writer)
 	thread.destroy(writer)
 	chan.destroy(cs.outbox.ch)
+	delete(cs.replay_spare)
 	delete(cs.outbox.auth_pks)
 	free(cs.outbox)
 
-	for sub_id in cs.live_subs {
-		delete(sub_id)
-	}
-	delete(cs.live_subs)
 	for sub_id, session in cs.neg_subs {
 		neg_session_destroy(session)
 		delete(sub_id)
@@ -390,10 +387,8 @@ parse_msg :: proc(raw: string, max_filter_values: int) -> (nostr.Client_Msg, str
 
 @(private)
 remove_live_sub :: proc(cs: ^Conn_State, sub_id: string) {
-	if sub_id in cs.live_subs {
-		key, _ := delete_key(&cs.live_subs, sub_id)
-		delete(key)
-		fanout_unsubscribe(&cs.relay.fanout, sub_id, cs.outbox)
+	if cs.live_count > 0 && fanout_unsubscribe(&cs.relay.fanout, sub_id, cs.outbox) {
+		cs.live_count -= 1
 	}
 }
 
@@ -566,7 +561,7 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 	remove_live_sub(cs, sub_id)
 
 	// NIP-77: REQ namespace cap only; replacing an existing sub_id is free.
-	if len(cs.live_subs) >= cfg.max_subscriptions_per_conn && sub_id not_in cs.live_subs {
+	if cs.live_count >= cfg.max_subscriptions_per_conn {
 		send_closed(cs, sub_id, "restricted: too many subscriptions")
 		return
 	}
@@ -594,15 +589,17 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 
 	// #65: register the fanout subscription BEFORE the stored query so events
 	// published during the query queue in the outbox rather than being lost.
-	if sub_id not_in cs.live_subs {
-		cs.live_subs[strings.clone(sub_id)] = {}
-	}
 	fanout_subscribe(&cs.relay.fanout, sub_id, filters, cs.outbox)
+	cs.live_count += 1
 
 	qctx := Req_Query_Ctx {
 		sub_id      = sub_id,
-		wire        = make([dynamic]u8, 0, 1024),
+		wire        = cs.replay_spare,
 		union_query = len(filters) > 1,
+	}
+	cs.replay_spare = nil
+	if qctx.wire == nil {
+		qctx.wire = make([dynamic]u8, 0, 2048)
 	}
 	if qctx.union_query {
 		qctx.hits = make([dynamic]Req_Hit, context.temp_allocator)
@@ -659,7 +656,7 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 	non_zero_resize(&qctx.wire, start + 2)
 	nostr.write_eose_json(&qctx.wire, sub_id)
 	finish_text_frame(&qctx.wire, start, 2)
-	if !outbox_send(cs.outbox, Out_Msg(Out_Batch{wire = qctx.wire})) {
+	if !outbox_send(cs.outbox, Out_Msg(Out_Batch{wire = qctx.wire}), &cs.replay_spare) {
 		delete(qctx.wire)
 	}
 }
