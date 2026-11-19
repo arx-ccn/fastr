@@ -1,9 +1,4 @@
-// Hex encode/decode via LUTs.
 package pack
-
-// Encode LUT: index=byte, value = lo_nibble_char | hi_nibble_char<<8.
-@(private = "file")
-pair_lut: [256]u16
 
 // Decode LUT: 0xFF=invalid, else nibble value.
 @(private = "file")
@@ -11,9 +6,7 @@ decode_lut: [256]u8
 
 @(init, private = "file")
 init_hex_luts :: proc "contextless" () {
-	hex_chars := "0123456789abcdef"
 	for i in 0 ..< 256 {
-		pair_lut[i] = u16(hex_chars[i >> 4]) | (u16(hex_chars[i & 0xF]) << 8)
 		decode_lut[i] = 0xFF
 	}
 	for c := int('0'); c <= int('9'); c += 1 {
@@ -26,10 +19,11 @@ init_hex_luts :: proc "contextless" () {
 
 // Encode `src` as lowercase hex into `dst` (`len(dst) >= len(src)*2`).
 hex_encode :: proc(src: []u8, dst: []u8) {
-	for b, i in src {
-		p := pair_lut[b]
-		dst[i * 2] = u8(p)
-		dst[i * 2 + 1] = u8(p >> 8)
+	assert(len(src) <= len(dst) / 2)
+	#no_bounds_check for b, i in src {
+		hi, lo := b >> 4, b & 15
+		dst[2 * i] = hi + ('0' if hi < 10 else 'a' - 10)
+		dst[2 * i + 1] = lo + ('0' if lo < 10 else 'a' - 10)
 	}
 }
 
@@ -61,12 +55,6 @@ is_hex :: proc(s: []u8) -> bool {
 		}
 	}
 	return true
-}
-
-// Convert a validated lowercase hex ASCII byte to its nibble value.
-// Caller guarantees `b` is in `'0'..='9' | 'a'..='f'`.
-hex_nibble :: proc(b: u8) -> u8 {
-	return decode_lut[b]
 }
 
 // Encode `src` as lowercase hex, appending directly to `buf`.

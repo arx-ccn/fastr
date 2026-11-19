@@ -103,7 +103,14 @@ write_field :: proc(buf: ^[dynamic]u8, s: []u8, compress: bool) -> Error {
 }
 
 @(private)
-read_field :: proc(buf: []u8, pos: ^int, allocator := context.allocator) -> (s: string, err: Error) {
+read_field :: proc(
+	buf: []u8,
+	pos: ^int,
+	allocator := context.allocator,
+) -> (
+	s: string,
+	err: Error,
+) {
 	length, hexed, fc := read_len_flag(buf[pos^:]) or_return
 	pos^ += fc
 	if length < 0 || pos^ + length > len(buf) {
@@ -379,70 +386,7 @@ write_json_str :: proc(s: string, buf: ^[dynamic]u8) {
 			// Array alignment is one byte; never load beyond this string.
 			for len(bytes) - i >= 16 {
 				v := simd.from_array((cast(^[16]u8)&bytes[i])^)
-				control := simd.lanes_lt(
-					v,
-					simd.u8x16 {
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-						0x20,
-					},
-				)
-				quote := simd.lanes_eq(
-					v,
-					simd.u8x16 {
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-						'"',
-					},
-				)
-				slash := simd.lanes_eq(
-					v,
-					simd.u8x16 {
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-						'\\',
-					},
-				)
-				if simd.extract_msbs(control | quote | slash) != {} {
+				if simd.extract_msbs(json_escape_mask(v)) != {} {
 					break
 				}
 				i += 16
@@ -537,6 +481,15 @@ write_json_str_canonical :: proc(s: string, buf: ^[dynamic]u8) {
 	append(buf, '"')
 }
 
+@(private)
+json_escape_mask :: #force_inline proc(v: simd.u8x16) -> simd.u8x16 {
+	return(
+		simd.lanes_lt(v, simd.u8x16(0x20)) |
+		simd.lanes_eq(v, simd.u8x16('"')) |
+		simd.lanes_eq(v, simd.u8x16('\\')) \
+	)
+}
+
 // Read a len_flag-encoded field from `dp[pos^:]` and write it as a JSON
 // string into `buf`. Hex-compressed fields are re-encoded to hex; raw fields
 // are JSON-escaped.
@@ -556,17 +509,29 @@ write_field_as_json :: proc(dp: []u8, pos: ^int, buf: ^[dynamic]u8) -> Error {
 		hex_encode_into(data, buf)
 		append(buf, '"')
 	} else {
-		// Whole ASCII blocks are valid UTF-8. Validate the remaining suffix
-		// normally; the skipped prefix cannot split a multibyte sequence.
+		// A plain ASCII field needs neither UTF-8 decoding nor JSON escapes.
 		ascii := 0
 		when simd.HAS_HARDWARE_SIMD {
 			for len(data) - ascii >= 16 {
 				v := simd.from_array((cast(^[16]u8)&data[ascii])^)
-				if simd.extract_msbs(v) != {} {
+				if simd.extract_msbs(v | json_escape_mask(v)) != {} {
 					break
 				}
 				ascii += 16
 			}
+		}
+		for ascii < len(data) {
+			b := data[ascii]
+			if b >= 0x80 || b < 0x20 || b == '"' || b == '\\' {
+				break
+			}
+			ascii += 1
+		}
+		if ascii == len(data) {
+			append(buf, '"')
+			append(buf, ..data)
+			append(buf, '"')
+			return .None
 		}
 		if !utf8.valid_string(string(data[ascii:])) {
 			return .Invalid

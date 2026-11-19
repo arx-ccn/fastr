@@ -61,7 +61,7 @@ Out_Text :: struct {
 }
 
 Out_Batch :: struct {
-	frames: []string, // ownership transfers to the writer (slice + strings)
+	wire: []u8, // complete frames, owned by the writer after enqueue
 }
 
 Out_Live :: struct {
@@ -93,7 +93,7 @@ Outbox :: struct {
 	ch:       chan.Chan(Out_Msg),
 	conn_id:  u64,
 	auth_mu:  sync.RW_Mutex,
-	auth_pks: map[[32]u8]struct {},
+	auth_pks: map[[32]u8]struct{},
 }
 
 @(private = "file")
@@ -243,13 +243,16 @@ fanout_subscribe :: proc(f: ^Fanout, sub_id: string, filters: []nostr.Filter, ou
 	if key, found := f.by_sub_id[Subscription_Key{outbox, sub_id}]; found {
 		remove_sub(f, key)
 	}
-	insert_sub(f, Subscription {
-		sub_id        = strings.clone(sub_id, f.allocator),
-		filters       = cloned,
-		outbox        = outbox,
-		indexed_kinds = kinds,
-		in_wildcard   = in_wildcard,
-	})
+	insert_sub(
+		f,
+		Subscription {
+			sub_id = strings.clone(sub_id, f.allocator),
+			filters = cloned,
+			outbox = outbox,
+			indexed_kinds = kinds,
+			in_wildcard = in_wildcard,
+		},
+	)
 }
 
 // Remove a single subscription by sub_id + connection identity.
@@ -306,7 +309,11 @@ fanout_broadcast :: proc(f: ^Fanout, shared: ^Shared_Event) {
 				}
 				shared_event_acquire(shared)
 				live := Out_Live {
-					live = Live_Event{key = key, sub_id = strings.clone(sub.sub_id), shared = shared},
+					live = Live_Event {
+						key = key,
+						sub_id = strings.clone(sub.sub_id),
+						shared = shared,
+					},
 				}
 				if !chan.try_send(sub.outbox.ch, Out_Msg(live)) {
 					// Full (slow client) or closed: drop the event.

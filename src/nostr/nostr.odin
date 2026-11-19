@@ -20,31 +20,14 @@ unix_now :: proc() -> i64 {
 	return time.time_to_unix(time.now())
 }
 
-@(private)
-is_lower_hex :: proc(s: string) -> bool {
-	for i in 0 ..< len(s) {
-		switch s[i] {
-		case '0' ..= '9', 'a' ..= 'f':
-		case:
-			return false
-		}
-	}
-	return true
-}
-
 // Decode exactly len(out) bytes from a lowercase hex string of length 2*len(out).
 @(private)
 decode_hex_exact :: proc(s: string, field: string, out: []u8) -> (reason: string, ok: bool) {
 	if len(s) != 2 * len(out) {
 		return fmt.tprintf("invalid: %s wrong length", field), false
 	}
-	if !is_lower_hex(s) {
+	if _, err := pack.hex_decode(transmute([]u8)s, out); err != .None {
 		return fmt.tprintf("invalid: %s not lowercase hex", field), false
-	}
-	for i in 0 ..< len(out) {
-		hi := pack.hex_nibble(s[2 * i])
-		lo := pack.hex_nibble(s[2 * i + 1])
-		out[i] = (hi << 4) | lo
 	}
 	return "", true
 }
@@ -63,15 +46,11 @@ decode_hex_prefix :: proc(s: string, field: string) -> (p: Hex_Prefix, reason: s
 	if len(s) % 2 != 0 {
 		return p, fmt.tprintf("invalid: %s odd-length hex prefix", field), false
 	}
-	if !is_lower_hex(s) {
+	n, err := pack.hex_decode(transmute([]u8)s, p.bytes[:])
+	if err != .None {
 		return p, fmt.tprintf("invalid: %s not lowercase hex", field), false
 	}
-	for i in 0 ..< len(s) / 2 {
-		hi := pack.hex_nibble(s[2 * i])
-		lo := pack.hex_nibble(s[2 * i + 1])
-		p.bytes[i] = (hi << 4) | lo
-	}
-	p.length = len(s) / 2
+	p.length = n
 	return p, "", true
 }
 

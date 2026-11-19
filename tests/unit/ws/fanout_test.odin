@@ -2,13 +2,13 @@ package ws
 
 import "../../tests/fixtures"
 
-import "core:strings"
+import "../store"
 import "core:fmt"
 import "core:os"
-import "core:time"
-import "../store"
+import "core:strings"
 import "core:sync/chan"
 import "core:testing"
+import "core:time"
 
 import "../nostr"
 import "../pack"
@@ -32,7 +32,7 @@ make_outbox :: proc(id: u64, cap: int) -> ^Outbox {
 	assert(err == nil)
 	o.ch = c
 	o.conn_id = id
-	o.auth_pks = make(map[[32]u8]struct {})
+	o.auth_pks = make(map[[32]u8]struct{})
 	return o
 }
 
@@ -86,7 +86,7 @@ test_broadcast_two_subscribers_receive :: proc(t: ^testing.T) {
 	defer fanout_destroy(&f)
 	o1 := make_outbox(1, 8)
 	o2 := make_outbox(2, 8)
-	defer {outbox_destroy(o1);outbox_destroy(o2)}
+	defer {outbox_destroy(o1); outbox_destroy(o2)}
 
 	any1: nostr.Filter
 	any2: nostr.Filter
@@ -138,7 +138,7 @@ test_full_channel_does_not_block :: proc(t: ^testing.T) {
 	defer fanout_destroy(&f)
 	o1 := make_outbox(1, 1)
 	o2 := make_outbox(2, 8)
-	defer {outbox_destroy(o1);outbox_destroy(o2)}
+	defer {outbox_destroy(o1); outbox_destroy(o2)}
 
 	any1: nostr.Filter
 	any2: nostr.Filter
@@ -268,6 +268,29 @@ perf_emit :: proc(user: rawptr, dp: []u8) -> store.Error {
 	return .None
 }
 
+@(private = "file")
+replay_checksum :: proc(batch: Out_Batch, events: int) -> u64 {
+	checksum: u64
+	wire := batch.wire
+	for i in 0 ..< events + 1 {
+		h, err := decode_frame_header(wire)
+		assert(err == .None && h.fin && !h.masked && h.opcode == .Text)
+		end := h.header_len + int(h.payload_len)
+		payload := wire[h.header_len:end]
+		if i == events {
+			assert(string(payload) == "[\"EOSE\",\"perf\"]")
+		} else {
+			assert(strings.has_prefix(string(payload), "[\"EVENT\",\"perf\","))
+		}
+		for b in payload {
+			checksum = checksum * 31 + u64(b)
+		}
+		wire = wire[end:]
+	}
+	assert(len(wire) == 0)
+	return checksum
+}
+
 @(test)
 test_perf_queries :: proc(t: ^testing.T) {
 	dir, dir_err := os.make_directory_temp("", "fastr_perf_*", context.allocator)
@@ -296,7 +319,10 @@ test_perf_queries :: proc(t: ^testing.T) {
 		for i in 0 ..< n {
 			append(&selected, ids[i * 3])
 		}
-		filter := nostr.Filter{ids = selected, limit = n}
+		filter := nostr.Filter {
+			ids   = selected,
+			limit = n,
+		}
 		ref: u64
 		assert(store.query_authed(s, &filter, nil, &ref, perf_emit) == .None)
 		free_all(context.temp_allocator)
@@ -307,11 +333,18 @@ test_perf_queries :: proc(t: ^testing.T) {
 			assert(checksum == ref)
 			free_all(context.temp_allocator)
 		}
-		fmt.printfln("PERF ids-%d %.1f ns/op checksum=%d", n, f64(time.tick_since(start)) / PERF_ITERS, ref)
+		fmt.printfln(
+			"PERF ids-%d %.1f ns/op checksum=%d",
+			n,
+			f64(time.tick_since(start)) / PERF_ITERS,
+			ref,
+		)
 		delete(selected)
 	}
 	for n in ([]int{1, 100, 500}) {
-		filter := nostr.Filter{limit = n}
+		filter := nostr.Filter {
+			limit = n,
+		}
 		ref: u64
 		assert(store.query_authed(s, &filter, nil, &ref, perf_emit) == .None)
 		free_all(context.temp_allocator)
@@ -322,22 +355,39 @@ test_perf_queries :: proc(t: ^testing.T) {
 			assert(checksum == ref)
 			free_all(context.temp_allocator)
 		}
-		fmt.printfln("PERF scan-%d %.1f ns/op checksum=%d", n, f64(time.tick_since(start)) / PERF_ITERS, ref)
+		fmt.printfln(
+			"PERF scan-%d %.1f ns/op checksum=%d",
+			n,
+			f64(time.tick_since(start)) / PERF_ITERS,
+			ref,
+		)
 	}
-	r := Relay{store = s, cfg = {max_subscriptions_per_conn = 20, max_filters_per_req = 10, max_limit = 500}}
+	r := Relay {
+		store = s,
+		cfg = {max_subscriptions_per_conn = 20, max_filters_per_req = 10, max_limit = 500},
+	}
 	fanout_init(&r.fanout)
 	defer fanout_destroy(&r.fanout)
 	o := make_outbox(1, 1)
 	defer outbox_destroy(o)
-	cs := Conn_State{relay = &r, outbox = o, live_subs = make(map[string]struct {})}
+	cs := Conn_State {
+		relay     = &r,
+		outbox    = o,
+		live_subs = make(map[string]struct{}),
+	}
 	defer {
 		for key in cs.live_subs {
 			delete(key)
 		}
 		delete(cs.live_subs)
 	}
+	last_id := make([dynamic]nostr.Hex_Prefix, 1)
+	defer delete(last_id)
+	last_id[0] = ids[len(ids) - 1]
 	for n in ([]int{1, 100, 500}) {
-		filter := nostr.Filter{limit = n}
+		filter := nostr.Filter {
+			limit = n,
+		}
 		ref: u64
 		elapsed: time.Duration
 		for iteration in 0 ..< PERF_ITERS + 1 {
@@ -347,13 +397,8 @@ test_perf_queries :: proc(t: ^testing.T) {
 			assert(ok)
 			elapsed += time.tick_since(start)
 			batch, is_batch := msg.(Out_Batch)
-			assert(is_batch && len(batch.frames) == n + 1)
-			checksum: u64
-			for frame in batch.frames {
-				for b in transmute([]u8)frame {
-					checksum = checksum * 31 + u64(b)
-				}
-			}
+			assert(is_batch)
+			checksum := replay_checksum(batch, n)
 			if iteration == 0 {
 				ref = checksum
 				elapsed = 0
@@ -376,21 +421,23 @@ test_perf_queries :: proc(t: ^testing.T) {
 		empty := nostr.Filter {
 			limit = 0,
 		}
-		for filters in ([3][]nostr.Filter{{filter, filter}, {empty, filter, filter}, {filter, empty, filter}}) {
+		first := filter
+		if n > 1 {
+			// The last ID in the newest timestamp tie must move after its peers.
+			first = {
+				ids   = last_id,
+				limit = 1,
+			}
+		}
+		for filters in ([4][]nostr.Filter{{filter, filter}, {empty, filter, filter}, {filter, empty, filter}, {first, filter}}) {
 			handle_req(&cs, "perf", filters)
 			// The second batch must be freed when the outbox is already full.
 			handle_req(&cs, "perf", filters)
 			msg, ok := chan.try_recv(o.ch)
 			assert(ok)
 			batch, is_batch := msg.(Out_Batch)
-			assert(is_batch && len(batch.frames) == n + 1)
-			checksum: u64
-			for frame in batch.frames {
-				for b in transmute([]u8)frame {
-					checksum = checksum * 31 + u64(b)
-				}
-			}
-			assert(checksum == ref)
+			assert(is_batch)
+			assert(replay_checksum(batch, n) == ref)
 			drop_msg(msg)
 			free_all(context.temp_allocator)
 		}

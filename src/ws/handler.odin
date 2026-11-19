@@ -105,10 +105,7 @@ drop_msg :: proc(msg: Out_Msg) {
 	case Out_Text:
 		delete(m.json)
 	case Out_Batch:
-		for frame in m.frames {
-			delete(frame)
-		}
-		delete(m.frames)
+		delete(m.wire)
 	case Out_Live:
 		delete(m.live.sub_id)
 		shared_event_release(m.live.shared)
@@ -139,25 +136,8 @@ writer_loop :: proc(cs: ^Conn_State) {
 			}
 			delete(m.json)
 		case Out_Batch:
-			// One TCP send for N frames: REQ stored events + EOSE.
-			total := 0
-			for frame in m.frames {
-				total += len(frame) + MAX_FRAME_HEADER_LEN
-			}
-			buf := make([]u8, total, context.temp_allocator)
-			off := 0
-			for frame in m.frames {
-				encoded := encode_frame(buf[off:], .Text, transmute([]u8)frame)
-				off += len(encoded)
-			}
-			if _, err := net.send_tcp(cs.conn.sock, buf[:off]); err != nil {
-				dead = true
-			}
-			for frame in m.frames {
-				delete(frame)
-			}
-			delete(m.frames)
-			free_all(context.temp_allocator)
+			dead = send_all(cs.conn.sock, m.wire) != .None
+			delete(m.wire)
 		case Out_Live:
 			ev := &m.live.shared.ev
 			if live_allowed(cs, m.live) {
@@ -471,14 +451,33 @@ handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 Req_Hit :: struct {
 	created_at: i64,
 	id:         [32]u8,
-	json:       string, // heap-owned
+	start:      int,
+	end:        int,
 }
 
 @(private)
 Req_Query_Ctx :: struct {
-	sub_id: string,
-	hits:   ^[dynamic]Req_Hit,
-	seen:   ^map[[32]u8]struct{},
+	sub_id:      string,
+	wire:        [dynamic]u8,
+	union_query: bool,
+	hits:        [dynamic]Req_Hit,
+	seen:        ^map[[32]u8]struct{},
+}
+
+// Fill the header after serialization reveals the payload length. Only a
+// payload outgrowing its reserved header needs to move.
+@(private)
+finish_text_frame :: proc(buf: ^[dynamic]u8, start, reserved: int) {
+	hdr: [MAX_FRAME_HEADER_LEN]u8 = ---
+	payload_start := start + reserved
+	payload_end := len(buf^)
+	n := encode_frame_header(hdr[:], .Text, payload_end - payload_start)
+	assert(n >= reserved)
+	if n > reserved {
+		non_zero_resize(buf, payload_end + n - reserved)
+		copy(buf^[start + n:], buf^[payload_start:payload_end])
+	}
+	copy(buf^[start:start + n], hdr[:n])
 }
 
 @(private)
@@ -487,22 +486,34 @@ req_emit :: proc(user: rawptr, dp: []u8) -> store.Error {
 	if len(dp) < 136 {
 		return .Pack_Invalid
 	}
-	id: [32]u8
-	copy(id[:], dp[:32])
-	if ctx.seen != nil {
-		if id in ctx.seen^ {
-			// Already emitted by a previous filter — NIP-01 OR semantics.
-			return .None
+	id: [32]u8 = ---
+	if ctx.union_query {
+		copy(id[:], dp[:32])
+		if ctx.seen != nil {
+			if id in ctx.seen^ {
+				return .None
+			}
+			ctx.seen^[id] = {}
 		}
-		ctx.seen^[id] = {}
 	}
-	created_at := i64(endian.unchecked_get_u64le(dp[128:136]))
-	buf := make([dynamic]u8, 0, max(1024, len(dp) + len(ctx.sub_id) + 512))
-	if err := pack.transcode_to_event_json(dp, ctx.sub_id, &buf); err != .None {
-		delete(buf)
+	// The event's hex id, pubkey, and signature alone exceed 125 bytes.
+	start := len(ctx.wire)
+	non_zero_resize(&ctx.wire, start + 4)
+	if err := pack.transcode_to_event_json(dp, ctx.sub_id, &ctx.wire); err != .None {
 		return .Pack_Invalid
 	}
-	append(ctx.hits, Req_Hit{created_at = created_at, id = id, json = string(buf[:])})
+	finish_text_frame(&ctx.wire, start, 4)
+	if ctx.union_query {
+		append(
+			&ctx.hits,
+			Req_Hit {
+				created_at = i64(endian.unchecked_get_u64le(dp[128:136])),
+				id = id,
+				start = start,
+				end = len(ctx.wire),
+			},
+		)
+	}
 	return .None
 }
 
@@ -582,17 +593,20 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 	}
 	fanout_subscribe(&cs.relay.fanout, sub_id, filters, cs.outbox)
 
-	hits := make([dynamic]Req_Hit)
-	seen: map[[32]u8]struct{}
 	qctx := Req_Query_Ctx {
-		sub_id = sub_id,
-		hits   = &hits,
+		sub_id      = sub_id,
+		wire        = make([dynamic]u8, 0, 1024),
+		union_query = len(filters) > 1,
 	}
+	if qctx.union_query {
+		qctx.hits = make([dynamic]Req_Hit, context.temp_allocator)
+	}
+	seen: map[[32]u8]struct{}
 	for &filter, i in filters {
 		if i == 1 {
 			// Seed the union from the already-unique first query.
-			seen = make(map[[32]u8]struct{}, len(hits), context.temp_allocator)
-			for hit in hits {
+			seen = make(map[[32]u8]struct{}, len(qctx.hits), context.temp_allocator)
+			for hit in qctx.hits {
 				seen[hit.id] = {}
 			}
 			qctx.seen = &seen
@@ -607,18 +621,15 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 		); err != .None {
 			// #73: roll back and tell the client instead of a lying EOSE.
 			remove_live_sub(cs, sub_id)
-			for hit in hits {
-				delete(hit.json)
-			}
-			delete(hits)
+			delete(qctx.wire)
 			send_closed(cs, sub_id, "error: internal store error")
 			return
 		}
 	}
 
 	// Each filter is already ordered; only a multi-filter union needs sorting.
-	if len(filters) > 1 {
-		slice.sort_by(hits[:], proc(a, b: Req_Hit) -> bool {
+	if len(qctx.hits) > 1 {
+		slice.sort_by(qctx.hits[:], proc(a, b: Req_Hit) -> bool {
 			if a.created_at != b.created_at {
 				return a.created_at > b.created_at
 			}
@@ -629,22 +640,21 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 			}
 			return false
 		})
+		ordered := make([dynamic]u8, 0, len(qctx.wire) + 64)
+		for hit in qctx.hits {
+			append(&ordered, ..qctx.wire[hit.start:hit.end])
+		}
+		delete(qctx.wire)
+		qctx.wire = ordered
 	}
 
 	// One channel send for all stored events + EOSE.
-	batch := make([]string, len(hits) + 1)
-	for hit, i in hits {
-		batch[i] = hit.json
-	}
-	eose := make([dynamic]u8, 0, 64)
-	nostr.write_eose_json(&eose, sub_id)
-	batch[len(hits)] = string(eose[:])
-	delete(hits)
-	if !chan.try_send(cs.outbox.ch, Out_Msg(Out_Batch{frames = batch})) {
-		for frame in batch {
-			delete(frame)
-		}
-		delete(batch)
+	start := len(qctx.wire)
+	non_zero_resize(&qctx.wire, start + 2)
+	nostr.write_eose_json(&qctx.wire, sub_id)
+	finish_text_frame(&qctx.wire, start, 2)
+	if !chan.try_send(cs.outbox.ch, Out_Msg(Out_Batch{wire = qctx.wire[:]})) {
+		delete(qctx.wire)
 	}
 }
 

@@ -451,6 +451,29 @@ test_encode_header_length_forms :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_finish_text_frame :: proc(t: ^testing.T) {
+	for tc in ([4][2]int{{125, 2}, {126, 2}, {65535, 4}, {65536, 4}}) {
+		size, reserved := tc[0], tc[1]
+		prefix := []u8{0x81, 1, 'x'}
+		start := len(prefix)
+		buf := make([dynamic]u8, start + reserved + size)
+		defer delete(buf)
+		copy(buf[:], prefix)
+		payload := make([]u8, size)
+		defer delete(payload)
+		for &b, i in payload {
+			b = u8(i)
+		}
+		copy(buf[start + reserved:], payload)
+		finish_text_frame(&buf, start, reserved)
+		expected := make([]u8, size + MAX_FRAME_HEADER_LEN)
+		defer delete(expected)
+		testing.expect(t, slice.equal(buf[:start], prefix))
+		testing.expect(t, slice.equal(buf[start:], encode_frame(expected, .Text, payload)))
+	}
+}
+
+@(test)
 test_encode_close_frame :: proc(t: ^testing.T) {
 	buf: [MAX_FRAME_HEADER_LEN + 2 + MAX_CONTROL_PAYLOAD]u8
 	frame := encode_close(buf[:], CLOSE_TOO_LARGE, "too big")
