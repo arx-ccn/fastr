@@ -59,7 +59,25 @@ hex_decode :: proc(src: []u8, dst: []u8) -> (n: int, err: Error) {
 		return 0, .Invalid_Hex
 	}
 	count := len(src) / 2
-	for i in 0 ..< count {
+	assert(count <= len(dst))
+	i := 0
+	when simd.HAS_HARDWARE_SIMD {
+		for ; count - i >= 8; i += 8 {
+			v := simd.from_array((cast(^[16]u8)&src[2 * i])^)
+			digit := v - simd.u8x16('0')
+			letter := v - simd.u8x16('a')
+			digits := simd.lanes_lt(digit, simd.u8x16(10))
+			letters := simd.lanes_lt(letter, simd.u8x16(6))
+			if simd.extract_msbs(~(digits | letters)) != {} {
+				return 0, .Invalid_Hex
+			}
+			nibbles := (digit & digits) | ((letter + simd.u8x16(10)) & letters)
+			hi := simd.shuffle(nibbles, nibbles, 0, 2, 4, 6, 8, 10, 12, 14)
+			lo := simd.shuffle(nibbles, nibbles, 1, 3, 5, 7, 9, 11, 13, 15)
+			(cast(^[8]u8)&dst[i])^ = transmute([8]u8)(hi * 16 | lo)
+		}
+	}
+	for ; i < count; i += 1 {
 		hi := decode_lut[src[i * 2]]
 		lo := decode_lut[src[i * 2 + 1]]
 		if hi == 0xFF || lo == 0xFF {

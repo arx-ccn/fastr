@@ -78,7 +78,15 @@ wire_filter_list :: proc(
 	for {
 		if len(values) == max_values {return}
 		when T == Hex_Prefix {
-			text := wire_plain_string(s) or_return
+			if !wire_take(s, '"') {return}
+			// Decoding validates every byte, including escapes and control bytes.
+			end := min(len(s^), 64)
+			if end == len(s^) || s^[end] != '"' {
+				end = strings.index_byte(s^[:end], '"')
+				if end < 0 {return}
+			}
+			text := s^[:end]
+			s^ = s^[end + 1:]
 			prefix, _, valid := decode_hex_prefix(text, "hex prefix")
 			if !valid {return}
 			append(&values, prefix)
