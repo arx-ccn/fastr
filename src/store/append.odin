@@ -533,6 +533,7 @@ append_classified :: proc(
 		} else {
 			s.mailbox.entries = -1
 		}
+		publish_query_maps(s)
 		mapped_file_publish_len(&s.data, w.data.offset)
 		mapped_file_publish_len(&s.tags, w.tags.offset)
 		mapped_file_publish_len(&s.dtags, w.dtags.offset)

@@ -79,6 +79,7 @@ Store :: struct {
 	known_ids:              map[[32]u8]Event_Slot,
 	// known_ids_mu also protects mailbox postings and REQ snapshot publication.
 	mailbox:                Mailbox_Index,
+	query_maps:             ^Query_Maps,
 	// Query early-exit: scan_ceiling[i] is the maximum created_at over index
 	// entries [0..=i] (monotone in i). Scanning newest-slot-first, once the
 	// result heap is full and scan_ceiling[i] is strictly below the worst
@@ -372,6 +373,7 @@ store_open :: proc(dir: string, allocator := context.allocator) -> (s: ^Store, e
 		store_close(s)
 		return nil, berr
 	}
+	publish_query_maps(s)
 	return s, .None
 }
 
@@ -397,6 +399,7 @@ store_close :: proc(s: ^Store) {
 	if s.vanish_file != nil {
 		os.close(s.vanish_file)
 	}
+	query_maps_release(s, s.query_maps)
 	mapped_file_destroy(&s.data)
 	mapped_file_destroy(&s.index)
 	mapped_file_destroy(&s.tags)

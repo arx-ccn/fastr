@@ -308,7 +308,8 @@ query_authed :: proc(
 
 	// Pin the mappings and mailbox runs under the publication lock. No
 	// pointers into the lookup maps escape the lock.
-	idx_g, data_g, tags_g: Slice_Guard
+	maps: ^Query_Maps
+	idx, data, tags_buf: []u8
 	local_id: [1]Event_Slot
 	cand: []Event_Slot
 	local_run: [1]Mailbox_Cursor
@@ -317,14 +318,12 @@ query_authed :: proc(
 	mailbox_steps := 0
 	use_mailbox: bool
 	indexed_tags: bool
+	total: int
 	{
 		sync.shared_guard(&s.known_ids_mu)
-		idx_g = mapped_file_slice(&s.index)
-		data_g = mapped_file_slice(&s.data)
-		tags_g = mapped_file_slice(&s.tags)
-		idx := idx_g.data
-		total := index_entry_count(idx)
-		indexed_tags = total == s.mailbox.entries && len(tags_g.data) == s.mailbox.tag_bytes
+		maps = s.query_maps
+		idx = query_map_slice(maps.index, &s.index)
+		total = index_entry_count(idx)
 		if use_ids {
 			cand = local_id[:]
 			if len(fids) > len(cand) do cand = make([]Event_Slot, len(fids), context.temp_allocator)
@@ -344,7 +343,11 @@ query_authed :: proc(
 				n += 1
 			}
 			cand = cand[:n]
+			if use_ids && n == 0 do return .None
 		}
+		data = query_map_slice(maps.data, &s.data)
+		tags_buf = query_map_slice(maps.tags, &s.tags)
+		indexed_tags = total == s.mailbox.entries && len(tags_buf) == s.mailbox.tag_bytes
 		if !use_ids && inbox && indexed_tags {
 			use_mailbox = true
 			for &pk in auth_pks {
@@ -364,14 +367,10 @@ query_authed :: proc(
 				}
 			}
 		}
+		sync.atomic_add(&maps.refs, 1)
 	}
-	defer slice_release(idx_g)
-	defer slice_release(data_g)
-	defer slice_release(tags_g)
+	defer query_maps_release(s, maps)
 	defer for &c in cursors do mailbox_release(c.run)
-	idx := idx_g.data
-	data := data_g.data
-	total := index_entry_count(idx)
 	steps := total
 	use_slots := use_ids || use_mailbox
 	ordered := use_mailbox || use_ids && indexed_tags
@@ -395,13 +394,13 @@ query_authed :: proc(
 			}
 		}
 	} else if len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
-		recipient_offsets = p_tag_offsets_union(tags_g.data, auth_pks)
+		recipient_offsets = p_tag_offsets_union(tags_buf, auth_pks)
 	}
 
 	// Tag records follow increasing data offsets, including after compaction.
 	// Ordered reads reset the cursor from each candidate's stored tag_end.
 	specs := build_tag_specs(filter)
-	tag_end := len(tags_g.data) / TAG_ENTRY_SIZE
+	tag_end := len(tags_buf) / TAG_ENTRY_SIZE
 	walk: Tag_Walk = .Sparse if use_ids && !indexed_tags else .Sequential
 
 	now := unix_now()
@@ -534,7 +533,7 @@ query_authed :: proc(
 		//    ID slots still need that check, independently of requested tags.
 		check_recipient := wrap && use_ids
 		if check_recipient || len(specs) > 0 {
-			tags := candidate_tags(tags_g.data, &tag_end, offset, walk)
+			tags := candidate_tags(tags_buf, &tag_end, offset, walk)
 			if (check_recipient && !has_recipient(tags, auth_pks)) ||
 			   !event_tags_match_specs(tags, specs) {
 				continue
