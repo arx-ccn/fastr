@@ -449,3 +449,34 @@ We dropped the codec candidate: it traded 2.30% of single-ID throughput
 for 1.34% more batch throughput. On these twelve passes the retained build
 needed 107,584 single-ID requests/s to clear 10%. Neither build met all
 three thresholds.
+
+### Recipient tag scans (`3ce4eea0b2`)
+
+An inbox query can skip its `#p` check when the filter accepts every
+authenticated recipient used to select the mailbox runs. Other tag filters
+still apply. An exact-ID read checks the event's own tags; a matching tag
+on the preceding event does not grant access.
+
+Four alternating passes with eight independent validators (141–144, `-long`)
+put inbox CPU at 265.6 µs per page, down from 296.3 on `319bd4ffd4`.
+Median inbox throughput went from 2,556 to 2,602 pages/s. A separate size
+hint for the replay buffer raised CPU from 227.5 to 243.1 µs per page in
+passes 131–134; we dropped it.
+
+On the unchanged single-client benchmark, passes 141–149 put `3ce4eea0b2`
+ahead of Magnitude by 6.68% (one ID), 8.87% (100 IDs) and 10.74% (inbox).
+Only the inbox met the target in this cohort.
+
+Passes 151–158 also included the intermediate build (`319bd4ffd4`), with
+each of the four binaries in each position twice. Across all 17 runs of
+the final build (141–149 and 151–158), median validated requests/s were:
+
+| Request | Starting fastr | Final fastr | Magnitude | Lead | Runs ≥10% ahead |
+|---|---:|---:|---:|---:|---:|
+| One wrap by ID | 107,991 | 108,347 | 101,678 | +6.56% | 3/17 |
+| 100 wraps by ID | 2,850 | 2,813 | 2,523 | +11.46% | 10/17 |
+| Inbox, limit 500 | 571.4 | 569.5 | 495.6 | +14.91% | 14/17 |
+
+Only one run cleared all three cutoffs together. Against starting fastr,
+the final medians changed +0.33%, −1.30% and −0.34% respectively. The
+inbox CPU saving did not establish a throughput improvement on all three.
