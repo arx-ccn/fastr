@@ -125,14 +125,13 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 	fanout_init(&r.fanout)
 	defer fanout_destroy(&r.fanout)
 	outbox := Outbox {
-		conn_id  = 1,
-		auth_pks = make(map[[32]u8]struct{}),
+		conn_id = 1,
 	}
 	ch, cerr := chan.create(chan.Chan(Out_Msg), 16, context.allocator)
 	assert(cerr == nil)
 	outbox.ch = ch
 	o := &outbox
-	defer {chan.destroy(o.ch); delete(o.auth_pks)}
+	defer chan.destroy(o.ch)
 	cs := Conn_State {
 		relay    = &r,
 		outbox   = o,
@@ -141,22 +140,23 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 	defer delete(cs.neg_subs)
 	filter: nostr.Filter
 	fanout_subscribe(&r.fanout, "s", {filter}, o)
-	key := fanout_shard(&r.fanout, o).by_sub_id[{o, "s"}]
 	cs.live_count = 1
 	ev := fixtures.test_make_event(1, 1, 1000, nil)
 	shared := shared_event_new(event_clone(&ev, context.allocator))
 	defer shared_event_release(shared)
-	live := Live_Event {
-		key    = key,
-		sub_id = "s",
-		shared = shared,
-	}
+	fanout_broadcast(&r.fanout, shared)
+	msg, queued := chan.try_recv(o.ch)
+	assert(queued)
+	defer drop_msg(msg)
+	live := msg.(Out_Live).live
 	testing.expect(t, !live_allowed(&cs, live), "anonymous reader must be hidden")
-	o.auth_pks[shared.ev.pubkey] = {}
+	assert(auth_record(&cs.auth, shared.ev.pubkey))
 	testing.expect(t, live_allowed(&cs, live), "current auth must be used")
-	delete_key(&o.auth_pks, shared.ev.pubkey)
-	testing.expect(t, !live_allowed(&cs, live))
-	o.auth_pks[shared.ev.pubkey] = {}
+	// A policy snapshot cannot overwrite the connection's authenticated key.
+	keys: [MAX_AUTH_PUBKEYS][32]u8
+	view := auth_snapshot(&cs.auth, &keys)
+	view[0] = {}
+	testing.expect(t, live_allowed(&cs, live))
 
 	// A denied replacement must invalidate events already queued by the old REQ.
 	remove_live_sub(&cs, "missing")
@@ -328,6 +328,22 @@ test_marked_vanished_ingress :: proc(t: ^testing.T) {
 		testing.expect_value(t, reason, "blocked: test policy")
 		testing.expect_value(t, spy.writes[source], 1)
 	}
+}
+
+@(test)
+test_auth_capacity_and_reuse :: proc(t: ^testing.T) {
+	a: Auth_State
+	auth_state_init(&a)
+	for i in 0 ..< MAX_AUTH_PUBKEYS {
+		testing.expect(t, auth_record(&a, [32]u8{0 = u8(i)}))
+	}
+	testing.expect(t, auth_record(&a, {}))
+	testing.expect(t, !auth_record(&a, [32]u8{0 = 255}))
+	auth_state_destroy(&a)
+	auth_state_init(&a)
+	defer auth_state_destroy(&a)
+	keys: [MAX_AUTH_PUBKEYS][32]u8
+	testing.expect_value(t, len(auth_snapshot(&a, &keys)), 0)
 }
 
 @(test)

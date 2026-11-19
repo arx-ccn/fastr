@@ -36,7 +36,6 @@ make_outbox :: proc(id: u64, cap: int) -> ^Outbox {
 	assert(err == nil)
 	o.ch = c
 	o.conn_id = id
-	o.auth_pks = make(map[[32]u8]struct{})
 	return o
 }
 
@@ -51,7 +50,6 @@ outbox_destroy :: proc(o: ^Outbox) {
 		drop_out_msg(msg)
 	}
 	chan.destroy(o.ch)
-	delete(o.auth_pks)
 	free(o)
 }
 
@@ -218,6 +216,76 @@ test_subscribe_replace_no_double_delivery :: proc(t: ^testing.T) {
 	testing.expect(t, !recv_one(o), "replaced sub must not double-deliver")
 
 	fanout_unsubscribe_all(&f, o)
+}
+
+@(test)
+test_exact_id_subscription_reuse :: proc(t: ^testing.T) {
+	r: Relay
+	fanout_init(&r.fanout)
+	defer fanout_destroy(&r.fanout)
+	o := make_outbox(1, 8)
+	defer outbox_destroy(o)
+	defer fanout_unsubscribe_all(&r.fanout, o)
+	other := make_outbox(o.conn_id + u64(len(r.fanout.shards)), 8)
+	defer outbox_destroy(other)
+	defer fanout_unsubscribe_all(&r.fanout, other)
+	cs := Conn_State {
+		relay  = &r,
+		outbox = o,
+	}
+
+	a := make_shared(1)
+	defer shared_event_release(a)
+	b := make_shared(2)
+	defer shared_event_release(b)
+	b.ev.id[31] = 2
+	ids := make([dynamic]nostr.Hex_Prefix, 1, context.temp_allocator)
+	ids[0] = {
+		bytes  = a.ev.id,
+		length = 32,
+	}
+	filter := nostr.Filter {
+		ids = ids,
+	}
+	fanout_subscribe(&r.fanout, "s", {filter}, o)
+	ids[0].bytes = b.ev.id
+	fanout_subscribe(&r.fanout, "s", {filter}, other)
+
+	fanout_broadcast(&r.fanout, b)
+	testing.expect(t, !recv_one(o), "subscription must own its ID filter")
+	testing.expect(t, recv_one(other), "another connection can use the same subscription ID")
+	fanout_broadcast(&r.fanout, a)
+	old, got_old := chan.try_recv(o.ch)
+	assert(got_old)
+	defer drop_out_msg(old)
+	testing.expect(t, live_allowed(&cs, old.(Out_Live).live))
+
+	fanout_subscribe(&r.fanout, "s", {filter}, o)
+	testing.expect(
+		t,
+		!live_allowed(&cs, old.(Out_Live).live),
+		"replacement must invalidate the queued event",
+	)
+	fanout_broadcast(&r.fanout, a)
+	testing.expect(t, !recv_one(o), "old filter must not match")
+	fanout_broadcast(&r.fanout, b)
+	current, got_current := chan.try_recv(o.ch)
+	assert(got_current)
+	defer drop_out_msg(current)
+	testing.expect(t, live_allowed(&cs, current.(Out_Live).live))
+	testing.expect(t, recv_one(other))
+	testing.expect(t, !recv_one(other), "other connection must receive only the matching event")
+
+	testing.expect(t, fanout_unsubscribe(&r.fanout, "s", o))
+	fanout_broadcast(&r.fanout, b)
+	testing.expect(t, !recv_one(o), "CLOSE must stop live routing")
+	testing.expect(t, recv_one(other), "CLOSE must not affect another connection")
+	fanout_subscribe(&r.fanout, "s", {filter}, o)
+	testing.expect(
+		t,
+		!live_allowed(&cs, current.(Out_Live).live),
+		"reusing the ID must not revive the closed generation",
+	)
 }
 
 // Default to a correctness check; raise iterations for release benchmarks.

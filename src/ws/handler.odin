@@ -174,23 +174,16 @@ live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
 	{
 		f := fanout_shard(&cs.relay.fanout, cs.outbox)
 		sync.shared_guard(&f.mu)
-		if sub, found := f.subs[live.key]; !found || sub.outbox != cs.outbox {
+		if sub := find_sub(f, cs.outbox, live.sub_id); sub == nil || sub.key != live.key {
 			return false
 		}
 	}
-	auth: [MAX_AUTH_PUBKEYS][32]u8
-	n := 0
-	{
-		sync.shared_guard(&cs.outbox.auth_mu)
-		for pk in cs.outbox.auth_pks {
-			auth[n] = pk
-			n += 1
-		}
-	}
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
+	auth := auth_snapshot(&cs.auth, &keys)
 	ev := &live.shared.ev
 	if ev.kind == nostr.KIND_GIFT_WRAP {
 		matched := false
-		for &pk in auth[:n] {
+		for &pk in auth {
 			if nostr.event_has_p_tag(ev, &pk) {
 				matched = true
 				break
@@ -200,14 +193,14 @@ live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
 			return false
 		}
 	}
-	if nostr.has_protected_tag(ev.tags) && !slice.contains(auth[:n], ev.pubkey) {
+	if nostr.has_protected_tag(ev.tags) && !slice.contains(auth, ev.pubkey) {
 		return false
 	}
 	if cs.relay.hooks.check_read != nil {
 		principal := policy.Principal {
 			source   = .Client,
 			conn_id  = cs.outbox.conn_id,
-			auth_pks = auth[:n],
+			auth_pks = auth,
 		}
 		view := pack.view_event(ev)
 		return cs.relay.hooks.check_read(cs.relay.hooks.user, &principal, &view) == .Show
@@ -234,7 +227,6 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 	cs.outbox.ch = ch
 	cs.outbox.conn = &cs.conn
 	cs.outbox.conn_id = conn_id
-	cs.outbox.auth_pks = make(map[[32]u8]struct{})
 
 	auth_state_init(&cs.auth)
 	cs.neg_subs = make(map[string]^Neg_Session)
@@ -288,7 +280,6 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 	thread.destroy(writer)
 	chan.destroy(cs.outbox.ch)
 	delete(cs.replay_spare)
-	delete(cs.outbox.auth_pks)
 	free(cs.outbox)
 
 	for sub_id, session in cs.neg_subs {
@@ -412,15 +403,9 @@ handle_auth :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 		send_ok(cs, &id, false, reason)
 		return
 	}
-	if len(cs.auth.authenticated) >= MAX_AUTH_PUBKEYS && pubkey not_in cs.auth.authenticated {
+	if !auth_record(&cs.auth, pubkey) {
 		send_ok(cs, &id, false, "auth-required: too many authenticated pubkeys")
 		return
-	}
-	cs.auth.authenticated[pubkey] = {}
-	{
-		// NIP-17/NIP-70: share with the writer's visibility gates.
-		sync.guard(&cs.outbox.auth_mu)
-		cs.outbox.auth_pks[pubkey] = {}
 	}
 	send_ok(cs, &id, true, "")
 }
@@ -430,16 +415,11 @@ handle_auth :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 
 @(private)
 handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
-	auth: [MAX_AUTH_PUBKEYS][32]u8
-	n := 0
-	for pk in cs.auth.authenticated {
-		auth[n] = pk
-		n += 1
-	}
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
 	principal := policy.Principal {
 		source   = .Client,
 		conn_id  = cs.outbox.conn_id,
-		auth_pks = auth[:n],
+		auth_pks = auth_snapshot(&cs.auth, &keys),
 	}
 	err, reason := ingest_event(cs.relay, principal, ev)
 	send_ok(cs, &ev.id, err == .None || err == .Duplicate || err == .Duplicate_Newer, reason)
@@ -519,21 +499,12 @@ req_emit :: proc(user: rawptr, dp: []u8) -> store.Error {
 }
 
 @(private)
-collect_auth_pks :: proc(cs: ^Conn_State) -> [][32]u8 {
-	pks := make([dynamic][32]u8, 0, len(cs.auth.authenticated), context.temp_allocator)
-	for pk in cs.auth.authenticated {
-		append(&pks, pk)
-	}
-	return pks[:]
-}
-
-@(private)
-read_access :: proc(cs: ^Conn_State) -> policy.Read_Access {
+read_access :: proc(cs: ^Conn_State, keys: ^[MAX_AUTH_PUBKEYS][32]u8) -> policy.Read_Access {
 	return {
 		principal = {
 			source = .Client,
 			conn_id = cs.outbox.conn_id,
-			auth_pks = collect_auth_pks(cs),
+			auth_pks = auth_snapshot(&cs.auth, keys),
 		},
 		user = cs.relay.hooks.user,
 		check = cs.relay.hooks.check_read,
@@ -581,7 +552,8 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 		}
 	}
 
-	access := read_access(cs)
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
+	access := read_access(cs, &keys)
 	if reason := request_denial(cs, access, .Req, filters); reason != "" {
 		send_closed(cs, sub_id, reason)
 		return
@@ -666,7 +638,8 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 
 @(private)
 handle_count :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
-	access := read_access(cs)
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
+	access := read_access(cs, &keys)
 	if reason := request_denial(cs, access, .Count, filters); reason != "" {
 		send_closed(cs, sub_id, reason)
 		return
@@ -764,7 +737,8 @@ handle_neg_open :: proc(cs: ^Conn_State, sub_id: string, filter: ^nostr.Filter, 
 		return
 	}
 
-	access := read_access(cs)
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
+	access := read_access(cs, &keys)
 	if reason := request_denial(cs, access, .Neg_Open, []nostr.Filter{filter^}); reason != "" {
 		send_neg_err(cs, sub_id, reason)
 		return
