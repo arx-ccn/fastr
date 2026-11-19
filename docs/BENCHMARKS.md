@@ -354,3 +354,50 @@ it increased relay CPU per 100-ID request from 114–116 µs to 150–159 µs.
 Raw JSONL: `~/.cache/fastr-bench/magnitude-ieI3rD/`, passes 51–55 for the
 original client, 51–53 with suffix `-long` for the sustained test. The
 `sched/` directory contains the diagnostic clients, commands and binary hashes.
+
+### Ordered mailbox replay (`18805491ad`)
+
+fastr now reads recipient postings in `(created_at desc, id asc)` order. It
+stops after the requested number of visible events, not the first N candidates.
+The encoder writes packed fields directly into the outgoing frames. A socket
+can reuse up to 256 KiB after a complete send; a short write leaves the
+buffer with the writer until the remaining bytes have gone out.
+
+Five passes per relay, alternating run order, with the original client and
+100,000-event fixture. Rates are median validated requests/s. The target is
+1.25 times Magnitude's unrounded median, rounded up to a whole request/s.
+
+| Request | fastr | Magnitude | Lead | Target | Prerecorded replies¹ |
+|---|---:|---:|---:|---:|---:|
+| One wrap by ID | 108,234 | 103,892 | +4.2% | 129,866 | 109,154 |
+| 100 wraps by ID | 2,820 | 2,546 | +10.8% | 3,183 | 3,022 |
+| Inbox, limit 500 | 568 | 514 | +10.6% | 642 | 600 |
+
+¹ A read-only loopback control recorded complete WebSocket replies from the
+old relay, keyed by authenticated recipient and verbatim request. All timed
+requests in the next five passes hit the recording. This bypassed filter
+parsing, subscription registration, lookup and encoding; the unchanged client
+still checked every event and its order. None of these rates reached the
+target either. This measures one socket implementation, not a hard limit on
+client throughput. A separate CPU sample put the original client's main
+thread at 98% of one core during batches and 99% during inbox reads.
+
+With eight independent validators, three passes per relay gave:
+
+| Request | fastr req/s | Magnitude req/s | fastr CPU µs/req | Magnitude CPU µs/req |
+|---|---:|---:|---:|---:|
+| One wrap by ID | 235,301 | 274,626 | 9.28 | 8.66 |
+| 100 wraps by ID | 10,949 | 10,646 | 80 | 95 |
+| Inbox, limit 500 | 2,671 | 2,511 | 250 | 170 |
+
+Three separate before/after passes (81–83) put fastr's relay CPU per 100-ID
+batch at 142.5 → 87.5 µs, and per inbox page at 512.5 → 277.5 µs. The
+index moves sorting work to startup and append. Two imports of the signed
+fixture into fresh tmpfs directories took 3.61–3.70 s before and 3.64–3.66 s
+after; all four imported 100,000 events with no failures. These timings do
+not measure write latency while readers contend with a large mailbox merge.
+
+Raw results: `~/.cache/fastr-bench/magnitude-ieI3rD/`, passes 75–79 for
+the original client and 75–77 (`-long`) for the eight validators. `ordered/`
+contains the playback patch against `279528a5dd`, its hit counts and raw
+rates, the client and relay hashes, and the import timings.
