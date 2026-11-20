@@ -88,6 +88,22 @@ test_is_hex_valid :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_decode_rejects_bad_lanes :: proc(t: ^testing.T) {
+	src: [34]u8
+	dst: [17]u8
+	for &b in src {b = 'a'}
+	for &b in src {
+		for bad in ([6]u8{'/', ':', 'A', '`', 'g', 0xff}) {
+			b = bad
+			n, err := hex_decode(src[:], dst[:])
+			testing.expect_value(t, err, Error.Invalid_Hex)
+			testing.expect_value(t, n, 0)
+		}
+		b = 'a'
+	}
+}
+
+@(test)
 test_is_hex_invalid :: proc(t: ^testing.T) {
 	testing.expect(t, !is_hex(sb("DEADBEEF")))
 	testing.expect(t, !is_hex(sb("xyz")))
@@ -100,7 +116,8 @@ test_hex_all_bytes :: proc(t: ^testing.T) {
 	for &b, i in input {
 		b = u8(i)
 	}
-	expected := "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" +
+	expected :=
+		"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" +
 		"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f" +
 		"404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f" +
 		"606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f" +

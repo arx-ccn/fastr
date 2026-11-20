@@ -76,7 +76,10 @@ Store :: struct {
 	// resolving ids through it must verify the entry id at the slot and
 	// fall back to a full scan on mismatch or out-of-range.
 	known_ids_mu:           sync.RW_Mutex,
-	known_ids:              map[[32]u8]u32,
+	known_ids:              map[[32]u8]Event_Slot,
+	// known_ids_mu also protects mailbox postings and REQ snapshot publication.
+	mailbox:                Mailbox_Index,
+	query_maps:             ^Query_Maps,
 	// Query early-exit: scan_ceiling[i] is the maximum created_at over index
 	// entries [0..=i] (monotone in i). Scanning newest-slot-first, once the
 	// result heap is full and scan_ceiling[i] is strictly below the worst
@@ -363,13 +366,14 @@ store_open :: proc(dir: string, allocator := context.allocator) -> (s: ^Store, e
 	s.author_counts = make(map[[32]u8]u64)
 	s.kinds_with_expiry = make(map[u16]struct{})
 	s.authors_with_expiry = make(Key_Set)
-	s.known_ids = make(map[[32]u8]u32)
+	s.known_ids = make(map[[32]u8]Event_Slot)
 	s.scan_ceiling = make([dynamic]i64)
 
 	if berr := boot_rebuild(s); berr != .None {
 		store_close(s)
 		return nil, berr
 	}
+	publish_query_maps(s)
 	return s, .None
 }
 
@@ -395,6 +399,7 @@ store_close :: proc(s: ^Store) {
 	if s.vanish_file != nil {
 		os.close(s.vanish_file)
 	}
+	query_maps_release(s, s.query_maps)
 	mapped_file_destroy(&s.data)
 	mapped_file_destroy(&s.index)
 	mapped_file_destroy(&s.tags)
@@ -410,6 +415,7 @@ store_close :: proc(s: ^Store) {
 	delete(s.kinds_with_expiry)
 	delete(s.authors_with_expiry)
 	delete(s.known_ids)
+	mailbox_destroy(&s.mailbox)
 	delete(s.scan_ceiling)
 	delete(s.dir)
 	free(s)

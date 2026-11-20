@@ -44,6 +44,67 @@ Slice_Guard :: struct {
 	data: []u8,
 }
 
+// One reference per query pins all three files through emit. The store owns
+// the first reference and replaces the group only when a mapping changes.
+@(private)
+Query_Maps :: struct {
+	refs:              int,
+	index, data, tags: ^Mmap,
+}
+
+@(private)
+query_maps_release :: proc(s: ^Store, maps: ^Query_Maps) {
+	if maps != nil && sync.atomic_sub(&maps.refs, 1) == 1 {
+		for m in ([3]^Mmap{maps.index, maps.data, maps.tags}) {
+			if m != nil do sync.atomic_sub(&m.refs, 1)
+		}
+		free(maps, s.allocator)
+	}
+}
+
+// Called before open returns, or under both writer_mu and known_ids_mu.
+@(private)
+publish_query_maps :: proc(s: ^Store) {
+	old := s.query_maps
+	i, d, t := s.index.current, s.data.current, s.tags.current
+	if old != nil && old.index == i && old.data == d && old.tags == t do return
+	g := new(Query_Maps, s.allocator)
+	g^ = {
+		refs  = 1,
+		index = i,
+		data  = d,
+		tags  = t,
+	}
+	for m in ([3]^Mmap{i, d, t}) {
+		if m != nil do sync.atomic_add(&m.refs, 1)
+	}
+	s.query_maps = g
+	if old == nil do return
+	changed_index, changed_data, changed_tags := old.index != i, old.data != d, old.tags != t
+	query_maps_release(s, old)
+	// mapped_file_swap could not reclaim mappings still held by old.
+	if changed_index {
+		sync.guard(&s.index.mu)
+		sweep_retired(&s.index)
+	}
+	if changed_data {
+		sync.guard(&s.data.mu)
+		sweep_retired(&s.data)
+	}
+	if changed_tags {
+		sync.guard(&s.tags.mu)
+		sweep_retired(&s.tags)
+	}
+}
+
+@(private)
+query_map_slice :: proc(m: ^Mmap, mf: ^Mapped_File) -> []u8 {
+	if m == nil do return nil
+	length := uint(mapped_file_load_len(mf))
+	if length == 0 do return nil
+	return m.ptr[HEADER_SIZE:HEADER_SIZE + length]
+}
+
 @(private = "file")
 map_fd :: proc(file: ^os.File, size: uint) -> (^Mmap, Error) {
 	ptr, errno := linux.mmap(0, size, {.READ}, {.SHARED}, linux.Fd(os.fd(file)), 0)

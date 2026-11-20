@@ -282,16 +282,158 @@ test_tag_cursor_order_compact :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_wrap_candidate_visibility :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	keys: [2][32]u8
+	keys[0][0], keys[1][0] = 1, 2
+	tag0 := test_tag("p", test_hex(keys[0][:]))
+	tag := test_tag("p", test_hex(keys[1][:]))
+	wrap :: nostr.KIND_GIFT_WRAP
+	visible := test_make_event(3, wrap, 10, test_tags(test_tag("p", "other"), tag, tag0, tag))
+	untagged := test_make_event(4, wrap, 20, nil)
+	wrong := test_make_event(
+		5,
+		wrap,
+		30,
+		test_tags(test_tag("p", "other"), test_tag("e", test_hex(keys[1][:]))),
+	)
+	note := test_make_event(6, 1, 40, test_tags(test_tag("p", "other"), tag))
+	ids := make([dynamic]nostr.Hex_Prefix, context.temp_allocator)
+	for ev in ([]^pack.Event{&visible, &untagged, &wrong, &note}) {
+		test_append_ok(t, s, ev)
+		append(&ids, nostr.Hex_Prefix{bytes = ev.id, length = 32})
+	}
+	f := test_tag_filter('p', "other")
+	f.kinds = test_kind_filter(wrap).kinds
+	by_id := nostr.Filter {
+		ids   = ids,
+		kinds = f.kinds,
+	}
+	exact := collect_ctx_init()
+	testing.expect_value(t, query_authed(s, &by_id, keys[:], &exact, collect_cb), Error.None)
+	// The untagged event follows a visible one: its tag end alone is not proof.
+	testing.expect(t, slice.equal(exact.ids[:], [][32]u8{visible.id}))
+	mailbox := s.mailbox
+	defer s.mailbox = mailbox
+	for phase in 0 ..< 5 {
+		switch phase {
+		case 1:
+			f.ids = ids
+		case 2:
+			prefixes := make([dynamic]nostr.Hex_Prefix, context.temp_allocator)
+			append(&prefixes, nostr.Hex_Prefix{bytes = wrong.id, length = 4})
+			f.ids = prefixes
+			c := collect_ctx_init()
+			testing.expect_value(t, query_authed(s, &f, keys[:], &c, collect_cb), Error.None)
+			testing.expect_value(t, len(c.ids), 0)
+			f.ids = nil
+		case 3:
+			s.mailbox.tag_bytes -= TAG_ENTRY_SIZE
+		case 4:
+			s.mailbox = {}
+		case:
+		}
+		c := collect_ctx_init()
+		testing.expect_value(t, query_authed(s, &f, keys[:], &c, collect_cb), Error.None)
+		testing.expect(t, slice.equal(c.ids[:], [][32]u8{visible.id}))
+		testing.expect_value(t, test_query_count(t, s, &f), 0)
+	}
+}
+
+@(test)
+test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	keys := [2][32]u8{test_pubkey(1), test_pubkey(7)}
+	p := test_hex(keys[0][:])
+	tag := test_tag("p", p)
+	other_tag := test_tag("p", test_hex(keys[1][:]))
+	wrap :: nostr.KIND_GIFT_WRAP
+	// This event is authorized, but the requested p tag excludes it.
+	other := test_make_event(9, wrap, 100, test_tags(other_tag))
+	test_append_ok(t, s, &other)
+	removed := test_make_event(2, wrap, 40, test_tags(tag, other_tag))
+	older := test_make_event(3, wrap, 20, test_tags(tag, other_tag, tag, test_tag("t", "topic")))
+	tied := test_make_event(4, wrap, 20, test_tags(tag))
+	protected := test_make_event(5, wrap, 50, test_tags(tag, test_tag("-")))
+	backdated := test_make_event(8, wrap, 10, test_tags(tag, other_tag))
+	for ev in ([]^pack.Event{&removed, &older, &tied, &protected, &backdated}) {
+		test_append_ok(t, s, ev)
+	}
+	// Delete as the author; a recipient deletion would sweep the shared mailbox.
+	deletion := test_kind5_event(2, removed.id)
+	test_append_ok(t, s, &deletion)
+	testing.expect(t, store_is_tombstoned(s, removed.id))
+	compound := test_tag_filter('p', p)
+	compound.tags['t'] = test_tag_filter('t', "topic").tags['t']
+	compound.kinds = test_kind_filter(wrap).kinds
+	selected := collect_ctx_init()
+	testing.expect_value(
+		t,
+		query_authed(s, &compound, keys[:1], &selected, collect_cb),
+		Error.None,
+	)
+	testing.expect(t, slice.equal(selected.ids[:], [][32]u8{older.id}))
+	expected := [3][32]u8{{}, older.id, tied.id}
+	slice.sort_by(expected[1:], test_id_less)
+	f := test_tag_filter('p', p)
+	f.kinds = test_kind_filter(wrap).kinds
+	f.limit = 2
+	for phase in 0 ..< 4 {
+		want := expected[1:]
+		switch phase {
+		case 1:
+			store_close(s)
+			s = test_open(t, dir)
+		case 2:
+			_, err := store_compact(s)
+			testing.expect_value(t, err, Error.None)
+		case 3:
+			newer := test_make_event(6, wrap, 60, test_tags(tag))
+			test_arm_fail(s, 3)
+			err, _ := store_append(s, &newer)
+			testing.expect_value(t, err, Error.Io)
+			test_append_ok(t, s, &newer)
+			expected[0] = newer.id
+			want = expected[:2]
+		case:
+		}
+		c := collect_ctx_init()
+		testing.expect_value(t, query_authed(s, &f, keys[:], &c, collect_cb), Error.None)
+		testing.expectf(
+			t,
+			slice.equal(c.ids[:], want),
+			"phase %d: got %v, want %v",
+			phase,
+			c.ids,
+			want,
+		)
+	}
+}
+
+@(test)
 test_tag_snapshot_ahead :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
 	s := test_open(t, dir)
 	defer store_close(s)
-	old := test_make_event(1, 1, 10, test_tags(test_tag("t", "topic")))
+	keys := [1][32]u8{test_pubkey(4)}
+	p := test_tag("p", test_hex(keys[0][:]))
+	old := test_make_event(1, nostr.KIND_GIFT_WRAP, 10, test_tags(p, test_tag("t", "topic")))
 	test_append_ok(t, s, &old)
 	index_len := mapped_file_load_len(&s.index)
 	data_len := mapped_file_load_len(&s.data)
-	newer := test_make_event(2, 1, 20, test_tags(test_tag("t", "topic"), test_tag("x", "newer")))
+	newer := test_make_event(
+		2,
+		nostr.KIND_GIFT_WRAP,
+		20,
+		test_tags(p, test_tag("t", "topic"), test_tag("x", "newer")),
+	)
 	test_append_ok(t, s, &newer)
 	full_index_len := mapped_file_load_len(&s.index)
 	full_data_len := mapped_file_load_len(&s.data)
@@ -302,9 +444,13 @@ test_tag_snapshot_ahead :: proc(t: ^testing.T) {
 	mapped_file_publish_len(&s.data, data_len)
 	f := test_tag_filter('t', "topic")
 	f.limit = 1
-	c := test_query_collect(t, s, &f)
-	testing.expect_value(t, len(c.ids), 1)
-	testing.expect_value(t, c.ids[0], old.id)
+	for phase in 0 ..< 2 {
+		if phase == 1 do f.kinds = test_kind_filter(nostr.KIND_GIFT_WRAP).kinds
+		c := collect_ctx_init()
+		testing.expect_value(t, query_authed(s, &f, keys[:], &c, collect_cb), Error.None)
+		testing.expect_value(t, len(c.ids), 1)
+		testing.expect_value(t, c.ids[0], old.id)
+	}
 }
 
 @(test)
@@ -980,12 +1126,15 @@ test_query_ids_fast_path_exact :: proc(t: ^testing.T) {
 	testing.expect_value(t, c.ids[1], want_old)
 
 	// A stale slot must retain the ID check on the fallback scan.
-	s.known_ids[want_old] = 101
+	saved := s.known_ids[want_old]
+	s.known_ids[want_old] = {
+		slot = 101,
+	}
 	stale := test_query_collect(t, s, &f)
 	testing.expect_value(t, len(stale.ids), 2)
 	testing.expect_value(t, stale.ids[0], want_new)
 	testing.expect_value(t, stale.ids[1], want_old)
-	s.known_ids[want_old] = 100
+	s.known_ids[want_old] = saved
 
 	// Other gates still apply on the fast path: kind mismatch yields nothing.
 	f2 := test_kind_filter(42)

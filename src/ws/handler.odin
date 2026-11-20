@@ -2,9 +2,8 @@
 // the EVENT/REQ/COUNT/AUTH/NEG-* handlers.
 //
 // Threading model: one reader thread (this proc) + one writer thread per
-// connection. ALL socket writes go through the writer via the outbox
-// channel — including pongs and closes — because two threads must never
-// interleave bytes on one TCP socket. The writer also applies the
+// connection. An idle outbox can send a replay without waking the writer.
+// Otherwise the writer sends queued frames in order. It also applies the
 // NIP-17/NIP-70 live-event visibility gates using the auth state shared
 // through the outbox.
 //
@@ -38,12 +37,13 @@ Neg_Session :: struct {
 
 @(private)
 Conn_State :: struct {
-	relay:     ^Relay,
-	conn:      Conn,
-	outbox:    ^Outbox,
-	auth:      Auth_State,
-	live_subs: map[string]struct{}, // heap-owned keys
-	neg_subs:  map[string]^Neg_Session, // heap-owned keys and sessions
+	relay:        ^Relay,
+	conn:         Conn,
+	outbox:       ^Outbox,
+	auth:         Auth_State,
+	live_count:   int, // reader owns admission; the fanout owns subscription IDs
+	replay_spare: [dynamic]u8, // empty unless the reader completed the last write
+	neg_subs:     map[string]^Neg_Session, // heap-owned keys and sessions
 }
 
 // ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ Conn_State :: struct {
 // closed or full (a dropped direct response means the socket is going away).
 @(private)
 send_text :: proc(cs: ^Conn_State, json: string) {
-	if !chan.try_send(cs.outbox.ch, Out_Msg(Out_Text{json = json})) {
+	if !outbox_send(cs.outbox, Out_Msg(Out_Text{json = json})) {
 		delete(json)
 	}
 }
@@ -105,10 +105,7 @@ drop_msg :: proc(msg: Out_Msg) {
 	case Out_Text:
 		delete(m.json)
 	case Out_Batch:
-		for frame in m.frames {
-			delete(frame)
-		}
-		delete(m.frames)
+		delete(m.wire)
 	case Out_Live:
 		delete(m.live.sub_id)
 		shared_event_release(m.live.shared)
@@ -128,6 +125,11 @@ writer_loop :: proc(cs: ^Conn_State) {
 		if !ok {
 			return
 		}
+		defer {
+			sync.guard(&cs.outbox.send_mu)
+			cs.outbox.pending -= 1
+			cs.outbox.failed = dead
+		}
 		if dead {
 			drop_msg(msg)
 			continue
@@ -139,25 +141,8 @@ writer_loop :: proc(cs: ^Conn_State) {
 			}
 			delete(m.json)
 		case Out_Batch:
-			// One TCP send for N frames: REQ stored events + EOSE.
-			total := 0
-			for frame in m.frames {
-				total += len(frame) + MAX_FRAME_HEADER_LEN
-			}
-			buf := make([]u8, total, context.temp_allocator)
-			off := 0
-			for frame in m.frames {
-				encoded := encode_frame(buf[off:], .Text, transmute([]u8)frame)
-				off += len(encoded)
-			}
-			if _, err := net.send_tcp(cs.conn.sock, buf[:off]); err != nil {
-				dead = true
-			}
-			for frame in m.frames {
-				delete(frame)
-			}
-			delete(m.frames)
-			free_all(context.temp_allocator)
+			dead = send_all(cs.conn.sock, m.wire[m.sent:]) != .None
+			delete(m.wire)
 		case Out_Live:
 			ev := &m.live.shared.ev
 			if live_allowed(cs, m.live) {
@@ -187,24 +172,18 @@ writer_loop :: proc(cs: ^Conn_State) {
 @(private)
 live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
 	{
-		sync.shared_guard(&cs.relay.fanout.mu)
-		if sub, found := cs.relay.fanout.subs[live.key]; !found || sub.outbox != cs.outbox {
+		f := fanout_shard(&cs.relay.fanout, cs.outbox)
+		sync.shared_guard(&f.mu)
+		if sub := find_sub(f, cs.outbox, live.sub_id); sub == nil || sub.key != live.key {
 			return false
 		}
 	}
-	auth: [MAX_AUTH_PUBKEYS][32]u8
-	n := 0
-	{
-		sync.shared_guard(&cs.outbox.auth_mu)
-		for pk in cs.outbox.auth_pks {
-			auth[n] = pk
-			n += 1
-		}
-	}
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
+	auth := auth_snapshot(&cs.auth, &keys)
 	ev := &live.shared.ev
 	if ev.kind == nostr.KIND_GIFT_WRAP {
 		matched := false
-		for &pk in auth[:n] {
+		for &pk in auth {
 			if nostr.event_has_p_tag(ev, &pk) {
 				matched = true
 				break
@@ -214,14 +193,14 @@ live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
 			return false
 		}
 	}
-	if nostr.has_protected_tag(ev.tags) && !slice.contains(auth[:n], ev.pubkey) {
+	if nostr.has_protected_tag(ev.tags) && !slice.contains(auth, ev.pubkey) {
 		return false
 	}
 	if cs.relay.hooks.check_read != nil {
 		principal := policy.Principal {
 			source   = .Client,
 			conn_id  = cs.outbox.conn_id,
-			auth_pks = auth[:n],
+			auth_pks = auth,
 		}
 		view := pack.view_event(ev)
 		return cs.relay.hooks.check_read(cs.relay.hooks.user, &principal, &view) == .Show
@@ -246,11 +225,10 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 	ch, ch_err := chan.create(chan.Chan(Out_Msg), OUTBOX_CAPACITY, context.allocator)
 	assert(ch_err == nil)
 	cs.outbox.ch = ch
+	cs.outbox.conn = &cs.conn
 	cs.outbox.conn_id = conn_id
-	cs.outbox.auth_pks = make(map[[32]u8]struct{})
 
 	auth_state_init(&cs.auth)
-	cs.live_subs = make(map[string]struct{})
 	cs.neg_subs = make(map[string]^Neg_Session)
 
 	writer := thread.create_and_start_with_poly_data(cs, writer_loop)
@@ -269,7 +247,7 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 		incoming, err := conn_next(&cs.conn)
 		if err != .None {
 			if code := close_code_for_error(err); code != 0 {
-				_ = chan.try_send(cs.outbox.ch, Out_Msg(Out_Close{code = code}))
+				_ = outbox_send(cs.outbox, Out_Msg(Out_Close{code = code}))
 			}
 			break read
 		}
@@ -282,12 +260,12 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 		case .Ping:
 			payload := make([]u8, len(incoming.data))
 			copy(payload, incoming.data)
-			if !chan.try_send(cs.outbox.ch, Out_Msg(Out_Pong{payload = payload})) {
+			if !outbox_send(cs.outbox, Out_Msg(Out_Pong{payload = payload})) {
 				delete(payload)
 			}
 		case .Close:
 			// CLOSE_NO_STATUS echoes as an empty close frame (see encode_close).
-			_ = chan.try_send(cs.outbox.ch, Out_Msg(Out_Close{code = incoming.close_code}))
+			_ = outbox_send(cs.outbox, Out_Msg(Out_Close{code = incoming.close_code}))
 			break read
 		case .Pong, .None:
 		}
@@ -301,13 +279,9 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 	thread.join(writer)
 	thread.destroy(writer)
 	chan.destroy(cs.outbox.ch)
-	delete(cs.outbox.auth_pks)
+	delete(cs.replay_spare)
 	free(cs.outbox)
 
-	for sub_id in cs.live_subs {
-		delete(sub_id)
-	}
-	delete(cs.live_subs)
 	for sub_id, session in cs.neg_subs {
 		neg_session_destroy(session)
 		delete(sub_id)
@@ -404,10 +378,8 @@ parse_msg :: proc(raw: string, max_filter_values: int) -> (nostr.Client_Msg, str
 
 @(private)
 remove_live_sub :: proc(cs: ^Conn_State, sub_id: string) {
-	if sub_id in cs.live_subs {
-		key, _ := delete_key(&cs.live_subs, sub_id)
-		delete(key)
-		fanout_unsubscribe(&cs.relay.fanout, sub_id, cs.outbox)
+	if cs.live_count > 0 && fanout_unsubscribe(&cs.relay.fanout, sub_id, cs.outbox) {
+		cs.live_count -= 1
 	}
 }
 
@@ -431,15 +403,9 @@ handle_auth :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 		send_ok(cs, &id, false, reason)
 		return
 	}
-	if len(cs.auth.authenticated) >= MAX_AUTH_PUBKEYS && pubkey not_in cs.auth.authenticated {
+	if !auth_record(&cs.auth, pubkey) {
 		send_ok(cs, &id, false, "auth-required: too many authenticated pubkeys")
 		return
-	}
-	cs.auth.authenticated[pubkey] = {}
-	{
-		// NIP-17/NIP-70: share with the writer's visibility gates.
-		sync.guard(&cs.outbox.auth_mu)
-		cs.outbox.auth_pks[pubkey] = {}
 	}
 	send_ok(cs, &id, true, "")
 }
@@ -449,16 +415,11 @@ handle_auth :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 
 @(private)
 handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
-	auth: [MAX_AUTH_PUBKEYS][32]u8
-	n := 0
-	for pk in cs.auth.authenticated {
-		auth[n] = pk
-		n += 1
-	}
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
 	principal := policy.Principal {
 		source   = .Client,
 		conn_id  = cs.outbox.conn_id,
-		auth_pks = auth[:n],
+		auth_pks = auth_snapshot(&cs.auth, &keys),
 	}
 	err, reason := ingest_event(cs.relay, principal, ev)
 	send_ok(cs, &ev.id, err == .None || err == .Duplicate || err == .Duplicate_Newer, reason)
@@ -471,14 +432,33 @@ handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 Req_Hit :: struct {
 	created_at: i64,
 	id:         [32]u8,
-	json:       string, // heap-owned
+	start:      int,
+	end:        int,
 }
 
 @(private)
 Req_Query_Ctx :: struct {
-	sub_id: string,
-	hits:   ^[dynamic]Req_Hit,
-	seen:   ^map[[32]u8]struct{},
+	sub_id:      string,
+	wire:        [dynamic]u8,
+	union_query: bool,
+	hits:        [dynamic]Req_Hit,
+	seen:        ^map[[32]u8]struct{},
+}
+
+// Fill the header after serialization reveals the payload length. Only a
+// payload outgrowing its reserved header needs to move.
+@(private)
+finish_text_frame :: proc(buf: ^[dynamic]u8, start, reserved: int) {
+	hdr: [MAX_FRAME_HEADER_LEN]u8 = ---
+	payload_start := start + reserved
+	payload_end := len(buf^)
+	n := encode_frame_header(hdr[:], .Text, payload_end - payload_start)
+	assert(n >= reserved)
+	if n > reserved {
+		non_zero_resize(buf, payload_end + n - reserved)
+		copy(buf^[start + n:], buf^[payload_start:payload_end])
+	}
+	copy(buf^[start:start + n], hdr[:n])
 }
 
 @(private)
@@ -487,41 +467,44 @@ req_emit :: proc(user: rawptr, dp: []u8) -> store.Error {
 	if len(dp) < 136 {
 		return .Pack_Invalid
 	}
-	id: [32]u8
-	copy(id[:], dp[:32])
-	if ctx.seen != nil {
-		if id in ctx.seen^ {
-			// Already emitted by a previous filter — NIP-01 OR semantics.
-			return .None
+	id: [32]u8 = ---
+	if ctx.union_query {
+		copy(id[:], dp[:32])
+		if ctx.seen != nil {
+			if id in ctx.seen^ {
+				return .None
+			}
+			ctx.seen^[id] = {}
 		}
-		ctx.seen^[id] = {}
 	}
-	created_at := i64(endian.unchecked_get_u64le(dp[128:136]))
-	buf := make([dynamic]u8, 0, max(1024, len(dp) + len(ctx.sub_id) + 512))
-	if err := pack.transcode_to_event_json(dp, ctx.sub_id, &buf); err != .None {
-		delete(buf)
+	// The event's hex id, pubkey, and signature alone exceed 125 bytes.
+	start := len(ctx.wire)
+	non_zero_resize(&ctx.wire, start + 4)
+	if err := pack.transcode_to_event_json(dp, ctx.sub_id, &ctx.wire); err != .None {
 		return .Pack_Invalid
 	}
-	append(ctx.hits, Req_Hit{created_at = created_at, id = id, json = string(buf[:])})
+	finish_text_frame(&ctx.wire, start, 4)
+	if ctx.union_query {
+		append(
+			&ctx.hits,
+			Req_Hit {
+				created_at = i64(endian.unchecked_get_u64le(dp[128:136])),
+				id = id,
+				start = start,
+				end = len(ctx.wire),
+			},
+		)
+	}
 	return .None
 }
 
 @(private)
-collect_auth_pks :: proc(cs: ^Conn_State) -> [][32]u8 {
-	pks := make([dynamic][32]u8, 0, len(cs.auth.authenticated), context.temp_allocator)
-	for pk in cs.auth.authenticated {
-		append(&pks, pk)
-	}
-	return pks[:]
-}
-
-@(private)
-read_access :: proc(cs: ^Conn_State) -> policy.Read_Access {
+read_access :: proc(cs: ^Conn_State, keys: ^[MAX_AUTH_PUBKEYS][32]u8) -> policy.Read_Access {
 	return {
 		principal = {
 			source = .Client,
 			conn_id = cs.outbox.conn_id,
-			auth_pks = collect_auth_pks(cs),
+			auth_pks = auth_snapshot(&cs.auth, keys),
 		},
 		user = cs.relay.hooks.user,
 		check = cs.relay.hooks.check_read,
@@ -549,7 +532,7 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 	remove_live_sub(cs, sub_id)
 
 	// NIP-77: REQ namespace cap only; replacing an existing sub_id is free.
-	if len(cs.live_subs) >= cfg.max_subscriptions_per_conn && sub_id not_in cs.live_subs {
+	if cs.live_count >= cfg.max_subscriptions_per_conn {
 		send_closed(cs, sub_id, "restricted: too many subscriptions")
 		return
 	}
@@ -569,7 +552,8 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 		}
 	}
 
-	access := read_access(cs)
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
+	access := read_access(cs, &keys)
 	if reason := request_denial(cs, access, .Req, filters); reason != "" {
 		send_closed(cs, sub_id, reason)
 		return
@@ -577,22 +561,27 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 
 	// #65: register the fanout subscription BEFORE the stored query so events
 	// published during the query queue in the outbox rather than being lost.
-	if sub_id not_in cs.live_subs {
-		cs.live_subs[strings.clone(sub_id)] = {}
-	}
 	fanout_subscribe(&cs.relay.fanout, sub_id, filters, cs.outbox)
+	cs.live_count += 1
 
-	hits := make([dynamic]Req_Hit)
-	seen: map[[32]u8]struct{}
 	qctx := Req_Query_Ctx {
-		sub_id = sub_id,
-		hits   = &hits,
+		sub_id      = sub_id,
+		wire        = cs.replay_spare,
+		union_query = len(filters) > 1,
 	}
+	cs.replay_spare = nil
+	if qctx.wire == nil {
+		qctx.wire = make([dynamic]u8, 0, 2048)
+	}
+	if qctx.union_query {
+		qctx.hits = make([dynamic]Req_Hit, context.temp_allocator)
+	}
+	seen: map[[32]u8]struct{}
 	for &filter, i in filters {
 		if i == 1 {
 			// Seed the union from the already-unique first query.
-			seen = make(map[[32]u8]struct{}, len(hits), context.temp_allocator)
-			for hit in hits {
+			seen = make(map[[32]u8]struct{}, len(qctx.hits), context.temp_allocator)
+			for hit in qctx.hits {
 				seen[hit.id] = {}
 			}
 			qctx.seen = &seen
@@ -607,18 +596,15 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 		); err != .None {
 			// #73: roll back and tell the client instead of a lying EOSE.
 			remove_live_sub(cs, sub_id)
-			for hit in hits {
-				delete(hit.json)
-			}
-			delete(hits)
+			delete(qctx.wire)
 			send_closed(cs, sub_id, "error: internal store error")
 			return
 		}
 	}
 
 	// Each filter is already ordered; only a multi-filter union needs sorting.
-	if len(filters) > 1 {
-		slice.sort_by(hits[:], proc(a, b: Req_Hit) -> bool {
+	if len(qctx.hits) > 1 {
+		slice.sort_by(qctx.hits[:], proc(a, b: Req_Hit) -> bool {
 			if a.created_at != b.created_at {
 				return a.created_at > b.created_at
 			}
@@ -629,22 +615,21 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 			}
 			return false
 		})
+		ordered := make([dynamic]u8, 0, len(qctx.wire) + 64)
+		for hit in qctx.hits {
+			append(&ordered, ..qctx.wire[hit.start:hit.end])
+		}
+		delete(qctx.wire)
+		qctx.wire = ordered
 	}
 
-	// One channel send for all stored events + EOSE.
-	batch := make([]string, len(hits) + 1)
-	for hit, i in hits {
-		batch[i] = hit.json
-	}
-	eose := make([dynamic]u8, 0, 64)
-	nostr.write_eose_json(&eose, sub_id)
-	batch[len(hits)] = string(eose[:])
-	delete(hits)
-	if !chan.try_send(cs.outbox.ch, Out_Msg(Out_Batch{frames = batch})) {
-		for frame in batch {
-			delete(frame)
-		}
-		delete(batch)
+	// Keep all stored events and EOSE in one ordered outbox message.
+	start := len(qctx.wire)
+	non_zero_resize(&qctx.wire, start + 2)
+	nostr.write_eose_json(&qctx.wire, sub_id)
+	finish_text_frame(&qctx.wire, start, 2)
+	if !outbox_send(cs.outbox, Out_Msg(Out_Batch{wire = qctx.wire}), &cs.replay_spare) {
+		delete(qctx.wire)
 	}
 }
 
@@ -653,7 +638,8 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 
 @(private)
 handle_count :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
-	access := read_access(cs)
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
+	access := read_access(cs, &keys)
 	if reason := request_denial(cs, access, .Count, filters); reason != "" {
 		send_closed(cs, sub_id, reason)
 		return
@@ -751,7 +737,8 @@ handle_neg_open :: proc(cs: ^Conn_State, sub_id: string, filter: ^nostr.Filter, 
 		return
 	}
 
-	access := read_access(cs)
+	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
+	access := read_access(cs, &keys)
 	if reason := request_denial(cs, access, .Neg_Open, []nostr.Filter{filter^}); reason != "" {
 		send_neg_err(cs, sub_id, reason)
 		return

@@ -81,6 +81,52 @@ event_tags_match_specs :: proc(tags: []u8, specs: []Tag_Spec) -> bool {
 	return true
 }
 
+@(private)
+Tag_Walk :: enum {
+	Sequential,
+	Sparse,
+}
+
+// Return this event's tag records and advance the descending cursor past them.
+@(private)
+candidate_tags :: proc(tags: []u8, cursor: ^int, offset: u64, walk: Tag_Walk) -> []u8 {
+	end := cursor^
+	if walk == .Sparse {
+		// Exact IDs may jump from the newest event to the oldest in one step.
+		lo := 0
+		for lo < end {
+			mid := lo + (end - lo) / 2
+			if endian.unchecked_get_u64le(tags[mid * TAG_ENTRY_SIZE:]) <= offset {
+				lo = mid + 1
+			} else {
+				end = mid
+			}
+		}
+	} else {
+		for end > 0 && endian.unchecked_get_u64le(tags[(end - 1) * TAG_ENTRY_SIZE:]) > offset {
+			end -= 1
+		}
+	}
+	start := end
+	for start > 0 && endian.unchecked_get_u64le(tags[(start - 1) * TAG_ENTRY_SIZE:]) == offset {
+		start -= 1
+	}
+	cursor^ = start
+	return tags[start * TAG_ENTRY_SIZE:end * TAG_ENTRY_SIZE]
+}
+
+@(private)
+has_recipient :: proc(tags: []u8, offset: u64, keys: [][32]u8) -> bool {
+	for pos := len(tags) - TAG_ENTRY_SIZE; pos >= 0; pos -= TAG_ENTRY_SIZE {
+		tag := tags[pos:pos + TAG_ENTRY_SIZE]
+		if endian.unchecked_get_u64le(tag[:8]) != offset {break}
+		if tag[8] == 'p' && tag[41] == 32 && pk_in(keys, (cast(^[32]u8)&tag[9])^) {
+			return true
+		}
+	}
+	return false
+}
+
 // Union of tags.s p-tag offsets matching any auth pubkey (NIP-17 gate).
 @(private)
 p_tag_offsets_union :: proc(
@@ -187,6 +233,27 @@ event_matches_filter :: proc(f: ^nostr.Filter, ev: ^pack.Event) -> bool {
 	return true
 }
 
+@(private)
+Mailbox_Cursor :: struct {
+	run:  ^Mailbox_Run,
+	next: int,
+}
+
+@(private)
+mailbox_next :: proc(cursors: []Mailbox_Cursor, idx: rawptr) -> Event_Slot {
+	best := -1
+	result: Event_Slot
+	for &c, i in cursors {
+		if c.next == len(c.run.slots) do continue
+		slot := c.run.slots[c.next]
+		if best < 0 || slot_newer(slot, result, idx) {
+			best, result = i, slot
+		}
+	}
+	cursors[best].next += 1
+	return result
+}
+
 // One candidate kept by the query top-N selection.
 @(private)
 Heap_Item :: struct {
@@ -220,114 +287,190 @@ query_authed :: proc(
 	emit: Emit_Proc,
 	access: policy.Read_Access = {},
 ) -> Error {
-	idx_g := mapped_file_slice(&s.index)
-	defer slice_release(idx_g)
-	data_g := mapped_file_slice(&s.data)
-	defer slice_release(data_g)
-	tags_g := mapped_file_slice(&s.tags)
-	defer slice_release(tags_g)
-	idx := idx_g.data
-	data := data_g.data
-
-	total := index_entry_count(idx)
 	limit := filter.limit.? or_else 500
 	// limit == 0 is a no-op: the client asked for zero events.
 	if limit == 0 {
 		return .None
 	}
 
-	// NIP-17: pre-compute the set of data_offsets where a p-tag matches any
-	// auth pubkey. Gift wraps are skipped entirely when not authed or when
-	// the filter cannot match kind 1059.
-	nip17_skip_all := len(auth_pks) == 0
-	nip17_set: Offset_Set
-	defer delete(nip17_set)
-	if !nip17_skip_all && filter_may_match_giftwrap(filter) {
-		nip17_set = p_tag_offsets_union(tags_g.data, auth_pks)
+	fkinds, has_kinds := filter.kinds.?
+	fids, has_ids := filter.ids.?
+	inbox := has_kinds && len(fkinds) == 1 && fkinds[0] == nostr.KIND_GIFT_WRAP
+	if inbox && len(auth_pks) == 0 {
+		return .None
+	}
+	use_ids := has_ids && len(fids) > 0
+	for fid in fids {
+		if fid.length != 32 {
+			use_ids = false
+			break
+		}
+	}
+
+	// Pin the mappings and mailbox runs under the publication lock. No
+	// pointers into the lookup maps escape the lock.
+	maps: ^Query_Maps
+	idx, data, tags_buf: []u8
+	local_id: [1]Event_Slot
+	cand: []Event_Slot
+	local_run: [1]Mailbox_Cursor
+	run_storage := local_run[:]
+	cursors := run_storage[:0]
+	mailbox_steps := 0
+	use_mailbox: bool
+	indexed_tags: bool
+	total: int
+	{
+		sync.shared_guard(&s.known_ids_mu)
+		maps = s.query_maps
+		idx = query_map_slice(maps.index, &s.index)
+		total = index_entry_count(idx)
+		if use_ids {
+			cand = local_id[:]
+			if len(fids) > len(cand) do cand = make([]Event_Slot, len(fids), context.temp_allocator)
+			n := 0
+			for fid in fids {
+				slot, ok := s.known_ids[fid.bytes]
+				if !ok {
+					continue
+				}
+				i := int(slot.slot)
+				// Compaction may have swapped the mappings but not rebuilt known_ids.
+				if i >= total || (cast(^[32]u8)&idx[i * INDEX_ENTRY_SIZE + 28])^ != fid.bytes {
+					use_ids = false
+					break
+				}
+				cand[n] = slot
+				n += 1
+			}
+			cand = cand[:n]
+			if use_ids && n == 0 do return .None
+		}
+		data = query_map_slice(maps.data, &s.data)
+		tags_buf = query_map_slice(maps.tags, &s.tags)
+		indexed_tags = total == s.mailbox.entries && len(tags_buf) == s.mailbox.tag_bytes
+		if !use_ids && inbox && indexed_tags {
+			use_mailbox = true
+			for &pk in auth_pks {
+				for run in s.mailbox.by_recipient[pk].runs {
+					n := len(cursors)
+					if n == len(run_storage) {
+						grown := make([]Mailbox_Cursor, n * 2, context.temp_allocator)
+						copy(grown, cursors)
+						run_storage = grown
+					}
+					sync.atomic_add(&run.refs, 1)
+					cursors = run_storage[:n + 1]
+					cursors[n] = {
+						run = run,
+					}
+					mailbox_steps += len(run.slots)
+				}
+			}
+		}
+		sync.atomic_add(&maps.refs, 1)
+	}
+	defer query_maps_release(s, maps)
+	defer for &c in cursors do mailbox_release(c.run)
+	steps := total
+	use_slots := use_ids || use_mailbox
+	ordered := use_mailbox || use_ids && indexed_tags
+	recipient_offsets: Offset_Set
+	defer delete(recipient_offsets)
+	if use_slots {
+		steps = mailbox_steps if use_mailbox else len(cand)
+		if steps == 0 {
+			return .None
+		}
+		if use_ids && steps > 1 {
+			if ordered {
+				for j in 1 ..< steps {
+					if slot_newer(cand[j], cand[j - 1], raw_data(idx)) {
+						slice.sort_by_with_data(cand, slot_newer, raw_data(idx))
+						break
+					}
+				}
+			} else {
+				slice.sort_by(cand, proc(a, b: Event_Slot) -> bool {return a.slot < b.slot})
+			}
+		}
+	} else if len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
+		recipient_offsets = p_tag_offsets_union(tags_buf, auth_pks)
 	}
 
 	// Tag records follow increasing data offsets, including after compaction.
-	// Both scan branches visit descending slots (resolved ids are sorted below).
+	// Ordered reads reset the cursor from each candidate's stored tag_end.
 	specs := build_tag_specs(filter)
-	tag_end := len(tags_g.data) / TAG_ENTRY_SIZE
+	if use_mailbox {
+		// Every posting matches one authenticated p tag. The query's p
+		// predicate is redundant only if it accepts every source mailbox.
+		for spec, j in specs {
+			if spec.name != 'p' {continue}
+			covered := true
+			for pk in auth_pks {
+				if !slice.contains(spec.values, Tag_Value{bytes = pk, length = 32}) {
+					covered = false
+					break
+				}
+			}
+			if covered {
+				specs[j] = specs[len(specs) - 1]
+				specs = specs[:len(specs) - 1]
+			}
+			break
+		}
+	}
+	tag_end := len(tags_buf) / TAG_ENTRY_SIZE
+	walk: Tag_Walk = .Sparse if use_ids && !indexed_tags else .Sequential
 
 	now := unix_now()
-	// Snapshot tombstones once per query - held for the scan + emission.
-	sync.shared_guard(&s.tombstones_mu)
 
 	// NIP-01: results must be the top-N by (created_at desc, id asc), not
 	// the last-N appended (#57, #108). Bounded heap whose root is the worst
 	// survivor; complexity O(M log N).
 	heap: pq.Priority_Queue(Heap_Item)
-	pq.init(
-		&heap,
-		heap_item_worse,
-		pq.default_swap_proc(Heap_Item),
-		limit + 1,
-		context.temp_allocator,
-	)
+	hits: [dynamic][]u8
+	if steps > 1 {
+		if ordered {
+			hits = make([dynamic][]u8, 0, min(steps, limit), context.temp_allocator)
+		} else {
+			pq.init(
+				&heap,
+				heap_item_worse,
+				pq.default_swap_proc(Heap_Item),
+				min(steps, limit),
+				context.temp_allocator,
+			)
+		}
+	}
 	defer pq.destroy(&heap)
 
 	// Pre-extract filter fields to avoid repeated Maybe-unwrapping in the hot loop.
-	fkinds, has_kinds := filter.kinds.?
 	fauthors, has_authors := filter.authors.?
-	fids, has_ids := filter.ids.?
 	fsince, has_since := filter.since.?
 	funtil, has_until := filter.until.?
 	fsearch, has_search := filter.search.?
 
-	// Resolved-ids fast path: when every requested id is full-length, the
-	// known_ids map pins each present id to its index slot and the scan
-	// visits |ids| slots instead of all of them. Every candidate is verified
-	// against the entry id up front: the map can be stale in the window
-	// between a compaction/append publishing the index and the map update,
-	// and any mismatch or out-of-range slot abandons the fast path before
-	// the scan starts, so the fallback needs no partial-state cleanup. Ids
-	// absent from the map are conclusively absent from the index.
-	cand: [dynamic]int
-	use_slots := false
-	if has_ids && len(fids) > 0 {
-		use_slots = true
-		for fid in fids {
-			if fid.length != 32 {
-				use_slots = false
-				break
-			}
-		}
-	}
-	if use_slots {
-		cand = make([dynamic]int, 0, len(fids), context.temp_allocator)
-		sync.shared_guard(&s.known_ids_mu)
-		for fid in fids {
-			slot, ok := s.known_ids[fid.bytes]
-			if !ok {
-				continue
-			}
-			i := int(slot)
-			if i >= total || (cast(^[32]u8)&idx[i * INDEX_ENTRY_SIZE + 28])^ != fid.bytes {
-				use_slots = false
-				break
-			}
-			append(&cand, i)
-		}
-	}
-	steps := total
-	if use_slots {
-		slice.sort(cand[:])
-		steps = len(cand)
-	}
-
+	// Hold the tombstone snapshot for the scan and emission.
+	sync.shared_guard(&s.tombstones_mu)
 	prev_slot := -1
 	for si := 0; si < steps; si += 1 {
 		i: int
 		if use_slots {
-			// Descending slot order, duplicates skipped (the same id may
-			// appear more than once in the filter).
-			i = cand[len(cand) - 1 - si]
+			candidate: Event_Slot
+			if use_mailbox {
+				candidate = mailbox_next(cursors, raw_data(idx))
+			} else {
+				candidate = cand[si if ordered else steps - 1 - si]
+			}
+			i = int(candidate.slot)
 			if i == prev_slot {
 				continue
 			}
 			prev_slot = i
+			if indexed_tags {
+				tag_end = int(candidate.tag_end)
+			}
 		} else {
 			i = total - 1 - si
 		}
@@ -371,6 +514,7 @@ query_authed :: proc(
 		// 2. Time bounds — 8-byte read. created_at i64le at offset 8.
 		created_at := i64(endian.unchecked_get_u64le(base[8:16]))
 		if has_since && created_at < fsince {
+			if ordered do break
 			continue
 		}
 		if has_until && created_at > funtil {
@@ -400,34 +544,23 @@ query_authed :: proc(
 		offset := endian.unchecked_get_u64le(base[0:8])
 
 		// 6. NIP-17: kind-1059 events only served to the p-tag recipient.
-		if kind == nostr.KIND_GIFT_WRAP {
-			if nip17_skip_all || offset not_in nip17_set {
-				continue
-			}
+		wrap := kind == nostr.KIND_GIFT_WRAP
+		if wrap && (len(auth_pks) == 0 || (!use_slots && offset not_in recipient_offsets)) {
+			continue
 		}
 
-		// 7. Walk tags backwards with the index, comparing only this event's
-		// records. Skip newer offsets, including tags beyond the index snapshot.
-		if len(specs) > 0 {
-			for tag_end > 0 {
-				pos := (tag_end - 1) * TAG_ENTRY_SIZE
-				if endian.unchecked_get_u64le(tags_g.data[pos:pos + 8]) <= offset {
-					break
-				}
-				tag_end -= 1
+		// 7. Mailbox slots and the fallback offsets were selected by auth key.
+		//    ID slots still need that check, independently of requested tags.
+		check_recipient := wrap && use_ids
+		if check_recipient || len(specs) > 0 {
+			// With a known end, the recipient check alone can stop at its
+			// first match without first walking back to find the start.
+			tags := tags_buf[:tag_end * TAG_ENTRY_SIZE]
+			if !indexed_tags || len(specs) > 0 {
+				tags = candidate_tags(tags_buf, &tag_end, offset, walk)
 			}
-			end := tag_end
-			for tag_end > 0 {
-				pos := (tag_end - 1) * TAG_ENTRY_SIZE
-				if endian.unchecked_get_u64le(tags_g.data[pos:pos + 8]) != offset {
-					break
-				}
-				tag_end -= 1
-			}
-			if !event_tags_match_specs(
-				tags_g.data[tag_end * TAG_ENTRY_SIZE:end * TAG_ENTRY_SIZE],
-				specs,
-			) {
+			if (check_recipient && !has_recipient(tags, offset, auth_pks)) ||
+			   !event_tags_match_specs(tags, specs) {
 				continue
 			}
 		}
@@ -441,7 +574,7 @@ query_authed :: proc(
 		// 9. IDs filter — before the tombstone lookup: a failed prefix
 		//    compare usually rejects on the first byte, far cheaper than
 		//    hashing a 32-byte map key. Resolved slots were already verified.
-		if has_ids && !use_slots {
+		if has_ids && !use_ids {
 			found := false
 			for fid in fids {
 				if nostr.hex_prefix_matches(fid, id) {
@@ -492,7 +625,7 @@ query_authed :: proc(
 		//     - NIP-50: content substring match.
 		//     - NIP-70: protected events only served to the author.
 		authed := pk_in(auth_pks, pubkey^)
-		if has_search || !authed || access.check != nil {
+		if ordered || steps == 1 || has_search || !authed || access.check != nil {
 			start, end, bok := blob_bounds(idx, i, total, len(data), offset)
 			if !bok {
 				return .Io
@@ -513,12 +646,29 @@ query_authed :: proc(
 			if !visible {
 				continue
 			}
+			if steps == 1 {
+				return emit(user, dp)
+			}
+			if ordered {
+				append(&hits, dp)
+				if len(hits) == limit do break
+				continue
+			}
 		}
 
-		pq.push(&heap, Heap_Item{created_at, id^, i, offset})
-		if pq.len(heap) > limit {
-			pq.pop(&heap)
-		} else if pq.len(heap) == limit && i > 0 {
+		item := Heap_Item{created_at, id^, i, offset}
+		if steps <= limit {
+			// All candidates fit: no heap maintenance or early-exit test.
+			append(&heap.queue, item)
+			continue
+		}
+		if pq.len(heap) == limit {
+			heap.queue[0] = item
+			pq.fix(&heap, 0)
+			continue
+		}
+		pq.push(&heap, item)
+		if pq.len(heap) == limit && i > 0 {
 			// Check immediately on first fill instead of scanning to the
 			// next 1024-slot boundary. Ties still require further scanning.
 			stop: bool
@@ -533,14 +683,16 @@ query_authed :: proc(
 		}
 	}
 
-	// Drain the heap worst-first into a buffer, then emit in reverse:
-	// (created_at desc, id asc) - the NIP-01 emission order.
-	n := pq.len(heap)
-	out := make([]Heap_Item, n, context.temp_allocator)
-	for j := n - 1; j >= 0; j -= 1 {
-		out[j] = pq.pop(&heap)
+	if ordered {
+		for dp in hits do emit(user, dp) or_return
+		return .None
 	}
-	for &item in out {
+
+	// Selection is finished. Reuse its storage for NIP-01 emission order.
+	if pq.len(heap) > 1 {
+		slice.sort_by(heap.queue[:], proc(a, b: Heap_Item) -> bool {return heap_item_worse(b, a)})
+	}
+	for &item in heap.queue {
 		start, end, bok := blob_bounds(idx, item.slot, total, len(data), item.offset)
 		if !bok {
 			return .Io

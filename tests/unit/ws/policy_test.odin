@@ -119,49 +119,59 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 		reason = .Auth_Required,
 	}
 	r := Relay {
-		cfg = {max_subscriptions_per_conn = 10, max_filters_per_req = 10, max_limit = 100},
+		cfg = {max_subscriptions_per_conn = 1, max_filters_per_req = 10, max_limit = 100},
 		hooks = {user = &spy, check_request = spy_request, check_read = reader_is_author},
 	}
 	fanout_init(&r.fanout)
 	defer fanout_destroy(&r.fanout)
 	outbox := Outbox {
-		conn_id  = 1,
-		auth_pks = make(map[[32]u8]struct{}),
+		conn_id = 1,
 	}
 	ch, cerr := chan.create(chan.Chan(Out_Msg), 16, context.allocator)
 	assert(cerr == nil)
 	outbox.ch = ch
 	o := &outbox
-	defer {chan.destroy(o.ch); delete(o.auth_pks)}
+	defer chan.destroy(o.ch)
 	cs := Conn_State {
-		relay     = &r,
-		outbox    = o,
-		live_subs = make(map[string]struct{}),
-		neg_subs  = make(map[string]^Neg_Session),
+		relay    = &r,
+		outbox   = o,
+		neg_subs = make(map[string]^Neg_Session),
 	}
-	defer {delete(cs.live_subs); delete(cs.neg_subs)}
+	defer delete(cs.neg_subs)
 	filter: nostr.Filter
-	key := r.fanout.next_key
 	fanout_subscribe(&r.fanout, "s", {filter}, o)
-	cs.live_subs[strings.clone("s")] = {}
+	cs.live_count = 1
 	ev := fixtures.test_make_event(1, 1, 1000, nil)
 	shared := shared_event_new(event_clone(&ev, context.allocator))
 	defer shared_event_release(shared)
-	live := Live_Event {
-		key    = key,
-		sub_id = "s",
-		shared = shared,
-	}
+	fanout_broadcast(&r.fanout, shared)
+	msg, queued := chan.try_recv(o.ch)
+	assert(queued)
+	defer drop_msg(msg)
+	live := msg.(Out_Live).live
 	testing.expect(t, !live_allowed(&cs, live), "anonymous reader must be hidden")
-	o.auth_pks[shared.ev.pubkey] = {}
+	assert(auth_record(&cs.auth, shared.ev.pubkey))
 	testing.expect(t, live_allowed(&cs, live), "current auth must be used")
-	delete_key(&o.auth_pks, shared.ev.pubkey)
-	testing.expect(t, !live_allowed(&cs, live))
-	o.auth_pks[shared.ev.pubkey] = {}
+	// A policy snapshot cannot overwrite the connection's authenticated key.
+	keys: [MAX_AUTH_PUBKEYS][32]u8
+	view := auth_snapshot(&cs.auth, &keys)
+	view[0] = {}
+	testing.expect(t, live_allowed(&cs, live))
 
 	// A denied replacement must invalidate events already queued by the old REQ.
+	remove_live_sub(&cs, "missing")
+	handle_req(&cs, "other", {filter})
+	reply, got := chan.try_recv(o.ch)
+	assert(got)
+	testing.expect_value(
+		t,
+		reply.(Out_Text).json,
+		`["CLOSED","other","restricted: too many subscriptions"]`,
+	)
+	drop_msg(reply)
+	testing.expect(t, live_allowed(&cs, live))
 	handle_req(&cs, "s", {filter})
-	testing.expect(t, "s" not_in cs.live_subs)
+	testing.expect_value(t, cs.live_count, 0)
 	testing.expect(t, !live_allowed(&cs, live))
 	handle_count(&cs, "c", {filter})
 	handle_neg_open(&cs, "n", &filter, nil)
@@ -318,6 +328,22 @@ test_marked_vanished_ingress :: proc(t: ^testing.T) {
 		testing.expect_value(t, reason, "blocked: test policy")
 		testing.expect_value(t, spy.writes[source], 1)
 	}
+}
+
+@(test)
+test_auth_capacity_and_reuse :: proc(t: ^testing.T) {
+	a: Auth_State
+	auth_state_init(&a)
+	for i in 0 ..< MAX_AUTH_PUBKEYS {
+		testing.expect(t, auth_record(&a, [32]u8{0 = u8(i)}))
+	}
+	testing.expect(t, auth_record(&a, {}))
+	testing.expect(t, !auth_record(&a, [32]u8{0 = 255}))
+	auth_state_destroy(&a)
+	auth_state_init(&a)
+	defer auth_state_destroy(&a)
+	keys: [MAX_AUTH_PUBKEYS][32]u8
+	testing.expect_value(t, len(auth_snapshot(&a, &keys)), 0)
 }
 
 @(test)

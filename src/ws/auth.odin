@@ -3,7 +3,9 @@ package ws
 
 import "core:crypto"
 import "core:fmt"
+import "core:slice"
 import "core:strings"
+import "core:sync"
 
 import "../nostr"
 import "../pack"
@@ -11,9 +13,28 @@ import "../pack"
 // Per-connection NIP-42 authentication state.
 Auth_State :: struct {
 	// Challenge string sent to the client on connection open (32 hex chars).
-	challenge:     string,
-	// Pubkeys the client has successfully authenticated as.
-	authenticated: map[[32]u8]struct {},
+	challenge: string,
+	// Only the socket reader appends. Published entries never move or change.
+	keys:      [MAX_AUTH_PUBKEYS][32]u8,
+	count:     int,
+}
+
+@(private)
+auth_record :: proc(a: ^Auth_State, pk: [32]u8) -> bool {
+	n := sync.atomic_load(&a.count)
+	if slice.contains(a.keys[:n], pk) {return true}
+	if n == len(a.keys) {return false}
+	a.keys[n] = pk
+	sync.atomic_store(&a.count, n + 1)
+	return true
+}
+
+// Give policy callbacks a private view, never a mutable alias to live keys.
+@(private)
+auth_snapshot :: proc(a: ^Auth_State, dst: ^[MAX_AUTH_PUBKEYS][32]u8) -> [][32]u8 {
+	n := sync.atomic_load(&a.count)
+	copy(dst[:n], a.keys[:n])
+	return dst[:n]
 }
 
 // Generate a 32-character hex challenge string from 16 bytes of OS entropy.
@@ -28,12 +49,11 @@ generate_challenge :: proc(allocator := context.allocator) -> string {
 
 auth_state_init :: proc(a: ^Auth_State, allocator := context.allocator) {
 	a.challenge = generate_challenge(allocator)
-	a.authenticated = make(map[[32]u8]struct {}, allocator)
 }
 
 auth_state_destroy :: proc(a: ^Auth_State, allocator := context.allocator) {
 	delete(a.challenge, allocator)
-	delete(a.authenticated)
+	a^ = {}
 }
 
 // Extract the host (domain) component from a URL string: scheme, path, and
@@ -86,7 +106,9 @@ verify_auth_event :: proc(
 
 	has_challenge := false
 	for tag in ev.tags {
-		if len(tag.fields) >= 2 && tag.fields[0] == "challenge" && tag.fields[1] == expected_challenge {
+		if len(tag.fields) >= 2 &&
+		   tag.fields[0] == "challenge" &&
+		   tag.fields[1] == expected_challenge {
 			has_challenge = true
 			break
 		}

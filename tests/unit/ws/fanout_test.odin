@@ -2,13 +2,17 @@ package ws
 
 import "../../tests/fixtures"
 
-import "core:strings"
-import "core:fmt"
-import "core:os"
-import "core:time"
 import "../store"
+import "core:fmt"
+import "core:net"
+import "core:os"
+import "core:slice"
+import "core:strings"
 import "core:sync/chan"
+import "core:sys/linux"
 import "core:testing"
+import "core:thread"
+import "core:time"
 
 import "../nostr"
 import "../pack"
@@ -32,7 +36,6 @@ make_outbox :: proc(id: u64, cap: int) -> ^Outbox {
 	assert(err == nil)
 	o.ch = c
 	o.conn_id = id
-	o.auth_pks = make(map[[32]u8]struct {})
 	return o
 }
 
@@ -47,7 +50,6 @@ outbox_destroy :: proc(o: ^Outbox) {
 		drop_out_msg(msg)
 	}
 	chan.destroy(o.ch)
-	delete(o.auth_pks)
 	free(o)
 }
 
@@ -86,7 +88,7 @@ test_broadcast_two_subscribers_receive :: proc(t: ^testing.T) {
 	defer fanout_destroy(&f)
 	o1 := make_outbox(1, 8)
 	o2 := make_outbox(2, 8)
-	defer {outbox_destroy(o1);outbox_destroy(o2)}
+	defer {outbox_destroy(o1); outbox_destroy(o2)}
 
 	any1: nostr.Filter
 	any2: nostr.Filter
@@ -138,7 +140,7 @@ test_full_channel_does_not_block :: proc(t: ^testing.T) {
 	defer fanout_destroy(&f)
 	o1 := make_outbox(1, 1)
 	o2 := make_outbox(2, 8)
-	defer {outbox_destroy(o1);outbox_destroy(o2)}
+	defer {outbox_destroy(o1); outbox_destroy(o2)}
 
 	any1: nostr.Filter
 	any2: nostr.Filter
@@ -216,6 +218,76 @@ test_subscribe_replace_no_double_delivery :: proc(t: ^testing.T) {
 	fanout_unsubscribe_all(&f, o)
 }
 
+@(test)
+test_exact_id_subscription_reuse :: proc(t: ^testing.T) {
+	r: Relay
+	fanout_init(&r.fanout)
+	defer fanout_destroy(&r.fanout)
+	o := make_outbox(1, 8)
+	defer outbox_destroy(o)
+	defer fanout_unsubscribe_all(&r.fanout, o)
+	other := make_outbox(o.conn_id + u64(len(r.fanout.shards)), 8)
+	defer outbox_destroy(other)
+	defer fanout_unsubscribe_all(&r.fanout, other)
+	cs := Conn_State {
+		relay  = &r,
+		outbox = o,
+	}
+
+	a := make_shared(1)
+	defer shared_event_release(a)
+	b := make_shared(2)
+	defer shared_event_release(b)
+	b.ev.id[31] = 2
+	ids := make([dynamic]nostr.Hex_Prefix, 1, context.temp_allocator)
+	ids[0] = {
+		bytes  = a.ev.id,
+		length = 32,
+	}
+	filter := nostr.Filter {
+		ids = ids,
+	}
+	fanout_subscribe(&r.fanout, "s", {filter}, o)
+	ids[0].bytes = b.ev.id
+	fanout_subscribe(&r.fanout, "s", {filter}, other)
+
+	fanout_broadcast(&r.fanout, b)
+	testing.expect(t, !recv_one(o), "subscription must own its ID filter")
+	testing.expect(t, recv_one(other), "another connection can use the same subscription ID")
+	fanout_broadcast(&r.fanout, a)
+	old, got_old := chan.try_recv(o.ch)
+	assert(got_old)
+	defer drop_out_msg(old)
+	testing.expect(t, live_allowed(&cs, old.(Out_Live).live))
+
+	fanout_subscribe(&r.fanout, "s", {filter}, o)
+	testing.expect(
+		t,
+		!live_allowed(&cs, old.(Out_Live).live),
+		"replacement must invalidate the queued event",
+	)
+	fanout_broadcast(&r.fanout, a)
+	testing.expect(t, !recv_one(o), "old filter must not match")
+	fanout_broadcast(&r.fanout, b)
+	current, got_current := chan.try_recv(o.ch)
+	assert(got_current)
+	defer drop_out_msg(current)
+	testing.expect(t, live_allowed(&cs, current.(Out_Live).live))
+	testing.expect(t, recv_one(other))
+	testing.expect(t, !recv_one(other), "other connection must receive only the matching event")
+
+	testing.expect(t, fanout_unsubscribe(&r.fanout, "s", o))
+	fanout_broadcast(&r.fanout, b)
+	testing.expect(t, !recv_one(o), "CLOSE must stop live routing")
+	testing.expect(t, recv_one(other), "CLOSE must not affect another connection")
+	fanout_subscribe(&r.fanout, "s", {filter}, o)
+	testing.expect(
+		t,
+		!live_allowed(&cs, current.(Out_Live).live),
+		"reusing the ID must not revive the closed generation",
+	)
+}
+
 // Default to a correctness check; raise iterations for release benchmarks.
 @(private)
 PERF_ITERS :: #config(FASTR_PERF_ITERS, 1)
@@ -268,6 +340,29 @@ perf_emit :: proc(user: rawptr, dp: []u8) -> store.Error {
 	return .None
 }
 
+@(private = "file")
+replay_checksum :: proc(batch: Out_Batch, events: int) -> u64 {
+	checksum: u64
+	wire := batch.wire[:]
+	for i in 0 ..< events + 1 {
+		h, err := decode_frame_header(wire)
+		assert(err == .None && h.fin && !h.masked && h.opcode == .Text)
+		end := h.header_len + int(h.payload_len)
+		payload := wire[h.header_len:end]
+		if i == events {
+			assert(string(payload) == "[\"EOSE\",\"perf\"]")
+		} else {
+			assert(strings.has_prefix(string(payload), "[\"EVENT\",\"perf\","))
+		}
+		for b in payload {
+			checksum = checksum * 31 + u64(b)
+		}
+		wire = wire[end:]
+	}
+	assert(len(wire) == 0)
+	return checksum
+}
+
 @(test)
 test_perf_queries :: proc(t: ^testing.T) {
 	dir, dir_err := os.make_directory_temp("", "fastr_perf_*", context.allocator)
@@ -296,7 +391,10 @@ test_perf_queries :: proc(t: ^testing.T) {
 		for i in 0 ..< n {
 			append(&selected, ids[i * 3])
 		}
-		filter := nostr.Filter{ids = selected, limit = n}
+		filter := nostr.Filter {
+			ids   = selected,
+			limit = n,
+		}
 		ref: u64
 		assert(store.query_authed(s, &filter, nil, &ref, perf_emit) == .None)
 		free_all(context.temp_allocator)
@@ -307,11 +405,18 @@ test_perf_queries :: proc(t: ^testing.T) {
 			assert(checksum == ref)
 			free_all(context.temp_allocator)
 		}
-		fmt.printfln("PERF ids-%d %.1f ns/op checksum=%d", n, f64(time.tick_since(start)) / PERF_ITERS, ref)
+		fmt.printfln(
+			"PERF ids-%d %.1f ns/op checksum=%d",
+			n,
+			f64(time.tick_since(start)) / PERF_ITERS,
+			ref,
+		)
 		delete(selected)
 	}
 	for n in ([]int{1, 100, 500}) {
-		filter := nostr.Filter{limit = n}
+		filter := nostr.Filter {
+			limit = n,
+		}
 		ref: u64
 		assert(store.query_authed(s, &filter, nil, &ref, perf_emit) == .None)
 		free_all(context.temp_allocator)
@@ -322,22 +427,32 @@ test_perf_queries :: proc(t: ^testing.T) {
 			assert(checksum == ref)
 			free_all(context.temp_allocator)
 		}
-		fmt.printfln("PERF scan-%d %.1f ns/op checksum=%d", n, f64(time.tick_since(start)) / PERF_ITERS, ref)
+		fmt.printfln(
+			"PERF scan-%d %.1f ns/op checksum=%d",
+			n,
+			f64(time.tick_since(start)) / PERF_ITERS,
+			ref,
+		)
 	}
-	r := Relay{store = s, cfg = {max_subscriptions_per_conn = 20, max_filters_per_req = 10, max_limit = 500}}
+	r := Relay {
+		store = s,
+		cfg = {max_subscriptions_per_conn = 20, max_filters_per_req = 10, max_limit = 500},
+	}
 	fanout_init(&r.fanout)
 	defer fanout_destroy(&r.fanout)
 	o := make_outbox(1, 1)
 	defer outbox_destroy(o)
-	cs := Conn_State{relay = &r, outbox = o, live_subs = make(map[string]struct {})}
-	defer {
-		for key in cs.live_subs {
-			delete(key)
-		}
-		delete(cs.live_subs)
+	cs := Conn_State {
+		relay  = &r,
+		outbox = o,
 	}
+	last_id := make([dynamic]nostr.Hex_Prefix, 1)
+	defer delete(last_id)
+	last_id[0] = ids[len(ids) - 1]
 	for n in ([]int{1, 100, 500}) {
-		filter := nostr.Filter{limit = n}
+		filter := nostr.Filter {
+			limit = n,
+		}
 		ref: u64
 		elapsed: time.Duration
 		for iteration in 0 ..< PERF_ITERS + 1 {
@@ -347,13 +462,8 @@ test_perf_queries :: proc(t: ^testing.T) {
 			assert(ok)
 			elapsed += time.tick_since(start)
 			batch, is_batch := msg.(Out_Batch)
-			assert(is_batch && len(batch.frames) == n + 1)
-			checksum: u64
-			for frame in batch.frames {
-				for b in transmute([]u8)frame {
-					checksum = checksum * 31 + u64(b)
-				}
-			}
+			assert(is_batch)
+			checksum := replay_checksum(batch, n)
 			if iteration == 0 {
 				ref = checksum
 				elapsed = 0
@@ -376,25 +486,74 @@ test_perf_queries :: proc(t: ^testing.T) {
 		empty := nostr.Filter {
 			limit = 0,
 		}
-		for filters in ([3][]nostr.Filter{{filter, filter}, {empty, filter, filter}, {filter, empty, filter}}) {
+		first := filter
+		if n > 1 {
+			// The last ID in the newest timestamp tie must move after its peers.
+			first = {
+				ids   = last_id,
+				limit = 1,
+			}
+		}
+		for filters in ([4][]nostr.Filter{{filter, filter}, {empty, filter, filter}, {filter, empty, filter}, {first, filter}}) {
 			handle_req(&cs, "perf", filters)
 			// The second batch must be freed when the outbox is already full.
 			handle_req(&cs, "perf", filters)
 			msg, ok := chan.try_recv(o.ch)
 			assert(ok)
 			batch, is_batch := msg.(Out_Batch)
-			assert(is_batch && len(batch.frames) == n + 1)
-			checksum: u64
-			for frame in batch.frames {
-				for b in transmute([]u8)frame {
-					checksum = checksum * 31 + u64(b)
-				}
-			}
-			assert(checksum == ref)
+			assert(is_batch)
+			assert(replay_checksum(batch, n) == ref)
 			drop_msg(msg)
 			free_all(context.temp_allocator)
 		}
 	}
+}
+
+@(test)
+test_partial_replay_order :: proc(t: ^testing.T) {
+	pair: [2]linux.Fd
+	assert(linux.socketpair(.UNIX, .STREAM, linux.Protocol(0), &pair) == .NONE)
+	defer linux.close(pair[0])
+	defer linux.close(pair[1])
+	sndbuf: i32 = 4096
+	assert(linux.setsockopt(pair[0], linux.SOL_SOCKET, .SNDBUF, &sndbuf) == .NONE)
+
+	o := make_outbox(1, 2)
+	defer outbox_destroy(o)
+	cs := Conn_State {
+		outbox = o,
+	}
+	cs.conn.sock = net.TCP_Socket(pair[0])
+	o.conn = &cs.conn
+
+	PAYLOAD :: 128 * 1024
+	first := make([]u8, MAX_FRAME_HEADER_LEN + PAYLOAD)
+	defer delete(first)
+	h := encode_frame_header(first, .Binary, PAYLOAD)
+	for &b, i in first[h:] {b = u8(i % 251)}
+	second := []u8{0x81, 1, 'x'}
+	assert(outbox_send(o, Out_Msg(Out_Batch{wire = slice.clone_to_dynamic(first)})))
+	got := make([]u8, len(first) + len(second) + 1)
+	defer delete(got)
+	count, err := linux.recv(pair[1], got, {.DONTWAIT})
+	assert(err == .NONE && 0 < count && count < len(first))
+	assert(outbox_send(o, Out_Msg(Out_Batch{wire = slice.clone_to_dynamic(second)})))
+	chan.close(o.ch)
+	w := thread.create_and_start_with_poly_data(&cs, proc(cs: ^Conn_State) {
+		writer_loop(cs)
+		linux.shutdown(linux.Fd(cs.conn.sock), .WR)
+	})
+	defer thread.destroy(w)
+	for count < len(got) {
+		n, recv_err := linux.recv(pair[1], got[count:], {})
+		assert(recv_err == .NONE)
+		if n == 0 {break}
+		count += n
+	}
+	linux.shutdown(pair[1], .RD)
+	thread.join(w)
+	testing.expect(t, slice.equal(got[:len(first)], first))
+	testing.expect(t, slice.equal(got[len(first):count], second))
 }
 
 @(test)
@@ -410,7 +569,6 @@ test_perf_subscribe :: proc(t: ^testing.T) {
 		start := time.tick_now()
 		for _ in 0 ..< PERF_ITERS {
 			fanout_subscribe(&f, "same-id", {nostr.Filter{}}, outboxes[n - 1])
-			assert(len(f.subs) == n)
 			free_all(context.temp_allocator)
 		}
 		fmt.printfln("PERF subscribe-%d %.1f ns/op", n, f64(time.tick_since(start)) / PERF_ITERS)
@@ -421,7 +579,12 @@ test_perf_subscribe :: proc(t: ^testing.T) {
 			assert(recv_one(outbox) && !recv_one(outbox))
 		}
 		fanout_unsubscribe(&f, "same-id", outboxes[n - 1])
-		assert(len(f.subs) == n - 1)
+		ev = make_shared(1)
+		fanout_broadcast(&f, ev)
+		shared_event_release(ev)
+		for outbox, i in outboxes {
+			assert(recv_one(outbox) == (i != n - 1))
+		}
 		fanout_destroy(&f)
 		for outbox in outboxes {
 			outbox_destroy(outbox)

@@ -12,9 +12,11 @@
 package ws
 
 import "base:runtime"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
+import "core:sys/linux"
 
 import "../nostr"
 import "../pack"
@@ -61,15 +63,15 @@ Out_Text :: struct {
 }
 
 Out_Batch :: struct {
-	frames: []string, // ownership transfers to the writer (slice + strings)
+	wire: [dynamic]u8, // retain the allocation base and its owning allocator
+	sent: int,
 }
 
 Out_Live :: struct {
 	live: Live_Event,
 }
 
-// Control frames must also flow through the writer thread — the reader and
-// writer threads share one TCP socket, so only the writer may send.
+// Control frames share the same ordered outbox as replay and live events.
 Out_Pong :: struct {
 	payload: []u8, // owned copy (max 125 bytes)
 }
@@ -87,23 +89,70 @@ Out_Msg :: union {
 }
 
 // Per-connection outbound endpoint registered with the fanout.
-// `auth_pks` is shared between the reader (writes on AUTH) and the writer
-// (reads for NIP-17/NIP-70 gating).
+// Unregister before freeing it: fanout buckets can point into subs.
 Outbox :: struct {
-	ch:       chan.Chan(Out_Msg),
-	conn_id:  u64,
-	auth_mu:  sync.RW_Mutex,
-	auth_pks: map[[32]u8]struct {},
+	ch:      chan.Chan(Out_Msg),
+	conn:    ^Conn,
+	send_mu: sync.Mutex,
+	pending: int, // queued plus currently being written
+	failed:  bool,
+	conn_id: u64,
+	subs:    Subscription_Slot,
+}
+
+@(private)
+outbox_send :: proc(o: ^Outbox, msg: Out_Msg, spare: ^[dynamic]u8 = nil) -> bool {
+	sync.guard(&o.send_mu)
+	if o.failed {
+		return false
+	}
+	msg := msg
+	if batch, ok := &msg.(Out_Batch); ok && o.pending == 0 && o.conn != nil {
+		// No writer owns the socket. Don't block the reader on a slow client.
+		n, err := linux.send(linux.Fd(o.conn.sock), batch.wire[:], {.DONTWAIT, .NOSIGNAL})
+		if err == .NONE {
+			if int(n) == len(batch.wire) {
+				if spare != nil && cap(batch.wire) <= 256 * 1024 {
+					clear(&batch.wire)
+					spare^ = batch.wire
+				} else {
+					delete(batch.wire)
+				}
+				return true
+			}
+			batch.sent = int(n)
+		}
+	}
+	// With pending == 0 the channel is empty. A partial batch's suffix is
+	// therefore admitted before any later producer can acquire send_mu.
+	if !chan.try_send(o.ch, msg) {
+		return false
+	}
+	o.pending += 1
+	return true
 }
 
 @(private = "file")
 Subscription :: struct {
+	key:           u64,
+	slot:          int,
 	sub_id:        string, // owned by the fanout
 	filters:       []nostr.Filter, // owned by the fanout (deep clones)
 	outbox:        ^Outbox,
 	// Kind buckets this sub is registered in (nil ⇒ wildcard only or neither).
 	indexed_kinds: []u16, // owned
-	in_wildcard:   bool,
+	wildcard_slot: int, // -1 if the subscription is not in wildcard
+}
+
+@(private = "file")
+Subscription_Slot :: struct {
+	// The shard lock protects this record and its overflow count. Queued events
+	// own their IDs and generations, so CLOSE can reuse the record immediately.
+	first:          Subscription, // outbox == nil when free
+	short_id:       [64]u8,
+	filter:         [1]nostr.Filter,
+	prefix:         [1]nostr.Hex_Prefix,
+	overflow_count: int,
 }
 
 @(private = "file")
@@ -113,43 +162,59 @@ Subscription_Key :: struct {
 }
 
 Fanout :: struct {
+	shards: [8]Fanout_Shard,
+}
+
+@(private)
+fanout_shard :: #force_inline proc(hub: ^Fanout, o: ^Outbox) -> ^Fanout_Shard {
+	return &hub.shards[o.conn_id % len(hub.shards)]
+}
+
+@(private)
+Fanout_Shard :: struct {
 	mu:        sync.RW_Mutex,
 	next_key:  u64,
-	subs:      map[u64]Subscription,
-	by_kind:   map[u16][dynamic]u64,
-	wildcard:  [dynamic]u64,
-	by_sub_id: map[Subscription_Key]u64,
+	subs:      [dynamic]^Subscription,
+	by_kind:   map[u16][dynamic]^Subscription,
+	wildcard:  [dynamic]^Subscription,
+	overflow:  map[Subscription_Key]^Subscription,
 	allocator: runtime.Allocator,
 }
 
-fanout_init :: proc(f: ^Fanout, allocator := context.allocator) {
-	f.allocator = allocator
-	f.subs = make(map[u64]Subscription, allocator)
-	f.by_kind = make(map[u16][dynamic]u64, allocator)
-	f.wildcard = make([dynamic]u64, allocator)
-	f.by_sub_id = make(map[Subscription_Key]u64, allocator)
+fanout_init :: proc(hub: ^Fanout, allocator := context.allocator) {
+	for &f in hub.shards {
+		f.allocator = allocator
+		f.subs = make([dynamic]^Subscription, allocator)
+		f.by_kind = make(map[u16][dynamic]^Subscription, allocator)
+		f.wildcard = make([dynamic]^Subscription, allocator)
+		f.overflow = make(map[Subscription_Key]^Subscription, allocator)
+	}
 }
 
-fanout_destroy :: proc(f: ^Fanout) {
-	sync.guard(&f.mu)
-	keys := make([dynamic]u64, context.temp_allocator)
-	for key in f.subs {
-		append(&keys, key)
+fanout_destroy :: proc(hub: ^Fanout) {
+	for &f in hub.shards {
+		sync.guard(&f.mu)
+		for len(f.subs) != 0 {
+			remove_sub(&f, f.subs[len(f.subs) - 1])
+		}
+		delete(f.subs)
+		delete(f.by_kind)
+		delete(f.wildcard)
+		delete(f.overflow)
 	}
-	for key in keys {
-		remove_sub(f, key)
-	}
-	delete(f.subs)
-	delete(f.by_kind)
-	delete(f.wildcard)
-	delete(f.by_sub_id)
 }
 
 // Compute which buckets a subscription with these filters lives in.
 // Any filter without a kinds constraint ⇒ wildcard. Otherwise the union of
 // all mentioned kinds. Only empty-kinds filters ⇒ neither (unreachable sub).
 @(private = "file")
-bucket_for :: proc(f: ^Fanout, filters: []nostr.Filter) -> (kinds: []u16, in_wildcard: bool) {
+bucket_for :: proc(
+	f: ^Fanout_Shard,
+	filters: []nostr.Filter,
+) -> (
+	kinds: []u16,
+	in_wildcard: bool,
+) {
 	for &filt in filters {
 		if _, present := filt.kinds.?; !present {
 			return nil, true
@@ -172,28 +237,35 @@ bucket_for :: proc(f: ^Fanout, filters: []nostr.Filter) -> (kinds: []u16, in_wil
 }
 
 @(private = "file")
-insert_sub :: proc(f: ^Fanout, sub: Subscription) {
-	key := f.next_key
+insert_sub :: proc(f: ^Fanout_Shard, sub: ^Subscription, in_wildcard: bool) {
+	sub.key = f.next_key
 	f.next_key += 1
-	if sub.in_wildcard {
-		append(&f.wildcard, key)
+	sub.wildcard_slot = -1
+	if in_wildcard {
+		sub.wildcard_slot = len(f.wildcard)
+		append(&f.wildcard, sub)
 	}
 	for k in sub.indexed_kinds {
 		bucket, ok := &f.by_kind[k]
 		if !ok {
-			f.by_kind[k] = make([dynamic]u64, f.allocator)
+			f.by_kind[k] = make([dynamic]^Subscription, f.allocator)
 			bucket = &f.by_kind[k]
 		}
-		append(bucket, key)
+		append(bucket, sub)
 	}
-	f.by_sub_id[Subscription_Key{sub.outbox, sub.sub_id}] = key
-	f.subs[key] = sub
+	slot := &sub.outbox.subs
+	if sub != &slot.first {
+		f.overflow[Subscription_Key{sub.outbox, sub.sub_id}] = sub
+		slot.overflow_count += 1
+	}
+	sub.slot = len(f.subs)
+	append(&f.subs, sub)
 }
 
 @(private = "file")
-remove_key_from :: proc(bucket: ^[dynamic]u64, key: u64) {
+remove_from_bucket :: proc(bucket: ^[dynamic]^Subscription, sub: ^Subscription) {
 	for v, i in bucket {
-		if v == key {
+		if v == sub {
 			unordered_remove(bucket, i)
 			return
 		}
@@ -201,102 +273,156 @@ remove_key_from :: proc(bucket: ^[dynamic]u64, key: u64) {
 }
 
 @(private = "file")
-remove_sub :: proc(f: ^Fanout, key: u64) {
-	sub, ok := f.subs[key]
-	if !ok {
-		return
-	}
-	if sub.in_wildcard {
-		remove_key_from(&f.wildcard, key)
+remove_sub :: proc(f: ^Fanout_Shard, sub: ^Subscription) {
+	if sub.wildcard_slot >= 0 {
+		f.wildcard[len(f.wildcard) - 1].wildcard_slot = sub.wildcard_slot
+		unordered_remove(&f.wildcard, sub.wildcard_slot)
 	}
 	for k in sub.indexed_kinds {
 		if bucket, b_ok := &f.by_kind[k]; b_ok {
-			remove_key_from(bucket, key)
+			remove_from_bucket(bucket, sub)
 			if len(bucket) == 0 {
-				b := f.by_kind[k]
-				delete(b)
+				delete(bucket^)
 				delete_key(&f.by_kind, k)
 			}
 		}
 	}
-	delete_key(&f.by_sub_id, Subscription_Key{sub.outbox, sub.sub_id})
-	delete_key(&f.subs, key)
-	// Free owned state.
+	f.subs[len(f.subs) - 1].slot = sub.slot
+	unordered_remove(&f.subs, sub.slot)
+	slot := &sub.outbox.subs
+	if sub != &slot.first {
+		delete_key(&f.overflow, Subscription_Key{sub.outbox, sub.sub_id})
+		slot.overflow_count -= 1
+	}
 	for &filt in sub.filters {
 		nostr.filter_destroy(&filt, f.allocator)
 	}
-	delete(sub.filters, f.allocator)
+	if raw_data(sub.filters) != raw_data(slot.filter[:]) {
+		delete(sub.filters, f.allocator)
+	}
 	delete(sub.indexed_kinds, f.allocator)
-	delete(sub.sub_id, f.allocator)
+	if raw_data(sub.sub_id) != raw_data(slot.short_id[:]) {
+		delete(sub.sub_id, f.allocator)
+	}
+	if sub == &slot.first {
+		slot.first = {}
+	} else {
+		free(sub, f.allocator)
+	}
+}
+
+@(private)
+find_sub :: proc(f: ^Fanout_Shard, outbox: ^Outbox, sub_id: string) -> ^Subscription {
+	slot := &outbox.subs
+	if slot.first.outbox != nil && slot.first.sub_id == sub_id {
+		return &slot.first
+	}
+	if slot.overflow_count == 0 {
+		return nil
+	}
+	return f.overflow[{outbox, sub_id}]
 }
 
 // Register or replace a subscription. A REQ with a duplicate sub_id on the
 // same connection replaces the previous one per NIP-01. Filters are deep-
 // cloned into the fanout's allocator; the caller keeps ownership of its own.
-fanout_subscribe :: proc(f: ^Fanout, sub_id: string, filters: []nostr.Filter, outbox: ^Outbox) {
+fanout_subscribe :: proc(hub: ^Fanout, sub_id: string, filters: []nostr.Filter, outbox: ^Outbox) {
+	f := fanout_shard(hub, outbox)
 	sync.guard(&f.mu)
-	cloned := make([]nostr.Filter, len(filters), f.allocator)
-	for &filt, i in filters {
-		cloned[i] = nostr.filter_clone(&filt, f.allocator)
+	if old := find_sub(f, outbox, sub_id); old != nil {
+		remove_sub(f, old)
 	}
-	kinds, in_wildcard := bucket_for(f, cloned)
-	if key, found := f.by_sub_id[Subscription_Key{outbox, sub_id}]; found {
-		remove_sub(f, key)
+	slot := &outbox.subs
+	sub := &slot.first
+	if sub.outbox != nil {
+		sub = new(Subscription, f.allocator)
 	}
-	insert_sub(f, Subscription {
-		sub_id        = strings.clone(sub_id, f.allocator),
-		filters       = cloned,
-		outbox        = outbox,
-		indexed_kinds = kinds,
-		in_wildcard   = in_wildcard,
-	})
+	sub.outbox = outbox
+	if sub == &slot.first && len(sub_id) <= len(slot.short_id) {
+		copy(slot.short_id[:], transmute([]u8)sub_id)
+		sub.sub_id = string(slot.short_id[:len(sub_id)])
+	} else {
+		sub.sub_id = strings.clone(sub_id, f.allocator)
+	}
+	if sub == &slot.first && len(filters) == 1 {
+		sub.filters = slot.filter[:]
+		source := filters[0]
+		ids, has_ids := source.ids.?
+		inline_id := has_ids && len(ids) == 1
+		if inline_id {
+			source.ids = nil
+		}
+		sub.filters[0] = nostr.filter_clone(&source, f.allocator)
+		if inline_id {
+			inline := slice.into_dynamic(slot.prefix[:])
+			append(&inline, ids[0])
+			sub.filters[0].ids = inline
+		}
+	} else {
+		sub.filters = make([]nostr.Filter, len(filters), f.allocator)
+		for &filt, i in filters {
+			sub.filters[i] = nostr.filter_clone(&filt, f.allocator)
+		}
+	}
+	kinds, in_wildcard := bucket_for(f, sub.filters)
+	sub.indexed_kinds = kinds
+	insert_sub(f, sub, in_wildcard)
 }
 
 // Remove a single subscription by sub_id + connection identity.
-fanout_unsubscribe :: proc(f: ^Fanout, sub_id: string, outbox: ^Outbox) {
+fanout_unsubscribe :: proc(hub: ^Fanout, sub_id: string, outbox: ^Outbox) -> bool {
+	f := fanout_shard(hub, outbox)
 	sync.guard(&f.mu)
-	if key, found := f.by_sub_id[Subscription_Key{outbox, sub_id}]; found {
-		remove_sub(f, key)
+	if sub := find_sub(f, outbox, sub_id); sub != nil {
+		remove_sub(f, sub)
+		return true
 	}
+	return false
 }
 
 // Remove all subscriptions belonging to a connection (connection closed).
-fanout_unsubscribe_all :: proc(f: ^Fanout, outbox: ^Outbox) {
+fanout_unsubscribe_all :: proc(hub: ^Fanout, outbox: ^Outbox) {
+	f := fanout_shard(hub, outbox)
 	sync.guard(&f.mu)
-	victims := make([dynamic]u64, context.temp_allocator)
-	for key, sub in f.subs {
-		if sub.outbox == outbox {
-			append(&victims, key)
-		}
+	if outbox.subs.first.outbox != nil {
+		remove_sub(f, &outbox.subs.first)
 	}
-	for key in victims {
-		remove_sub(f, key)
+	if outbox.subs.overflow_count == 0 {
+		return
+	}
+	#reverse for sub in f.subs {
+		if sub.outbox == outbox {
+			remove_sub(f, sub)
+		}
 	}
 }
 
 // Broadcast a freshly ingested event to all matching subscriptions.
 // Slow clients (full channel) are skipped; closed channels are pruned.
-fanout_broadcast :: proc(f: ^Fanout, shared: ^Shared_Event) {
+fanout_broadcast :: proc(hub: ^Fanout, shared: ^Shared_Event) {
 	// NIP-40: drop expired live events before delivery.
 	if exp, has := nostr.event_expiry(&shared.ev); has && exp <= nostr.unix_now() {
 		return
 	}
 
+	for &f in hub.shards {
+		broadcast_shard(&f, shared)
+	}
+}
+
+@(private)
+broadcast_shard :: proc(f: ^Fanout_Shard, shared: ^Shared_Event) {
 	needs_prune := false
 	{
 		sync.shared_guard(&f.mu)
 		// Kind buckets and wildcard are disjoint; each key occurs once.
-		buckets: [2][]u64
+		buckets: [2][]^Subscription
 		if b, ok := f.by_kind[shared.ev.kind]; ok {
 			buckets[0] = b[:]
 		}
 		buckets[1] = f.wildcard[:]
 		for bucket in buckets {
-			for key in bucket {
-				sub, ok := f.subs[key]
-				if !ok {
-					continue
-				}
+			for sub in bucket {
 				if !nostr.filter_matches(sub.filters, &shared.ev) {
 					continue
 				}
@@ -306,9 +432,13 @@ fanout_broadcast :: proc(f: ^Fanout, shared: ^Shared_Event) {
 				}
 				shared_event_acquire(shared)
 				live := Out_Live {
-					live = Live_Event{key = key, sub_id = strings.clone(sub.sub_id), shared = shared},
+					live = Live_Event {
+						key = sub.key,
+						sub_id = strings.clone(sub.sub_id),
+						shared = shared,
+					},
 				}
-				if !chan.try_send(sub.outbox.ch, Out_Msg(live)) {
+				if !outbox_send(sub.outbox, Out_Msg(live)) {
 					// Full (slow client) or closed: drop the event.
 					delete(live.live.sub_id)
 					shared_event_release(shared)
@@ -322,14 +452,10 @@ fanout_broadcast :: proc(f: ^Fanout, shared: ^Shared_Event) {
 
 	if needs_prune {
 		sync.guard(&f.mu)
-		closed := make([dynamic]u64, context.temp_allocator)
-		for key, sub in f.subs {
+		#reverse for sub in f.subs {
 			if chan.is_closed(sub.outbox.ch) {
-				append(&closed, key)
+				remove_sub(f, sub)
 			}
-		}
-		for key in closed {
-			remove_sub(f, key)
 		}
 	}
 }

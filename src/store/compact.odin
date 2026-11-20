@@ -303,17 +303,21 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 		append(&s.scan_ceiling, ..new_ceiling[:])
 	}
 
-	// Shrink: publish smaller lens BEFORE swapping mmaps, else a reader
-	// could pair the old len with the new short mmap and SIGBUS past the
-	// new tail. Opposite order from growth.
-	mapped_file_publish_len(&s.data, new_data_offset)
-	mapped_file_publish_len(&s.index, new_index_offset)
-	mapped_file_publish_len(&s.tags, new_tags_offset)
-	mapped_file_publish_len(&s.dtags, new_dtags_offset)
-	mapped_file_swap(&s.data, data_wf.file, new_data_offset) or_return
-	mapped_file_swap(&s.index, index_wf.file, new_index_offset) or_return
-	mapped_file_swap(&s.tags, tags_wf.file, new_tags_offset) or_return
-	mapped_file_swap(&s.dtags, dtags_wf.file, new_dtags_offset) or_return
+	{
+		sync.guard(&s.known_ids_mu)
+		defer publish_query_maps(s)
+		// Old mailbox slot numbers cannot resolve against the new mappings.
+		s.mailbox.entries = -1
+		// Shrink lengths before swapping for readers that pin files separately.
+		mapped_file_publish_len(&s.data, new_data_offset)
+		mapped_file_publish_len(&s.index, new_index_offset)
+		mapped_file_publish_len(&s.tags, new_tags_offset)
+		mapped_file_publish_len(&s.dtags, new_dtags_offset)
+		mapped_file_swap(&s.data, data_wf.file, new_data_offset) or_return
+		mapped_file_swap(&s.index, index_wf.file, new_index_offset) or_return
+		mapped_file_swap(&s.tags, tags_wf.file, new_tags_offset) or_return
+		mapped_file_swap(&s.dtags, dtags_wf.file, new_dtags_offset) or_return
+	}
 
 	// Replace the writer files, closing the old descriptors.
 	os.close(w.data.file)
