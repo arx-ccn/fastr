@@ -35,6 +35,7 @@ init_relay :: proc(relay: ^ws.Relay, st: ^store.Store, cfg: ^Config, plugins: ^P
 		max_content_length_per_kind = cfg.max_content_length_per_kind,
 		relay_url                   = cfg.relay_url,
 		min_pow_difficulty          = cfg.min_pow_difficulty,
+		whitelist                   = cfg.whitelist,
 	}
 
 	plugins.grasp_enabled = cfg.grasp_enabled

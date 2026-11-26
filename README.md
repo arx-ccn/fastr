@@ -176,11 +176,21 @@ Accepts bare event objects or `["EVENT", {...}]` envelopes, because the world is
 | `FASTR_MAX_CONTENT_LENGTH` | `51200` | Max event `content` length in characters |
 | `FASTR_MAX_CONTENT_LENGTH_PER_KIND` | `444:1572864,445:1572864,1059:1572864` | Per-kind `content` limits as `kind:chars` pairs; entries replace the default for their kind. Marmot Welcomes (444, delivered in 1059 gift wraps) and group messages (445) get 1.5 MiB by default |
 | `FASTR_COMPACT_INTERVAL` | `21600` | Compaction interval in seconds |
+| `FASTR_WHITELIST` | unset | Comma-separated `npub1...` or 64-character hex keys allowed to read and publish over WebSocket after NIP-42 authentication |
 | `FASTR_SYNC_PEERS` | unset | Comma-separated `ws(s)://` relay URLs to pull-sync from (NIP-77). Empty = disabled |
 | `FASTR_SYNC_INTERVAL` | `3600` | Seconds between sync passes |
 | `FASTR_PUBKEY` | unset | NIP-11 admin contact pubkey, as `npub1...` or 64-char hex |
 | `FASTR_CONTACT` | admin npub | NIP-11 `contact` (e.g. `mailto:`, URL, npub). Defaults to `FASTR_PUBKEY` encoded as an `npub1...`; set to empty to omit |
 | `FASTR_ICON` | `<relay url>/icon.png` | NIP-11 icon URL; the relay serves a built-in icon at `/icon.png`. Set to empty to omit |
+
+`FASTR_WHITELIST` works without GRASP. Set `FASTR_URL` to the URL clients use
+for NIP-42. Unset `FASTR_WHITELIST` to disable this check. An empty list or an
+invalid key stops startup.
+
+The whitelist checks the authenticated client, not the event author. Local
+JSONL imports and NIP-11 remain available. `FASTR_SYNC_PEERS` is disabled
+while the whitelist is active. With private GRASP enabled, WebSocket clients
+must pass both checks. Git endpoints follow the [GRASP access rules](docs/GRASP.md#private-service).
 
 ---
 

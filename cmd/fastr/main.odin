@@ -112,7 +112,7 @@ serve :: proc() {
 
 	// Relay-to-relay pull sync (NIP-77): reconcile against each configured
 	// peer at startup and once per interval afterwards.
-	if len(cfg.sync_peers) > 0 && cfg.sync_interval > 0 && !(cfg.grasp_enabled && cfg.grasp_private) {
+	if len(cfg.sync_peers) > 0 && cfg.sync_interval > 0 && !info.limitation.auth_required {
 		sync_ctx := new(Sync_Ctx)
 		peers := make([dynamic]peersync.Peer, 0, len(cfg.sync_peers))
 		for url in cfg.sync_peers {

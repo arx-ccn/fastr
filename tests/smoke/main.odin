@@ -9,8 +9,11 @@ package main
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:net"
 import "core:os"
 import "core:strconv"
+import "core:strings"
+import "core:time"
 
 import "../../src/nostr"
 import "../../src/pack"
@@ -37,11 +40,13 @@ parse_array :: proc(raw: string) -> json.Array {
 	return arr
 }
 
-// Build the client-side ["EVENT",{...}] message for a signed event.
+// Build a client-side EVENT or AUTH message for a signed event.
 @(private)
-client_event_json :: proc(ev: ^pack.Event) -> string {
+client_event_json :: proc(ev: ^pack.Event, message: string = "EVENT") -> string {
 	buf := make([dynamic]u8, 0, 512, context.temp_allocator)
-	append(&buf, `["EVENT",{"id":"`)
+	append(&buf, `["`)
+	append(&buf, message)
+	append(&buf, `",{"id":"`)
 	pack.hex_encode_into(ev.id[:], &buf)
 	append(&buf, `","pubkey":"`)
 	pack.hex_encode_into(ev.pubkey[:], &buf)
@@ -81,11 +86,15 @@ main :: proc() {
 		}
 	}
 
-	conn, connect_err := wsclient.ws_connect(fmt.tprintf("ws://127.0.0.1:%d", port))
+	url := fmt.tprintf("ws://127.0.0.1:%d", port)
+	conn, connect_err := wsclient.ws_connect(url)
 	if connect_err != .None {
 		fail("websocket connect: %v", connect_err)
 	}
 	defer wsclient.conn_close(&conn)
+	if err := net.set_option(conn.sock, .Receive_Timeout, 5 * time.Second); err != nil {
+		fail("set WebSocket receive timeout: %v", err)
+	}
 	fmt.println("upgrade: OK")
 
 	// Expect the NIP-42 AUTH challenge.
@@ -101,6 +110,9 @@ main :: proc() {
 
 	// Publish a signed event.
 	secp.init()
+	if _, whitelisted := os.lookup_env("FASTR_WHITELIST", context.temp_allocator); whitelisted {
+		smoke_whitelist(&conn, url, string(auth_arr[1].(json.String)))
+	}
 	sk: [32]u8
 	sk[31] = 7
 	pubkey, pk_ok := secp.test_pubkey(&sk)
@@ -192,4 +204,50 @@ main :: proc() {
 	smoke_deletion_protection(&conn)
 
 	fmt.println("SMOKE PASS")
+}
+
+@(private)
+smoke_whitelist :: proc(conn: ^wsclient.Conn, url, challenge: string) {
+	listed_event := smoke_signed(1, "signed by a listed key", nil, 1)
+	relay_tag := [?]string{"relay", url}
+	challenge_tag := [?]string{"challenge", challenge}
+	tags := [?]pack.Tag{{fields = relay_tag[:]}, {fields = challenge_tag[:]}}
+
+	invalid := listed_event
+	invalid.sig[0] ~= 1
+	smoke_publish(conn, &invalid, "auth-required:")
+	whitelist_denied(conn, &listed_event, "auth-required:")
+	outsider := smoke_signed(nostr.KIND_AUTH, "", tags[:], 7)
+	smoke_publish(conn, &outsider, message = "AUTH")
+	whitelist_denied(conn, &listed_event, "restricted:")
+	member := smoke_signed(nostr.KIND_AUTH, "", tags[:], 1)
+	smoke_publish(conn, &member, message = "AUTH")
+	fmt.println("whitelist: anonymous and unlisted clients denied; listed key authenticated")
+}
+
+@(private)
+whitelist_denied :: proc(conn: ^wsclient.Conn, ev: ^pack.Event, prefix: string) {
+	smoke_publish(conn, ev, prefix)
+	tests := [?]struct {
+		request, response: string,
+	} {
+		{`["REQ","private",{}]`, "CLOSED"},
+		{`["COUNT","private",{}]`, "CLOSED"},
+		{`["NEG-OPEN","private",{},"61"]`, "NEG-ERR"},
+	}
+	for test in tests {
+		if err := wsclient.send_frame(conn.sock, test.request); err != .None {
+			fail("whitelist request: %v", err)
+		}
+		raw, err := wsclient.recv_text(conn)
+		if err != .None {
+			fail("whitelist response: %v", err)
+		}
+		arr := parse_array(raw)
+		verb, _ := arr[0].(json.String)
+		reason, _ := arr[2].(json.String)
+		if verb != test.response || !strings.has_prefix(string(reason), prefix) {
+			fail("whitelist %s expected %s %s, got %s", test.request, test.response, prefix, raw)
+		}
+	}
 }

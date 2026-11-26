@@ -121,7 +121,7 @@ relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> 
 			created_at_upper_limit = nostr.CREATED_AT_WINDOW,
 			created_at_lower_limit = 0,
 			min_pow_difficulty = cfg.min_pow_difficulty,
-			auth_required = cfg.grasp_enabled && cfg.grasp_private,
+			auth_required = cfg.whitelist != nil || (cfg.grasp_enabled && cfg.grasp_private),
 		},
 	}
 }

@@ -16,12 +16,12 @@ Visibility :: enum {
 }
 
 @(private)
-smoke_signed :: proc(kind: u16, content: string, tags: []pack.Tag) -> pack.Event {
+smoke_signed :: proc(kind: u16, content: string, tags: []pack.Tag, signer: u8 = 19) -> pack.Event {
 	sk: [32]u8
-	sk[31] = 19
+	sk[31] = signer
 	pk, ok := secp.test_pubkey(&sk)
 	if !ok {
-		fail("protection pubkey derivation")
+		fail("pubkey derivation")
 	}
 	ev := pack.Event {
 		pubkey     = pk,
@@ -33,19 +33,24 @@ smoke_signed :: proc(kind: u16, content: string, tags: []pack.Tag) -> pack.Event
 	ev.id = nostr.event_id_hash(&ev)
 	ev.sig, ok = secp.test_sign(&sk, &ev.id)
 	if !ok {
-		fail("protection signing")
+		fail("event signing")
 	}
 	return ev
 }
 
 @(private)
-smoke_publish :: proc(conn: ^wsclient.Conn, ev: ^pack.Event, prefix: string = "") {
-	if err := wsclient.send_frame(conn.sock, client_event_json(ev)); err != .None {
-		fail("protection publish: %v", err)
+smoke_publish :: proc(
+	conn: ^wsclient.Conn,
+	ev: ^pack.Event,
+	prefix: string = "",
+	message: string = "EVENT",
+) {
+	if err := wsclient.send_frame(conn.sock, client_event_json(ev, message)); err != .None {
+		fail("send %s: %v", message, err)
 	}
 	raw, err := wsclient.recv_text(conn)
 	if err != .None {
-		fail("protection response: %v", err)
+		fail("receive %s response: %v", message, err)
 	}
 	arr := parse_array(raw)
 	verb, _ := arr[0].(json.String)
@@ -56,7 +61,7 @@ smoke_publish :: proc(conn: ^wsclient.Conn, ev: ^pack.Event, prefix: string = ""
 	   id != smoke_hex(ev.id) ||
 	   bool(accepted) != (prefix == "" || prefix == "duplicate:") ||
 	   !strings.has_prefix(string(reason), prefix) {
-		fail("protection %s expected %q, got %s", ev.content, prefix, raw)
+		fail("%s %q expected reason prefix %q, got %s", message, ev.content, prefix, raw)
 	}
 }
 

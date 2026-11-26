@@ -25,6 +25,8 @@ Relay_Config :: struct {
 	// NIP-13: minimum proof-of-work difficulty (leading zero bits) required
 	// on incoming event ids. 0 = disabled (no PoW required).
 	min_pow_difficulty:          int,
+	// Immutable after startup. Nil allows public WebSocket access.
+	whitelist:                   map[[32]u8]struct{},
 }
 
 // Effective max content length for a given event kind.

@@ -44,20 +44,27 @@ vendor:
         -DCMAKE_BUILD_TYPE=Release
     cmake --build vendor/secp256k1/build -j
 
-# Self-contained end-to-end smoke test: spawns a throwaway fastr on
-# $FASTR_SMOKE_PORT (default 18080) with a temp data dir, runs the client
-# against it, and cleans up.
+# Run public and whitelisted relay smoke tests on $FASTR_SMOKE_PORT (default 18080).
 smoke: build
     #!/usr/bin/env bash
     set -euo pipefail
     odin build tests/smoke -out:fastr-smoke -o:speed
     port="${FASTR_SMOKE_PORT:-18080}"
-    data=$(mktemp -d)
-    FASTR_PORT="$port" FASTR_DATA_DIR="$data" ./fastr &
-    pid=$!
-    trap 'kill "$pid" 2>/dev/null || true; rm -rf "$data"' EXIT
-    sleep 1
-    FASTR_PORT="$port" ./fastr-smoke
+    export FASTR_PORT="$port" FASTR_ADDR=127.0.0.1 FASTR_URL="ws://127.0.0.1:$port" FASTR_GRASP_ENABLED=0
+    smoke() (
+        FASTR_DATA_DIR=$(mktemp -d)
+        export FASTR_DATA_DIR
+        ./fastr &
+        pid=$!
+        trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$FASTR_DATA_DIR"' EXIT
+        sleep 1
+        ./fastr-smoke
+    )
+    unset FASTR_WHITELIST FASTR_SYNC_PEERS
+    smoke
+    # Public key for the smoke client's member signer (secret scalar 1).
+    export FASTR_WHITELIST=79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+    smoke
 
 # Run the self-contained GRASP-01 end-to-end test (spawns its own fastr;
 # needs the git CLI as a dev dependency)

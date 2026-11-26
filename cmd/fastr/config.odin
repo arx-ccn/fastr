@@ -8,6 +8,7 @@ import "core:strconv"
 import "core:strings"
 
 import "../../src/nostr"
+import secp "../../src/secp256k1"
 import "../../src/ws"
 
 VERSION :: "0.1.0"
@@ -71,6 +72,8 @@ Config :: struct {
 	// NIP-13 minimum proof-of-work difficulty (leading zero bits) required on
 	// incoming events. FASTR_MIN_POW. 0 = disabled. Also reported in NIP-11.
 	min_pow_difficulty:          int,
+	// FASTR_WHITELIST restricts WebSocket access to NIP-42 identities.
+	whitelist:                   map[[32]u8]struct{},
 	// GRASP-01 git hosting. FASTR_GRASP_ENABLED ("1"/"true"). Off by default.
 	grasp_enabled:               bool,
 	// Directory holding the hosted bare repos. FASTR_GRASP_DIR. Default: "./repos".
@@ -93,7 +96,7 @@ Config :: struct {
 	grasp_sync_plus:             bool,
 	grasp_archive:               bool,
 	grasp_private:               bool,
-	grasp_whitelist:             [][32]u8,
+	grasp_whitelist:             map[[32]u8]struct{},
 	grasp_secret:                [32]u8,
 	// Relay-to-relay pull sync. FASTR_SYNC_PEERS: comma-separated ws(s)://
 	// relay URLs. Empty = disabled (default).
@@ -144,7 +147,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 
 	pubkey := ""
 	if raw, found := os.lookup_env("FASTR_PUBKEY", context.temp_allocator); found && raw != "" {
-		pubkey = parse_pubkey(raw, allocator)
+		pubkey = parse_pubkey("FASTR_PUBKEY", raw, allocator)
 	}
 
 	// FASTR_CONTACT overrides the NIP-11 contact verbatim (set it to "" to omit
@@ -232,23 +235,16 @@ load_config :: proc(allocator := context.allocator) -> Config {
 			allocator,
 		)
 	}
-	whitelist := make([dynamic][32]u8, allocator)
-	if raw, found := os.lookup_env("FASTR_GRASP_WHITELIST", context.temp_allocator); found {
-		for item in strings.split(raw, ",", context.temp_allocator) {
-			if strings.trim_space(item) == "" {
-				continue
-			}
-			hex := parse_pubkey(strings.trim_space(item), context.temp_allocator)
-			pk, ok := grasp_hex_key(hex)
-			assert(ok)
-			append(&whitelist, pk)
-		}
+	whitelist, configured := parse_whitelist("FASTR_WHITELIST", allocator)
+	if configured {
+		validate_whitelist(whitelist)
 	}
+	grasp_whitelist, _ := parse_whitelist("FASTR_GRASP_WHITELIST", allocator)
 	secret: [32]u8
 	if private && grasp_enabled {
 		raw := os.get_env("FASTR_GRASP_SECRET", context.temp_allocator)
 		key, ok := grasp_hex_key(raw)
-		if !ok || key == ([32]u8{}) || len(whitelist) == 0 {
+		if !ok || key == ([32]u8{}) || len(grasp_whitelist) == 0 {
 			panic(
 				"private GRASP requires FASTR_GRASP_SECRET (32-byte hex) and FASTR_GRASP_WHITELIST",
 			)
@@ -284,6 +280,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		tos_url = tos_url,
 		tos_text = tos_text,
 		min_pow_difficulty = min_pow,
+		whitelist = whitelist,
 		grasp_enabled = grasp_enabled,
 		grasp_dir = grasp_dir,
 		grasp_max_pack_bytes = env_int("FASTR_GRASP_MAX_PACK_BYTES", 256 * 1024 * 1024),
@@ -295,7 +292,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		grasp_sync_plus = env_int("FASTR_GRASP_SYNC_PLUS", 1) == 1,
 		grasp_archive = archive,
 		grasp_private = private,
-		grasp_whitelist = whitelist[:],
+		grasp_whitelist = grasp_whitelist,
 		grasp_secret = secret,
 		sync_peers = parse_sync_peers(allocator),
 		sync_interval = env_u64("FASTR_SYNC_INTERVAL", 3600),
@@ -363,20 +360,18 @@ default_asset_url :: proc(
 	return fmt.aprintf("%s://%s%s", scheme, url, path, allocator = allocator)
 }
 
-// Parse FASTR_PUBKEY: either an `npub1...` bech32 string or 64 hex chars.
-// Returns 64-char lowercase hex. Panics at startup on malformed input so
-// configuration mistakes surface immediately.
+// Accept npub or hex. Return lowercase hex for NIP-11 and whitelist parsing.
 @(private = "file")
-parse_pubkey :: proc(raw: string, allocator := context.allocator) -> string {
+parse_pubkey :: proc(key, raw: string, allocator := context.allocator) -> string {
 	if strings.has_prefix(raw, "npub1") {
 		hex, ok := nostr.npub_to_hex(raw, allocator)
 		if !ok {
-			fmt.panicf("FASTR_PUBKEY: invalid npub %q", raw)
+			fmt.panicf("%s: invalid npub %q", key, raw)
 		}
 		return hex
 	}
 	if len(raw) != 64 {
-		fmt.panicf("FASTR_PUBKEY: expected npub or 64 hex chars, got %q", raw)
+		fmt.panicf("%s: expected npub or 64 hex chars, got %q", key, raw)
 	}
 	for i in 0 ..< len(raw) {
 		c := raw[i]
@@ -386,10 +381,53 @@ parse_pubkey :: proc(raw: string, allocator := context.allocator) -> string {
 		case 'A' ..= 'F':
 		// lowercased below
 		case:
-			fmt.panicf("FASTR_PUBKEY: bad hex character %q in %q", rune(c), raw)
+			fmt.panicf("%s: bad hex character %q in %q", key, rune(c), raw)
 		}
 	}
 	return strings.to_lower(raw, allocator)
+}
+
+@(private = "file")
+parse_whitelist :: proc(
+	key: string,
+	allocator := context.allocator,
+) -> (
+	map[[32]u8]struct{},
+	bool,
+) {
+	raw, found := os.lookup_env(key, context.temp_allocator)
+	if !found {
+		return nil, false
+	}
+	allowed := make(map[[32]u8]struct{}, allocator)
+	for item_raw in strings.split_iterator(&raw, ",") {
+		item := strings.trim_space(item_raw)
+		if item == "" {
+			continue
+		}
+		hex := parse_pubkey(key, item, context.temp_allocator)
+		pk, ok := grasp_hex_key(hex)
+		assert(ok)
+		allowed[pk] = {}
+	}
+	return allowed, true
+}
+
+@(private = "file")
+validate_whitelist :: proc(allowed: map[[32]u8]struct{}) {
+	if len(allowed) == 0 {
+		fmt.panicf("FASTR_WHITELIST: expected at least one pubkey; unset to disable")
+	}
+	ctx := secp.context_create(secp.CONTEXT_NONE)
+	assert(ctx != nil, "secp256k1 context_create failed")
+	defer secp.context_destroy(ctx)
+	for pk in allowed {
+		key := pk
+		parsed: secp.Xonly_Pubkey = ---
+		if secp.xonly_pubkey_parse(ctx, &parsed, &key[0]) != 1 {
+			fmt.panicf("FASTR_WHITELIST: invalid x-only pubkey %x", key)
+		}
+	}
 }
 
 // Return the effective max content length for a given event kind.

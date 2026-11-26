@@ -87,6 +87,19 @@ test_relay_info_supported_grasps :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_whitelist_requires_auth :: proc(t: ^testing.T) {
+	os.set_env(
+		"FASTR_WHITELIST",
+		"npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg",
+	)
+	defer os.unset_env("FASTR_WHITELIST")
+	_, info := default_info()
+	obj := parse_info(t, relay_info_json(&info, context.temp_allocator))
+	lim := obj["limitation"].(json.Object)
+	testing.expect_value(t, lim["auth_required"].(json.Boolean), true)
+}
+
+@(test)
 test_relay_info_limitation_fields :: proc(t: ^testing.T) {
 	cfg, info := default_info()
 	obj := parse_info(t, relay_info_json(&info, context.temp_allocator))

@@ -37,13 +37,14 @@ Neg_Session :: struct {
 
 @(private)
 Conn_State :: struct {
-	relay:        ^Relay,
-	conn:         Conn,
-	outbox:       ^Outbox,
-	auth:         Auth_State,
-	live_count:   int, // reader owns admission; the fanout owns subscription IDs
-	replay_spare: [dynamic]u8, // empty unless the reader completed the last write
-	neg_subs:     map[string]^Neg_Session, // heap-owned keys and sessions
+	relay:            ^Relay,
+	conn:             Conn,
+	outbox:           ^Outbox,
+	auth:             Auth_State,
+	whitelist_member: bool, // Set once by the reader after verified NIP-42 AUTH.
+	live_count:       int, // reader owns admission; the fanout owns subscription IDs
+	replay_spare:     [dynamic]u8, // empty unless the reader completed the last write
+	neg_subs:         map[string]^Neg_Session, // heap-owned keys and sessions
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +408,21 @@ handle_auth :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 		send_ok(cs, &id, false, "auth-required: too many authenticated pubkeys")
 		return
 	}
+	if !cs.whitelist_member && pubkey in cs.relay.cfg.whitelist {
+		cs.whitelist_member = true
+	}
 	send_ok(cs, &id, true, "")
+}
+
+@(private)
+whitelist_denial :: proc(cs: ^Conn_State) -> string {
+	if cs.relay.cfg.whitelist == nil || cs.whitelist_member {
+		return ""
+	}
+	if sync.atomic_load(&cs.auth.count) == 0 {
+		return "auth-required: relay requires NIP-42 authentication"
+	}
+	return "restricted: pubkey is not in the relay whitelist"
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +430,10 @@ handle_auth :: proc(cs: ^Conn_State, ev: ^pack.Event) {
 
 @(private)
 handle_event :: proc(cs: ^Conn_State, ev: ^pack.Event) {
+	if reason := whitelist_denial(cs); reason != "" {
+		send_ok(cs, &ev.id, false, reason)
+		return
+	}
 	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
 	principal := policy.Principal {
 		source   = .Client,
@@ -518,6 +537,9 @@ request_denial :: proc(
 	op: policy.Operation,
 	filters: []nostr.Filter,
 ) -> string {
+	if reason := whitelist_denial(cs); reason != "" {
+		return reason
+	}
 	if cs.relay.hooks.check_request == nil {
 		return ""
 	}
