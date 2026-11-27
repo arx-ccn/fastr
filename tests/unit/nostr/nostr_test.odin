@@ -2,6 +2,7 @@ package nostr
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
@@ -97,6 +98,23 @@ test_parse_close_and_unknown :: proc(t: ^testing.T) {
 	testing.expect(t, !bad2)
 	_, _, bad3 := parse_client_msg(`["EVENT"]`, 256, context.temp_allocator)
 	testing.expect(t, !bad3)
+}
+
+@(private = "file")
+try_plain_subscription :: proc(
+	raw: string,
+	limit: int,
+	allocator := context.allocator,
+) -> (
+	msg: Client_Msg,
+	ok: bool,
+) {
+	s := raw
+	verb := message_verb(&s) or_return
+	if verb != "REQ" && verb != "CLOSE" {
+		return
+	}
+	return plain_subscription(s, verb, limit, allocator)
 }
 
 @(test)
@@ -202,7 +220,7 @@ ID64 :: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 @(private = "file")
 PK64 :: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 @(private = "file")
-SIG128 :: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+SIG128 :: PK64 + PK64
 
 @(private = "file")
 ev_msg :: proc(id, pk, sig, created_at, tags: string) -> string {
@@ -309,6 +327,108 @@ test_extract_sub_id_negative_cases :: proc(t: ^testing.T) {
 	for raw in cases {
 		_, ok := try_extract_sub_id_from_msg(raw)
 		testing.expectf(t, !ok, "must not extract from: %s", raw)
+	}
+}
+
+@(test)
+test_decoder_preserves_signature :: proc(t: ^testing.T) {
+	signed := make_golden_event()
+	signed.content = "𝄞\nquoted \"note\""
+	signed.tags = {{fields = {"t", "café"}}, {fields = {"x", "", "a\\b"}}}
+	signed.id = event_id_hash(&signed)
+	sk: [32]u8
+	sk[31] = 1
+	signed.sig, _ = secp.test_sign(&sk, &signed.id)
+	// Key order, escaped key names and extensions do not change signed data.
+	obj := fmt.tprintf(
+		`{{"tags":[["t","caf\u00e9"],["x","","a\\b"]],"ext":{{"v":[false,null,1e1]}},"kind":1,"s\u0069g":"%s","created_at":1700000000,"content":"\uD834\uDD1E\nquoted \"note\"","id":"%s","pubkey":"%s"}}`,
+		hex64(signed.sig),
+		hex32(signed.id),
+		hex32(signed.pubkey),
+	)
+	open := strings.repeat("[", 256, context.temp_allocator)
+	close := strings.repeat("]", 256, context.temp_allocator)
+	frame := fmt.tprintf(` [ "\u0045VENT", %s, %s[true,{{"ignored":"],"}}]%s ] `, obj, open, close)
+	input := make([]u8, len(frame), context.temp_allocator)
+	copy(input, frame)
+	msg, reason, ok := parse_client_msg(string(input), 256, context.allocator)
+	if !testing.expect(t, ok, reason) {
+		return
+	}
+	ev := msg.(Msg_Event).ev
+	defer pack.event_destroy(&ev)
+	for &b in input {
+		b = 0
+	}
+	free_all(context.temp_allocator)
+	why, valid := validate_event(&ev)
+	testing.expect(t, valid, why)
+}
+
+@(test)
+test_event_envelope_errors :: proc(t: ^testing.T) {
+	obj := fmt.tprintf(`{{"id":"%s","kind":1}}`, ID64)
+	malformed := [?]string {
+		fmt.tprintf(`["EVENT",%s] true`, obj),
+		fmt.tprintf(`["EVENT",%s,]`, obj),
+		fmt.tprintf(`["EVENT",%s,{{"x":1,"\u0078":2}}]`, obj),
+		fmt.tprintf(`["EVENT",%s,[1,]]`, obj),
+		fmt.tprintf(`["EVENT",%s,"\q"]`, obj),
+		fmt.tprintf(`["EVENT",%s,"\u000z"]`, obj),
+		fmt.tprintf(`["EVENT",%s,"%s"]`, obj, "\xff"),
+		fmt.tprintf(`["EVENT",{{"id":"%s","id":null}}]`, ID64),
+	}
+	for frame in malformed {
+		_, why, ok := parse_client_msg(frame, 256)
+		testing.expect(t, !ok)
+		testing.expect_value(t, why, "invalid: not valid JSON")
+		_, identifiable := try_extract_event_id_from_msg(frame)
+		testing.expect(t, !identifiable)
+	}
+	for verb in ([2]string{"EVENT", "AUTH"}) {
+		frame := fmt.tprintf(`["%s",%s]`, verb, obj)
+		_, why, ok := parse_client_msg(frame, 256)
+		testing.expect(t, !ok)
+		testing.expect_value(t, why, "invalid: pubkey missing or not a string")
+		_, identifiable := try_extract_event_id_from_msg(frame)
+		testing.expect_value(t, identifiable, verb == "EVENT")
+	}
+}
+
+@(test)
+test_event_scratch_exhaustion :: proc(t: ^testing.T) {
+	wire := ev_msg(ID64, PK64, SIG128, "123", `[["e","id"]]`)
+	cases := [?]string{wire, `["\u0045VENT",{}]`}
+	for frame in cases {
+		ok: bool
+		{
+			storage: [1]u8
+			arena: mem.Arena
+			mem.arena_init(&arena, storage[:])
+			context.temp_allocator = mem.arena_allocator(&arena)
+			_, _, ok = parse_client_msg(frame, 256, context.allocator)
+		}
+		testing.expect(t, !ok)
+	}
+}
+
+@(test)
+test_event_integer_limits :: proc(t: ^testing.T) {
+	for text in ([2]string{"-9223372036854775808", "9223372036854775807"}) {
+		wire := ev_msg(ID64, PK64, SIG128, text, "[]")
+		msg, why, ok := parse_client_msg(wire, 256, context.temp_allocator)
+		if testing.expect(t, ok, why) {
+			testing.expect_value(
+				t,
+				msg.(Msg_Event).ev.created_at,
+				min(i64) if text[0] == '-' else max(i64),
+			)
+		}
+	}
+	for text in ([?]string{"-9223372036854775809", "9223372036854775808", "1.0", "1e2"}) {
+		wire := ev_msg(ID64, PK64, SIG128, text, "[]")
+		_, why, ok := parse_client_msg(wire, 256, context.allocator)
+		testing.expect(t, !ok && strings.has_prefix(why, "invalid: "))
 	}
 }
 

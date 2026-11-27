@@ -1,7 +1,6 @@
 package main
 
 import "core:encoding/base64"
-import "core:fmt"
 import "core:strings"
 import "core:sync"
 
@@ -91,17 +90,15 @@ grasp_http_auth :: proc(p: ^Grasp_Profiles, url_path: string, req: ^ws.Request) 
 	if err != nil {
 		return false
 	}
-	msg, _, parsed := nostr.parse_client_msg(fmt.tprintf(`["EVENT",%s]`, string(raw)), 256, context.temp_allocator)
-	ev_msg, is_event := msg.(nostr.Msg_Event)
-	if !parsed || !is_event {
+	ev, _, parsed := nostr.parse_event_json(string(raw), context.temp_allocator)
+	if !parsed {
 		return false
 	}
-	ev := &ev_msg.ev
 	now := nostr.unix_now()
 	if ev.kind != 27235 || ev.created_at < now - 60 || ev.created_at > now + 60 {
 		return false
 	}
-	if _, valid := nostr.validate_event(ev); !valid {
+	if _, valid := nostr.validate_event(&ev); !valid {
 		return false
 	}
 	if grasp_access(p, {ev.pubkey}).reason != .Allow {

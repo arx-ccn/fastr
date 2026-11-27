@@ -394,120 +394,23 @@ Server_Eose :: struct {}
 
 Server_Other :: struct {}
 
-// nth_element_span returns the source substring of the n-th element of a
-// top-level JSON array (0-indexed), tracking string escapes and nesting.
-@(private)
-nth_element_span :: proc(data: []u8, n: int) -> string {
-	s := string(data)
-	i := 0
-	// Skip to first '['.
-	for i < len(s) && s[i] != '[' {
-		i += 1
-	}
-	if i >= len(s) {
-		return ""
-	}
-	i += 1
-	// Skip whitespace helper inline.
-	skip_ws :: proc(s: string, i: ^int) {
-		for i^ < len(s) && (s[i^] == ' ' || s[i^] == '\t' || s[i^] == '\n' || s[i^] == '\r') {
-			i^ += 1
-		}
-	}
-	for elem := 0;; elem += 1 {
-		skip_ws(s, &i)
-		if i >= len(s) {
-			return ""
-		}
-		start := i
-		// Scan one element: string, number/literal, or nested {}/[].
-		depth := 0
-		in_str := false
-		for i < len(s) {
-			c := s[i]
-			if in_str {
-				if c == '\\' {
-					i += 2
-					continue
-				}
-				if c == '"' {
-					in_str = false
-				}
-			} else {
-				switch c {
-				case '"':
-					in_str = true
-				case '{', '[':
-					depth += 1
-				case '}', ']':
-					if depth == 0 {
-						// Terminator of the parent array.
-						if elem == n {
-							return s[start:i]
-						}
-						return ""
-					}
-					depth -= 1
-				case ',':
-					if depth == 0 {
-						if elem == n {
-							return s[start:i]
-						}
-						i += 1
-						elem += 1
-						skip_ws(s, &i)
-						start = i
-						continue
-					}
-				}
-			}
-			i += 1
-		}
-		return ""
-	}
-}
-
-// parse_server_msg classifies a relay→client text frame. The returned
-// event's strings point into temp-allocator JSON storage; the caller
-// frees temp after each frame.
+// Classify a relay frame; the event is valid until the caller frees temp.
 @(private)
 parse_server_msg :: proc(data: []u8) -> Server_Msg {
+	ev, _, _, status := nostr.parse_relay_event(string(data))
+	switch status {
+	case .Event:
+		return Server_Event{ev = ev}
+	case .Bad_Event:
+		return Server_Other{}
+	case .Not_Event:
+	}
 	val, jerr := json.parse(data, allocator = context.temp_allocator)
-	if jerr != nil {
-		return Server_Other{}
-	}
 	arr, arr_ok := val.(json.Array)
-	if !arr_ok || len(arr) < 2 {
-		return Server_Other{}
-	}
-	verb, v_ok := arr[0].(json.String)
-	if !v_ok {
-		return Server_Other{}
-	}
-	switch verb {
-	case "EVENT":
-		if len(arr) < 3 {
-			return Server_Other{}
+	if jerr == nil && arr_ok && len(arr) >= 2 {
+		if verb, ok := arr[0].(json.String); ok && verb == "EOSE" {
+			return Server_Eose{}
 		}
-		// parse_client_msg expects client form ["EVENT",{...}]; rewrap the
-		// server event object by source span (json round-trip would emit
-		// floats for integer fields).
-		span := nth_element_span(data, 2)
-		if span == "" {
-			return Server_Other{}
-		}
-		raw := fmt.tprintf(`["EVENT",%s]`, span)
-		msg, _, p_ok := nostr.parse_client_msg(raw, 256, context.temp_allocator)
-		if !p_ok {
-			return Server_Other{}
-		}
-		ev_msg, is_event := msg.(nostr.Msg_Event)
-		if !is_event {
-			return Server_Other{}
-		}
-		return Server_Event{ev = ev_msg.ev}
-	case "EOSE":
-		return Server_Eose{}
 	}
 	return Server_Other{}
 }

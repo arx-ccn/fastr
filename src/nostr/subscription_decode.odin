@@ -150,18 +150,15 @@ wire_index_filter :: proc(
 // A miss leaves validation and its wire-visible reason to core:encoding/json
 // and parse_filter. No view of the input frame escapes a successful parse.
 @(private)
-try_plain_subscription :: proc(
-	raw: string,
+plain_subscription :: proc(
+	rest, verb: string,
 	max_values: int,
 	allocator := context.allocator,
 ) -> (
 	msg: Client_Msg,
 	ok: bool,
 ) {
-	s := raw
-	if !wire_take(&s, '[') {return}
-	verb := wire_plain_string(&s) or_return
-	if verb != "REQ" && verb != "CLOSE" {return}
+	s := rest
 	if !wire_take(&s, ',') {return}
 	sid := wire_plain_string(&s) or_return
 	if verb == "CLOSE" {

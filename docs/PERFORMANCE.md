@@ -126,6 +126,15 @@ network throughput, or power-loss durability.
 
 ## Ingest and replies
 
+Client `EVENT` and `AUTH` messages, relay `EVENT` messages, bare JSONL
+events and HTTP auth events use the same field decoder. It reads the
+seven event fields without building a JSON object tree. Tag strings and
+content belong to the caller's allocator; the input buffer can be reused.
+The decoder checks the syntax of unknown fields and trailing envelope
+elements. The GRASP watcher still requires exactly three envelope elements.
+Duplicate keys, trailing commas, trailing data and
+out-of-range timestamps or kinds are rejected before ingest.
+
 Before it checks a signature, `ingest_event` asks the store whether an event
 with the same ID and the same signature was appended since the store was
 opened or last compacted. Ingest verifies every event it appends, so such a

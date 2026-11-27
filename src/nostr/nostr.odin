@@ -131,93 +131,6 @@ json_parse_temp :: proc(raw: string) -> (val: json.Value, ok: bool) {
 }
 
 @(private)
-parse_event_obj :: proc(
-	obj: json.Object,
-	allocator := context.allocator,
-) -> (
-	ev: pack.Event,
-	reason: string,
-	ok: bool,
-) {
-	id_str, id_ok := obj["id"].(json.String)
-	if !id_ok {
-		return ev, "invalid: id missing or not a string", false
-	}
-	if why, deco_ok := decode_hex_exact(id_str, "id", ev.id[:]); !deco_ok {
-		return ev, why, false
-	}
-
-	pk_str, pk_ok := obj["pubkey"].(json.String)
-	if !pk_ok {
-		return ev, "invalid: pubkey missing or not a string", false
-	}
-	if why, deco_ok := decode_hex_exact(pk_str, "pubkey", ev.pubkey[:]); !deco_ok {
-		return ev, why, false
-	}
-
-	sig_str, sig_ok := obj["sig"].(json.String)
-	if !sig_ok {
-		return ev, "invalid: sig missing or not a string", false
-	}
-	if why, deco_ok := decode_hex_exact(sig_str, "sig", ev.sig[:]); !deco_ok {
-		return ev, why, false
-	}
-
-	created_at, ca_ok := obj["created_at"].(json.Integer)
-	if !ca_ok {
-		return ev, "invalid: created_at missing or not an integer", false
-	}
-	ev.created_at = created_at
-
-	kind_raw, kind_ok := obj["kind"].(json.Integer)
-	if !kind_ok || kind_raw < 0 {
-		return ev, "invalid: kind missing or not a non-negative integer", false
-	}
-	if kind_raw > i64(max(u16)) {
-		return ev, "invalid: kind out of range for u16", false
-	}
-	ev.kind = u16(kind_raw)
-
-	tags_val, tags_present := obj["tags"]
-	if !tags_present {
-		return ev, "invalid: tags missing", false
-	}
-	tags_arr, tags_ok := tags_val.(json.Array)
-	if !tags_ok {
-		return ev, "invalid: tags not an array", false
-	}
-	tags := make([]pack.Tag, len(tags_arr), allocator)
-	for item, ti in tags_arr {
-		inner, inner_ok := item.(json.Array)
-		if !inner_ok {
-			return ev, "invalid: tag element not an array", false
-		}
-		if len(inner) == 0 {
-			return ev, "invalid: tag inner array is empty", false
-		}
-		fields := make([]string, len(inner), allocator)
-		for f, fi in inner {
-			s, s_ok := f.(json.String)
-			if !s_ok {
-				return ev, "invalid: tag field not a string", false
-			}
-			fields[fi] = strings.clone(s, allocator)
-		}
-		tags[ti] = pack.Tag {
-			fields = fields,
-		}
-	}
-	ev.tags = tags
-
-	content, content_ok := obj["content"].(json.String)
-	if !content_ok {
-		return ev, "invalid: content missing or not a string", false
-	}
-	ev.content = strings.clone(content, allocator)
-	return ev, "", true
-}
-
-@(private)
 parse_filter :: proc(
 	val: json.Value,
 	max_values: int,
@@ -377,27 +290,16 @@ parse_sub_and_filters :: proc(
 // NIP-01 the relay MUST respond OK (not NOTICE) to every EVENT submission
 // whose id can be extracted.
 try_extract_event_id_from_msg :: proc(raw: string) -> (id: [32]u8, ok: bool) {
-	val := json_parse_temp(raw) or_return
-	arr, arr_ok := val.(json.Array)
-	if !arr_ok || len(arr) < 2 {
+	s := raw
+	verb := message_verb(&s) or_return
+	if verb != "EVENT" {
 		return
 	}
-	verb, verb_ok := arr[0].(json.String)
-	if !verb_ok || verb != "EVENT" {
+	frame := read_event_frame(s, verb, .Client)
+	if frame.reason != "" {
 		return
 	}
-	obj, obj_ok := arr[1].(json.Object)
-	if !obj_ok {
-		return
-	}
-	id_str, id_ok := obj["id"].(json.String)
-	if !id_ok {
-		return
-	}
-	if _, deco_ok := decode_hex_exact(id_str, "id", id[:]); !deco_ok {
-		return
-	}
-	return id, true
+	return event_member_id(&frame.members)
 }
 
 // Best-effort extraction of the subscription id from a raw REQ or COUNT
@@ -406,6 +308,10 @@ try_extract_event_id_from_msg :: proc(raw: string) -> (id: [32]u8, ok: bool) {
 // open from the client's view, so it waits for an EOSE that never comes
 // (e.g. ngit fetches with hundreds of #E values time out after 7s).
 try_extract_sub_id_from_msg :: proc(raw: string) -> (sub_id: string, ok: bool) {
+	s := raw
+	if header, found := message_verb(&s); found && header != "REQ" && header != "COUNT" {
+		return
+	}
 	val := json_parse_temp(raw) or_return
 	arr, arr_ok := val.(json.Array)
 	if !arr_ok || len(arr) < 2 {
@@ -421,8 +327,7 @@ try_extract_sub_id_from_msg :: proc(raw: string) -> (sub_id: string, ok: bool) {
 
 // Parse a raw WebSocket text frame into a Client_Msg.
 // On failure returns a NOTICE-ready reason string.
-// Event/filter data is allocated from `allocator`; the JSON tree and reason
-// strings use context.temp_allocator.
+// Event and filter data belong to `allocator`. Scratch and reasons use temp.
 parse_client_msg :: proc(
 	raw: string,
 	max_filter_values: int,
@@ -432,8 +337,27 @@ parse_client_msg :: proc(
 	reason: string,
 	ok: bool,
 ) {
-	if fast, parsed := try_plain_subscription(raw, max_filter_values, allocator); parsed {
-		return fast, "", true
+	s := raw
+	if verb, has_verb := message_verb(&s); has_verb {
+		switch verb {
+		case "EVENT", "AUTH":
+			frame := read_event_frame(s, verb, .Client)
+			if frame.reason != "" {
+				return nil, frame.reason, false
+			}
+			ev, why, valid := decode_event_members(&frame.members, allocator)
+			if !valid {
+				return nil, why, false
+			}
+			if verb == "AUTH" {
+				return Msg_Auth{ev}, "", true
+			}
+			return Msg_Event{ev}, "", true
+		case "REQ", "CLOSE":
+			if fast, parsed := plain_subscription(s, verb, max_filter_values, allocator); parsed {
+				return fast, "", true
+			}
+		}
 	}
 	val, parse_ok := json_parse_temp(raw)
 	if !parse_ok {
@@ -453,25 +377,9 @@ parse_client_msg :: proc(
 
 	switch verb {
 	case "EVENT", "AUTH":
-		if len(arr) < 2 {
-			return nil,
-				"invalid: EVENT missing event object" if verb == "EVENT" else "invalid: AUTH missing event object",
-				false
-		}
-		obj, obj_ok := arr[1].(json.Object)
-		if !obj_ok {
-			return nil,
-				"invalid: EVENT payload not an object" if verb == "EVENT" else "invalid: AUTH payload not an object",
-				false
-		}
-		ev, ev_why, ev_ok := parse_event_obj(obj, allocator)
-		if !ev_ok {
-			return nil, ev_why, false
-		}
-		if verb == "EVENT" {
-			return Msg_Event{ev = ev}, "", true
-		}
-		return Msg_Auth{ev = ev}, "", true
+		// The DOM reader also recognizes malformed string literals. They are
+		// not valid event headers and must not bypass the event decoder.
+		return nil, INVALID_EVENT_JSON, false
 	case "REQ":
 		sub_id, filters, why, sf_ok := parse_sub_and_filters(
 			arr,

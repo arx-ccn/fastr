@@ -15,6 +15,7 @@ import "core:time"
 
 import "../../src/grasp"
 import "../../src/nostr"
+import "../../src/pack"
 import "../../src/peersync"
 import secp "../../src/secp256k1"
 import "../../src/store"
@@ -419,24 +420,31 @@ import_events :: proc(
 		if line == "" {
 			continue
 		}
-		raw := line if strings.has_prefix(line, "[") else fmt.tprintf(`["EVENT",%s]`, line)
-
-		msg, reason, parse_ok := nostr.parse_client_msg(raw, max(int), context.temp_allocator)
+		defer free_all(context.temp_allocator)
+		ev: pack.Event
+		reason: string
+		parse_ok: bool
+		if strings.has_prefix(line, "[") {
+			msg: nostr.Client_Msg
+			msg, reason, parse_ok = nostr.parse_client_msg(line, max(int), context.temp_allocator)
+			if parse_ok {
+				event, is_event := &msg.(nostr.Msg_Event)
+				if !is_event {
+					fmt.eprintfln("line %d: not an EVENT message", line_no)
+					failures += 1
+					continue
+				}
+				ev = event.ev
+			}
+		} else {
+			ev, reason, parse_ok = nostr.parse_event_json(line, context.temp_allocator)
+		}
 		if !parse_ok {
 			fmt.eprintfln("line %d: parse error: %s", line_no, reason)
 			failures += 1
-			free_all(context.temp_allocator)
 			continue
 		}
-		ev_msg, is_event := &msg.(nostr.Msg_Event)
-		if !is_event {
-			fmt.eprintfln("line %d: not an EVENT message", line_no)
-			failures += 1
-			free_all(context.temp_allocator)
-			continue
-		}
-		ev := &ev_msg.ev
-		append_err, append_reason := ws.ingest_event(relay, {source = .Import}, ev)
+		append_err, append_reason := ws.ingest_event(relay, {source = .Import}, &ev)
 		switch append_err {
 		case .None:
 			imported += 1
@@ -447,7 +455,6 @@ import_events :: proc(
 			fmt.eprintfln("line %d: store error: %v %s", line_no, append_err, append_reason)
 			failures += 1
 		}
-		free_all(context.temp_allocator)
 	}
 	return imported, duplicates, failures, true
 }

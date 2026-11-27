@@ -2,15 +2,34 @@ package peersync
 
 import "core:testing"
 
+@(private)
+SERVER_EVENT_JSON :: `{"id":"25ee55f1be55a10efb892fc7df07aa4127c23a993a9ada6696f23692d7aa619c","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1000,"kind":1,"tags":[],"content":"h\u0069","sig":"43ae4dbe7ae1629704ae191ba454ee0ee61942d3f929dd7d0841abbfcd5ce8b2eb681111f11e31dba576475c6b66384eb93058d0f1e173295e2185ddfe406919"}`
+
 @(test)
 test_parse_server_event :: proc(t: ^testing.T) {
-	raw := `["EVENT","fetch",{"id":"25ee55f1be55a10efb892fc7df07aa4127c23a993a9ada6696f23692d7aa619c","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1000,"kind":1,"tags":[],"content":"hi","sig":"43ae4dbe7ae1629704ae191ba454ee0ee61942d3f929dd7d0841abbfcd5ce8b2eb681111f11e31dba576475c6b66384eb93058d0f1e173295e2185ddfe406919"}]`
+	raw := `["EV\u0045NT",{"unexpected":[1]},` + SERVER_EVENT_JSON + `,[true,{"ext":null}]]`
 	msg := parse_server_msg(transmute([]u8)raw)
 	ev, is_ev := msg.(Server_Event)
 	testing.expect(t, is_ev, "expected Server_Event")
 	if is_ev {
 		testing.expect_value(t, ev.ev.created_at, i64(1000))
 		testing.expect_value(t, ev.ev.content, "hi")
+	}
+}
+
+@(test)
+test_parse_server_rejects_invalid_event :: proc(t: ^testing.T) {
+	cases := [?]string {
+		`["EVENT"]`,
+		`["EVENT","fetch"]`,
+		`["EVENT","fetch",null]`,
+		`["EVENT","fetch",{}]`,
+		`["EVENT","fetch",` + SERVER_EVENT_JSON + `,]`,
+	}
+	for raw in cases {
+		msg := parse_server_msg(transmute([]u8)raw)
+		_, is_other := msg.(Server_Other)
+		testing.expect(t, is_other, raw)
 	}
 }
 

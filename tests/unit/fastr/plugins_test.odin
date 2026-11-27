@@ -34,19 +34,24 @@ test_import_policy :: proc(t: ^testing.T) {
 	ev := fixtures.signed_event(1, 1, 1000)
 	buf := make([dynamic]u8, context.temp_allocator)
 	nostr.write_event_json("test", &ev, &buf)
-	// Convert the server envelope to the bare JSON object accepted by import.
+	bare := string(buf[len(`["EVENT","test",`):len(buf) - 1])
+	lines := strings.concatenate(
+		{bare, "\n", `["EV\u0045NT",`, bare, ",null]\n", `["CLOSE","sub"]`},
+		context.temp_allocator,
+	)
 	path := strings.concatenate({dir, "/events.jsonl"}, context.allocator)
 	defer delete(path)
-	assert(os.write_entire_file(path, buf[len(`["EVENT","test",`):len(buf) - 1]) == nil)
+	assert(os.write_entire_file(path, transmute([]u8)lines) == nil)
 	n, duplicates, failures, ok := import_events(&relay, path)
 	testing.expect(t, ok)
 	testing.expect_value(t, n, u64(0))
 	testing.expect_value(t, duplicates, u64(0))
-	testing.expect_value(t, failures, u64(1))
+	testing.expect_value(t, failures, u64(3))
 	testing.expect_value(t, store.event_count(st), 0)
 	relay.hooks.check_write = nil
 	n, duplicates, failures, ok = import_events(&relay, path)
 	testing.expect(t, ok)
 	testing.expect_value(t, n, u64(1))
-	testing.expect_value(t, failures, u64(0))
+	testing.expect_value(t, duplicates, u64(1))
+	testing.expect_value(t, failures, u64(1))
 }

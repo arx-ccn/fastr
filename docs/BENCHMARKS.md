@@ -730,3 +730,23 @@ Without subscribers, fresh ingest ran at 177–181k events/s before and
 174–179k after. Duplicate ingest ran at 440–455k before and 450–452k
 after. Raw output: `fanout-explore.txt`, `fanout-ingest.txt`, and
 `fanout-suite.txt` under `~/.cache/fastr-bench/juice/raw/`.
+
+## Event decoder
+
+Compared with `0a935c1230`, both builds used `odin -o:speed`. The isolated
+fixture called `parse_client_msg` 200,000 times per pass on CPU 8 and reset
+the temporary allocator after each event. These are median TSC cycles per
+event over three passes, excluding signature verification and storage.
+
+| Client EVENT frame | DOM | Field decoder |
+|---|---:|---:|
+| 350 bytes, no tags, plain content | 5,508 | 727 |
+| 391 bytes, two tags, escaped tag and content | 7,269 | 1,396 |
+
+With eight publisher connections and no subscribers, each run submitted
+400,000 fresh events, then the same events as duplicates. Fresh ingest
+rose from 178–183k to 188–191k events/s; duplicate ingest rose from
+456–468k to 515–516k events/s. All four runs stored 400,000 events with
+zero publisher errors. Raw output: `decoder-{base,final}-cpu.txt`,
+`decoder-base-1.txt`, `decoder-comparison.txt` and `decoder-final-ingest.txt` under
+`~/.cache/fastr-bench/juice/raw/`.

@@ -581,6 +581,34 @@ grasp_watch_once :: proc(w: ^Grasp_Watch) {
 		if rerr != .None || closed {
 			return
 		}
+		event, event_sid, arity, status := nostr.parse_relay_event(string(data))
+		if status != .Not_Event {
+			if arity < 2 {
+				return
+			}
+			if arity != 3 || (event_sid != "live" && event_sid != "history") {
+				continue
+			}
+			if status == .Bad_Event {
+				continue
+			}
+			principal := policy.Principal {
+				source = .Peer,
+				peer   = w.url,
+			}
+			if w.p.cfg.grasp_private {
+				principal.auth_pks = {w.p.owner}
+			}
+			ingest_err, _ := ws.ingest_event(w.p.relay, principal, &event)
+			if ingest_err == .Io || ingest_err == .Mmap_Failed || ingest_err == .Pack_Invalid {
+				return
+			}
+			if event_sid == "history" {
+				oldest = min(oldest, event.created_at)
+				count += 1
+			}
+			continue
+		}
 		value, jerr := json.parse(data, allocator = context.temp_allocator)
 		arr, is_array := value.(json.Array)
 		if jerr != nil || !is_array || len(arr) < 2 {
@@ -618,30 +646,6 @@ grasp_watch_once :: proc(w: ^Grasp_Watch) {
 				continue // Reissue after AUTH OK, never bypass authentication.
 			}
 			return
-		}
-		if verb == "EVENT" && len(arr) == 3 && (sid == "live" || sid == "history") {
-			start := strings.index_byte(string(data), '{')
-			if start < 0 {
-				return
-			}
-			raw := string(data)[start:len(data) - 1]
-			msg, _, valid := nostr.parse_client_msg(fmt.tprintf(`["EVENT",%s]`, raw), 256, context.temp_allocator)
-			event, is_event := msg.(nostr.Msg_Event)
-			if !valid || !is_event {
-				continue
-			}
-			principal := policy.Principal{source = .Peer, peer = w.url}
-			if w.p.cfg.grasp_private {
-				principal.auth_pks = {w.p.owner}
-			}
-			ingest_err, _ := ws.ingest_event(w.p.relay, principal, &event.ev)
-			if ingest_err == .Io || ingest_err == .Mmap_Failed || ingest_err == .Pack_Invalid {
-				return
-			}
-			if sid == "history" {
-				oldest = min(oldest, event.ev.created_at)
-				count += 1
-			}
 		}
 		if verb == "EOSE" && sid == "history" && history {
 			if split_time >= 0 {
