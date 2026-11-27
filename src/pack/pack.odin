@@ -8,6 +8,7 @@ package pack
 
 import "base:runtime"
 import "core:encoding/endian"
+import "core:math/bits"
 import "core:simd"
 import "core:strings"
 import "core:unicode/utf8"
@@ -609,10 +610,21 @@ plain_json_prefix :: proc(data: []u8) -> int {
 		}
 		#no_bounds_check for len(data) - i >= 16 {
 			v := simd.from_array((cast(^[16]u8)&data[i])^)
-			if simd.extract_msbs(non_plain_mask(v)) != {} {
-				break
+			mask := simd.extract_msbs(non_plain_mask(v))
+			if mask != {} {
+				return i + int(bits.trailing_zeros(transmute(u16)mask))
 			}
 			i += 16
+		}
+		if i > 0 && i < len(data) {
+			// The overlap is already known to contain only plain bytes.
+			tail := len(data) - 16
+			v := simd.from_array((cast(^[16]u8)&data[tail])^)
+			mask := simd.extract_msbs(non_plain_mask(v))
+			if mask != {} {
+				return tail + int(bits.trailing_zeros(transmute(u16)mask))
+			}
+			return len(data)
 		}
 	}
 	#no_bounds_check for ; i < len(data); i += 1 {
