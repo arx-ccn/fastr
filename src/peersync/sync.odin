@@ -122,7 +122,12 @@ sync_once :: proc(
 			return 0, false, policy.decision_reason(d)
 		}
 	}
-	access := policy.Read_Access{principal = principal, user = relay.hooks.user, check = relay.hooks.check_read}
+	access := policy.Read_Access {
+		principal      = principal,
+		user           = relay.hooks.user,
+		check          = relay.hooks.check_read,
+		gift_wrap_read = relay.cfg.gift_wrap_read,
+	}
 	if serr, _ := store.iter_negentropy(relay.store, &filter, nil, max_neg_records, &fill, neg_fill, access); serr != .None {
 		return 0, false, "local store scan failed"
 	}

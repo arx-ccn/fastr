@@ -25,6 +25,11 @@ Decision :: struct {
 	message: string,
 }
 
+Gift_Wrap_Read :: enum {
+	Recipient,
+	Public,
+}
+
 Read_Hook :: #type proc(user: rawptr, principal: ^Principal, ev: ^pack.Event_View) -> Visibility
 
 Hooks :: struct {
@@ -38,9 +43,10 @@ Hooks :: struct {
 // Read checks are pure: query pruning and overlapping filters affect calls.
 // They may run under store read locks; never reenter the store or relay.
 Read_Access :: struct {
-	principal: Principal,
-	user:      rawptr,
-	check:     Read_Hook,
+	principal:      Principal,
+	user:           rawptr,
+	check:          Read_Hook,
+	gift_wrap_read: Gift_Wrap_Read,
 }
 
 read_packed :: proc(access: Read_Access, dp: []u8) -> (visible: bool, err: pack.Error) {

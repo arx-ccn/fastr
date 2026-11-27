@@ -150,8 +150,7 @@ p_tag_offsets_union :: proc(
 	return sets[0]
 }
 
-// True when the filter could match kind-1059 events (kinds absent or
-// containing 1059), i.e. NIP-17 gating must be computed.
+// True when the filter has no kind constraint or includes kind 1059.
 @(private)
 filter_may_match_giftwrap :: proc(filter: ^nostr.Filter) -> bool {
 	kinds, has := filter.kinds.?
@@ -500,8 +499,8 @@ heap_item_worse :: proc(a, b: Heap_Item) -> bool {
 // Query stored events matching `filter`, calling `emit` for each match
 // (newest-first, top-`filter.limit` by (created_at desc, id asc), default
 // limit 500). Excluded: NIP-40 expired entries, NIP-09 tombstoned events,
-// NIP-70 protected events unless authed as the author, and kind-1059 gift
-// wraps unless an auth pubkey matches the event's p-tag (NIP-17).
+// NIP-70 protected events unless authed as the author, and in recipient mode,
+// kind-1059 gift wraps unless an auth pubkey matches the event's p-tag.
 query_authed :: proc(
 	s: ^Store,
 	filter: ^nostr.Filter,
@@ -519,7 +518,9 @@ query_authed :: proc(
 	fkinds, has_kinds := filter.kinds.?
 	fids, has_ids := filter.ids.?
 	fauthors, has_authors := filter.authors.?
-	inbox := has_kinds && len(fkinds) == 1 && fkinds[0] == nostr.KIND_GIFT_WRAP
+	require_recipient := access.gift_wrap_read == .Recipient
+	inbox :=
+		require_recipient && has_kinds && len(fkinds) == 1 && fkinds[0] == nostr.KIND_GIFT_WRAP
 	if inbox && len(auth_pks) == 0 {
 		return .None
 	}
@@ -709,7 +710,7 @@ query_authed :: proc(
 				slice.sort_by(cand, proc(a, b: Event_Slot) -> bool {return a.slot < b.slot})
 			}
 		}
-	} else if len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
+	} else if require_recipient && len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
 		recipient_offsets = p_tag_offsets_union(tags_buf, auth_pks)
 	}
 
@@ -911,16 +912,16 @@ query_authed :: proc(
 		// 5. data offset — u64le at byte 0. Needed for NIP-17 and tag matching.
 		offset := endian.unchecked_get_u64le(base[0:8])
 
-		// 6. NIP-17: kind-1059 events only served to the p-tag recipient.
-		wrap := kind == nostr.KIND_GIFT_WRAP
-		if wrap && (len(auth_pks) == 0 || (!use_slots && offset not_in recipient_offsets)) {
+		// 6. In recipient mode, only serve gift wraps to a p-tag recipient.
+		check_wrap := require_recipient && kind == nostr.KIND_GIFT_WRAP
+		if check_wrap && (len(auth_pks) == 0 || (!use_slots && offset not_in recipient_offsets)) {
 			continue
 		}
 
 		// 7. Mailbox slots and the fallback offsets were selected by auth key.
-		//    ID and author slots still need that check, independently of
+		//    ID, author and tag slots still need that check, independently of
 		//    requested tags.
-		check_recipient := wrap && (use_ids || use_authors || use_tags)
+		check_recipient := check_wrap && (use_ids || use_authors || use_tags)
 		if check_recipient || len(specs) > 0 {
 			if use_tags {
 				for tag_end * TAG_ENTRY_SIZE < len(tags_buf) &&
@@ -1078,7 +1079,7 @@ query_authed :: proc(
 // NIP-45: count events matching a single filter (in-memory counters when
 // possible, exact scan otherwise).
 store_count :: proc(s: ^Store, filter: ^nostr.Filter) -> u64 {
-	return count_authors(s, filter, nil, unix_now())
+	return count_authors(s, filter, nil, unix_now(), {})
 }
 
 count_filters :: proc(
@@ -1106,13 +1107,19 @@ count_filters_at :: proc(
 		return scan_count_at(s, filters, auth_pks, now, access)
 	}
 	if len(filters) == 1 {
-		return count_authors(s, &filters[0], auth_pks, now)
+		return count_authors(s, &filters[0], auth_pks, now, access)
 	}
-	return scan_count_at(s, filters, auth_pks, now)
+	return scan_count_at(s, filters, auth_pks, now, access)
 }
 
 @(private)
-count_authors :: proc(s: ^Store, filter: ^nostr.Filter, auth_pks: [][32]u8, now: i64) -> u64 {
+count_authors :: proc(
+	s: ^Store,
+	filter: ^nostr.Filter,
+	auth_pks: [][32]u8,
+	now: i64,
+	access: policy.Read_Access,
+) -> u64 {
 	// Empty array on any of ids/authors/kinds is impossible per NIP-01.
 	if ids, ok := filter.ids.?; ok && len(ids) == 0 {
 		return 0
@@ -1130,11 +1137,12 @@ count_authors :: proc(s: ^Store, filter: ^nostr.Filter, auth_pks: [][32]u8, now:
 	has_time := has_since || has_until
 	_, has_ids := filter.ids.?
 	_, has_search := filter.search.?
-	needs_nip17 := filter_may_match_giftwrap(filter)
+	// Gift wraps can carry NIP-70 protection even in public mode.
+	may_match_wrap := filter_may_match_giftwrap(filter)
 
-	if has_tags || has_time || has_ids || has_search || needs_nip17 {
+	if has_tags || has_time || has_ids || has_search || may_match_wrap {
 		one := []nostr.Filter{filter^}
-		return scan_count_at(s, one, auth_pks, now)
+		return scan_count_at(s, one, auth_pks, now, access)
 	}
 
 	kinds, has_kinds := filter.kinds.?
@@ -1146,7 +1154,7 @@ count_authors :: proc(s: ^Store, filter: ^nostr.Filter, auth_pks: [][32]u8, now:
 		// requested kind is tainted.
 		if kinds_have_any_expiry(s, kinds[:]) {
 			one := []nostr.Filter{filter^}
-			return scan_count_at(s, one, auth_pks, now)
+			return scan_count_at(s, one, auth_pks, now, access)
 		}
 		sync.shared_guard(&s.kind_counts_mu)
 		total: u64
@@ -1181,7 +1189,7 @@ count_authors :: proc(s: ^Store, filter: ^nostr.Filter, auth_pks: [][32]u8, now:
 		// #117: defence-in-depth mirror of the kind-only fallback.
 		if authors_have_any_expiry(s, matching) {
 			one := []nostr.Filter{filter^}
-			return scan_count_at(s, one, auth_pks, now)
+			return scan_count_at(s, one, auth_pks, now, access)
 		}
 		sync.shared_guard(&s.author_counts_mu)
 		total: u64
@@ -1192,7 +1200,7 @@ count_authors :: proc(s: ^Store, filter: ^nostr.Filter, auth_pks: [][32]u8, now:
 	}
 	// Combined kind+author shape: exact scan.
 	one := []nostr.Filter{filter^}
-	return scan_count_at(s, one, auth_pks, now)
+	return scan_count_at(s, one, auth_pks, now, access)
 }
 
 @(private)
@@ -1201,7 +1209,7 @@ scan_count_at :: proc(
 	filters: []nostr.Filter,
 	auth_pks: [][32]u8,
 	now: i64,
-	access: policy.Read_Access = {},
+	access: policy.Read_Access,
 ) -> u64 {
 	idx_g := mapped_file_slice(&s.index)
 	defer slice_release(idx_g)
@@ -1216,21 +1224,15 @@ scan_count_at :: proc(
 	sync.shared_guard(&s.tombstones_mu)
 	sync.shared_guard(&s.vanished_mu)
 
-	needs_nip17 := false
-	for &f in filters {
-		if filter_may_match_giftwrap(&f) {
-			needs_nip17 = true
-			break
-		}
-	}
-	nip17_skip_all := false
+	require_recipient := access.gift_wrap_read == .Recipient
 	nip17_set: Offset_Set
 	defer delete(nip17_set)
-	if needs_nip17 {
-		if len(auth_pks) == 0 {
-			nip17_skip_all = true
-		} else {
-			nip17_set = p_tag_offsets_union(tags_g.data, auth_pks)
+	if require_recipient && len(auth_pks) > 0 {
+		for &f in filters {
+			if filter_may_match_giftwrap(&f) {
+				nip17_set = p_tag_offsets_union(tags_g.data, auth_pks)
+				break
+			}
 		}
 	}
 
@@ -1269,10 +1271,10 @@ scan_count_at :: proc(
 		if entry.pubkey in s.vanished && !entry.no_delete && entry.kind != nostr.KIND_VANISH {
 			continue
 		}
-		if entry.kind == nostr.KIND_GIFT_WRAP {
-			if nip17_skip_all || entry.offset not_in nip17_set {
-				continue
-			}
+		if require_recipient &&
+		   entry.kind == nostr.KIND_GIFT_WRAP &&
+		   entry.offset not_in nip17_set {
+			continue
 		}
 
 		// Cheap index-only pre-filter before touching the data blob.
@@ -1369,11 +1371,10 @@ iter_negentropy :: proc(
 
 	fsearch, has_search := filter.search.?
 
-	// NIP-17 gate, same shape as query_authed.
-	nip17_skip_all := len(auth_pks) == 0
+	require_recipient := access.gift_wrap_read == .Recipient
 	nip17_set: Offset_Set
 	defer delete(nip17_set)
-	if !nip17_skip_all && filter_may_match_giftwrap(filter) {
+	if require_recipient && len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
 		nip17_set = p_tag_offsets_union(tags_g.data, auth_pks)
 	}
 
@@ -1410,11 +1411,10 @@ iter_negentropy :: proc(
 			if entry.pubkey in s.vanished && !entry.no_delete && entry.kind != nostr.KIND_VANISH {
 				continue
 			}
-			// NIP-17: kind-1059 only served to the p-tag recipient.
-			if entry.kind == nostr.KIND_GIFT_WRAP {
-				if nip17_skip_all || entry.offset not_in nip17_set {
-					continue
-				}
+			if require_recipient &&
+			   entry.kind == nostr.KIND_GIFT_WRAP &&
+			   entry.offset not_in nip17_set {
+				continue
 			}
 			if !index_entry_matches(&entry, filter) {
 				continue

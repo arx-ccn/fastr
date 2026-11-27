@@ -181,7 +181,7 @@ live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
 	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
 	auth := auth_snapshot(&cs.auth, &keys)
 	ev := &live.shared.ev
-	if ev.kind == nostr.KIND_GIFT_WRAP {
+	if cs.relay.cfg.gift_wrap_read == .Recipient && ev.kind == nostr.KIND_GIFT_WRAP {
 		matched := false
 		for &pk in auth {
 			if nostr.event_has_p_tag(ev, &pk) {
@@ -526,6 +526,7 @@ read_access :: proc(cs: ^Conn_State, keys: ^[MAX_AUTH_PUBKEYS][32]u8) -> policy.
 		},
 		user = cs.relay.hooks.user,
 		check = cs.relay.hooks.check_read,
+		gift_wrap_read = cs.relay.cfg.gift_wrap_read,
 	}
 }
 

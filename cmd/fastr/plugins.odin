@@ -36,6 +36,7 @@ init_relay :: proc(relay: ^ws.Relay, st: ^store.Store, cfg: ^Config, plugins: ^P
 		relay_url                   = cfg.relay_url,
 		min_pow_difficulty          = cfg.min_pow_difficulty,
 		whitelist                   = cfg.whitelist,
+		gift_wrap_read              = cfg.gift_wrap_read,
 	}
 
 	plugins.grasp_enabled = cfg.grasp_enabled

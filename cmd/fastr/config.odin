@@ -8,6 +8,7 @@ import "core:strconv"
 import "core:strings"
 
 import "../../src/nostr"
+import "../../src/policy"
 import secp "../../src/secp256k1"
 import "../../src/ws"
 
@@ -74,6 +75,7 @@ Config :: struct {
 	min_pow_difficulty:          int,
 	// FASTR_WHITELIST restricts WebSocket access to NIP-42 identities.
 	whitelist:                   map[[32]u8]struct{},
+	gift_wrap_read:              policy.Gift_Wrap_Read,
 	// GRASP-01 git hosting. FASTR_GRASP_ENABLED ("1"/"true"). Off by default.
 	grasp_enabled:               bool,
 	// Directory holding the hosted bare repos. FASTR_GRASP_DIR. Default: "./repos".
@@ -126,6 +128,17 @@ env_u64 :: proc(key: string, default: u64) -> u64 {
 }
 
 load_config :: proc(allocator := context.allocator) -> Config {
+	gift_wrap_read: policy.Gift_Wrap_Read
+	raw := os.get_env("FASTR_GIFT_WRAPS_REQUIRE_AUTH", context.temp_allocator)
+	switch raw {
+	case "true", "1":
+		gift_wrap_read = .Recipient
+	case "", "false", "0":
+		gift_wrap_read = .Public
+	case:
+		fmt.panicf("FASTR_GIFT_WRAPS_REQUIRE_AUTH: expected true, false, 1, or 0, got %q", raw)
+	}
+
 	port := env_int("FASTR_PORT", 8080)
 	if port < 0 || port > 65535 {
 		port = 8080
@@ -281,6 +294,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		tos_text = tos_text,
 		min_pow_difficulty = min_pow,
 		whitelist = whitelist,
+		gift_wrap_read = gift_wrap_read,
 		grasp_enabled = grasp_enabled,
 		grasp_dir = grasp_dir,
 		grasp_max_pack_bytes = env_int("FASTR_GRASP_MAX_PACK_BYTES", 256 * 1024 * 1024),
