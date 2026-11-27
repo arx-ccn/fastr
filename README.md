@@ -45,7 +45,10 @@ in-memory prefix-max of `created_at` stops the scan as soon as nothing older
 can still crack the top-N (O(limit) for chronological ingest, not O(n)), and
 full-length id lookups skip the scan entirely via an id→slot map. A filter
 that names full author keys and no ids reads those authors' in-memory posting
-lists instead, while the authors hold at most an eighth of the index.
+lists instead, while the authors hold at most an eighth of the index. A tag
+filter reads the chain of records that carry its values, under the same
+limit. A scan bounded by `since` or `until` passes over blocks of 1,024 slots
+whose time range rules them out.
 [Performance notes](docs/PERFORMANCE.md) list the other cases that scan.
 Matching blobs are `mmap`-sliced and transcoded to JSON.
 

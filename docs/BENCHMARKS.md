@@ -577,3 +577,126 @@ fixture that set `POSTINGS_INDEX_SHARE` used 4,000 authors.
 Raw output, binary hashes, the driver scripts (`lib.sh`, `i.sh`, `a.sh`,
 `boot.sh`), and that fixture (`calib_test.odin`) are in
 `~/.cache/fastr-bench/juice/`, with the output under `raw/`.
+
+## Tag chains and time ranges: 2026-11-27
+
+These runs compare `b286fb7229` (before) and `333783e217` (after). The later
+build chains the records of `tags.s` by tag value and keeps a time range for
+each block of 1,024 index slots. The host, the compiler, the CPU pinning, and
+the way relay cycles are counted are those of the section above. Cycle
+columns are in thousands. `fastr-bench query` used eight connections and two
+passes.
+
+### Tag filters
+
+The data set was the suite's with 1,000,000 base events: 1,110,000 events,
+each with a `t` tag that holds one of four topics and a `p` tag that holds one
+of eight keys. A ninth key added 40 kind-1 events spread over the same time
+range. Each of the 40 has the `t` value `rare` and one of four `e` values.
+`tags.s` holds 2,220,080 records. Each row ran 2,000 requests, and the two
+`kinds` [9999] rows ran 400.
+
+| Filter | Relay cycles/req, `b286fb7229` | `333783e217` | Requests/s, `b286fb7229` | `333783e217` |
+|---|---:|---:|---:|---:|
+| A `#e` no event has | 49,091–52,170 | 12.3–12.4 | 669–722 | 309,015–335,237 |
+| A `#e` on 10 events | 49,034–50,605 | 20.8–20.9 | 693–706 | 120,428–126,286 |
+| `#t` `rare`, limit 20 | 43,673–43,935 | 31.6–34.1 | 792–797 | 74,087–82,148 |
+| `#t` `rare`, no limit given | 47,937–54,062 | 40.1–40.8 | 636–723 | 47,061–50,432 |
+| `#t` `rare`, `kinds` [7], no match | 40,473–47,408 | 15.4–16.0 | 728–860 | 301,423–309,600 |
+| `#t` `rare`, `since` with 3 events after it | 24,289–26,095 | 15.7–19.1 | 1,329–1,454 | 202,561–204,056 |
+| `#t` `rare`, `until` at the midpoint, limit 20 | 41,857–46,384 | 32.0–32.2 | 753–832 | 78,046–83,659 |
+| `#t` `rare` and an author with 1/8 of the events, no match | 59,028–59,141 | 16.4–17.0 | 627 | 259,766–280,577 |
+| `#p` on 1/8 of the events, limit 100 | 501.9–538.7 | 386.8–427.4 | 2,239–2,392 | 2,381–2,469 |
+| That `#p`, `kinds` [9999], no match | 23,135–24,378 | 14,216–15,787 | 1,415–1,515 | 2,332–2,411 |
+| `#t` on 1/4 of the events, limit 100 | 450.0–471.3 | 432.4–492.1 | 2,456–2,534 | 2,415–2,479 |
+| That `#t`, `kinds` [9999], no match | 22,686–22,765 | 22,037–23,695 | 1,520–1,543 | 1,431–1,591 |
+| That `#t`, `until` at the midpoint, limit 100 | 36,944–39,723 | 31,404–31,613 | 864–927 | 1,066–1,082 |
+| No tag, limit 100 | 338.3–351.5 | 353.4–363.7 | 2,411–2,470 | 2,469–2,589 |
+
+Both builds returned the same number of events in every row. The `p` key is
+on 138,750 of the 1,110,040 events. The cutoff of one eighth is 138,755, so
+its rows read the chain. A topic is on 277,500 events, one quarter, so its
+rows scan in both builds. The suite, which checks every reply against its own
+copy of the data, passed on `333783e217` with 100,000 base events and 2,000
+requests per workload.
+
+A build of `333783e217` with the cutoff at one quarter read the topic's chain
+for the `kinds` [9999] row. It took 36.6 to 37.1 million cycles per request
+in a run where the scan took 23.1 to 23.4 million.
+
+The topic row with `kinds` [9999] reads all 1,110,040 slots and matches
+nothing, in both builds. It ran five more times on each build, in turn. The
+earlier build took 23.3 to 24.8 million cycles per request and the later one
+22.5 to 23.6 million. The later build retires 45.5 million instructions per
+request where the earlier one retires 43.3 million. Its slot loop loads
+values from the stack that the earlier build's loop keeps in registers, and
+the count moved between 44.4 and 48.9 million as code elsewhere in
+`query_authed` changed.
+
+### Time-bounded scans
+
+`fastr-bench ingest --events 400000 --concurrency 1` stored 400,000 events
+from one key, one second apart, in time order. Each row ran 2,000 requests.
+
+| Filter | Relay cycles/req, `b286fb7229` | `333783e217` | Requests/s, `b286fb7229` | `333783e217` |
+|---|---:|---:|---:|---:|
+| `until` at the midpoint, limit 100 | 1,495–1,552 | 88.7–88.9 | 12,789–13,237 | 22,446–26,877 |
+| `until` at the first quarter, limit 100 | 2,647–2,810 | 87.3–88.4 | 8,454–9,071 | 22,948–26,147 |
+| `since` at the last quarter, limit 100 | 85.2–90.9 | 84.9 | 19,740–24,590 | 23,417–26,320 |
+| A window of 500 seconds in the middle, limit 100 | 1,994–2,013 | 91.2–94.9 | 11,144–11,220 | 24,234–26,793 |
+| A window before every event | 5,351–5,563 | 18.2–18.9 | 6,177–6,184 | 283,822–297,780 |
+| No bounds, limit 100 | 84.7–91.9 | 85.7–87.6 | 22,072–23,888 | 23,133–24,122 |
+
+The earlier build already stopped at `since`, and without bounds neither
+build reads far.
+
+The tagged data set shows the limit of the ranges. Eight connections stored
+its base events, so most of its blocks span most of the time range. In the
+topic row with `until` in the first table, the scan passes 106 of the 1,085
+blocks, numbers 977 to 1082, which hold only events newer than the bound. It
+reads the rest. These runs do not separate what those 106 blocks save from
+the other changes to that scan.
+
+An in-process fixture ran tag filters with `until` at the midpoint and limit
+20 on 400,000 events in time order. The tags were on 1/2 to 1/64 of the
+events, so each filter scanned. The fixture reads the time-stamp counter
+around each query. While the scan walked the tag records of the blocks it
+passed, a query took 599,000 to 735,000 time-stamp counter cycles. With the
+binary search it took 10,000 to 42,000.
+
+### Boot, memory, and append
+
+Each build started on the 1,110,040-event data set and answered one
+`{"limit":1}` REQ. Cycles and instructions are the relay's user-space totals,
+in millions. Three passes.
+
+| | `b286fb7229` | `333783e217` |
+|---|---:|---:|
+| Cycles to first EOSE | 6,748–6,881 | 6,886–7,282 |
+| Instructions to first EOSE | 14,805–14,824 | 15,267–15,296 |
+| Anonymous RSS at first EOSE, MiB | 133.8–136.2 | 149.5–154.5 |
+
+The links take 16.9 MiB: 8 bytes for each of the 2,220,080 tag records. This
+data set has 17 tag values, which fit in the hash table's first 1,024
+buckets. Once the table has grown, each value takes 24 to 48 bytes of it.
+
+An in-process fixture appended 200,000 events with three tags each: one of
+four `t` values, a `p` out of 5,000, and an `e` of its own. An append took
+11,731 to 12,208 time-stamp counter cycles with the call that chains a record
+removed, and 12,217 to 12,407 with it.
+
+These runs do not cover kernel cycles, cold page cache, authenticated tag
+queries over the wire, tag values that share a hash, or queries during
+compaction. The store's unit tests check the results of all three, not their
+cost: authenticated tag queries, two values whose keys share a hash, and a
+query that a compaction overtakes.
+
+Raw output is in `~/.cache/fastr-bench/juice/raw/` (`tags.txt`, `zones.txt`,
+`tags-boot.txt`, `tags-append.txt`, `tag-cutoff-quarter.txt`,
+`tag-cursor.txt`, `scan-no-hit.txt`, `suite.txt`). `raw/tag-chains-first/`
+holds the runs on `9861f4366a` that its commit message and the
+`TAG_INDEX_SHARE` comment quote, and `scan-no-hit-first.txt` the run that
+the commit message of `3eeac2d56e` quotes. The scripts and fixtures are one
+directory up: `rows.sh` with `tag.rows` and `time.rows`, `mkt.sh`, `mk.sh`,
+`s.sh`, `boot.sh`, and `calib.sh` with `calib_tags_test.odin` and
+`calib_append_test.odin`.

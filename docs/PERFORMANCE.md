@@ -47,13 +47,58 @@ scans as before. `POSTINGS_INDEX_SHARE` in `src/store/query.odin` records the
 measurement behind that cutoff. Exact-ID lookups and authenticated gift-wrap
 inbox reads keep their own paths and take precedence. A query also scans
 while the postings do not match its snapshot of the index, which lasts from a
-compaction swap until the rebuild that follows it. A filter without full
-author keys still scans: author prefixes, tags, and `kinds` select no
-postings on their own, apart from that inbox read.
+compaction swap until the rebuild that follows it.
 
 A posting is 12 bytes. Every event has one under its author, and a gift wrap
 has one more under each recipient. The maps, lists, and runs that hold them
 come on top.
+
+A filter with a tag reads tag chains. Every `tags.s` record links to the
+previous record with the same name and value, and a hash table holds the
+newest record of each key. The query walks the chains of the values it names,
+newest slot first, and runs the same checks on each candidate as the scan.
+Keys that share a 32-bit hash share a chain, and the tag check on each
+candidate tells them apart. Two values that name one chain count once, and
+the query reads that chain once. When a filter names several tags, the query
+reads the tag whose values name the fewest records. When the filter also
+names full author keys, the query reads the author postings or the tag
+chains, whichever names fewer events.
+
+The chains answer while the named values hold at most one eighth of the
+index. `TAG_INDEX_SHARE` in `src/store/query.odin` records the measurement
+behind that cutoff. With `since`, the walk stops at the first slot below which
+no event is new enough. A chain cannot start at `until`: it passes every
+record above the bound first, where the author postings seek and the scan
+starts at the bound. With `until`, the chains answer only when the square of
+their record count is at most `limit` times the number of events in the plan
+they replace. When the author postings qualify, that number is what the seek
+leaves: the events of the named authors at or below the bound. Otherwise it
+is every event. Past a cutoff the query reads the author postings or scans.
+It also scans from a compaction swap until the rebuild that follows it, as it
+does for the postings.
+
+A link is 8 bytes for each `tags.s` record. A key takes a 12-byte bucket in a
+hash table that starts with 1,024 buckets and is a quarter to half full once
+it has grown, so 24 to 48 bytes. Tags have
+chains and not posting lists because most tag values name one event, and a
+posting list costs a few hundred bytes per key.
+
+The store keeps the oldest and the newest `created_at` of each block of 1,024
+index slots. A scan bounded by `since` or `until` checks a block's range on
+entering the block, and passes every block that cannot hold a match. After it
+passes blocks, the scan finds its place in `tags.s` by binary search. The
+ranges help when slot order follows time. Events that eight connections
+deliver in parallel leave most blocks spanning most of the time range, and
+the scan then reads those blocks. Compaction renumbers the slots, so the
+ranges are empty from a compaction swap until the rebuild that follows it.
+A query that still reads the files from before the swap uses neither the new
+ranges nor the new prefix timestamp ceiling.
+
+A filter with no tag and no full author key still scans. Author prefixes,
+`kinds`, and `search` select no postings and no chains on their own. A filter
+whose authors or tag values are over their cutoffs scans too.
+[Measurements](BENCHMARKS.md#tag-chains-and-time-ranges-2026-11-27) cover the
+chains and the ranges.
 
 The in-process performance fixtures exercise fanout, exact-ID and broad store
 queries, REQ handling, subscription replacement, recipient lookup, and author

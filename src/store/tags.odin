@@ -139,9 +139,9 @@ Tag_Bucket :: struct {
 
 // Every tags.s record chained to the previous record with the same name and
 // value, so a tag filter visits its matches, newest slot first, where the
-// scan reads every slot. A record costs 8 bytes and a key 24 to 48. Posting
-// lists would cost a few hundred bytes per key, and most tag values name one
-// event.
+// scan reads every slot. A record costs 8 bytes, and a key 24 to 48 once the
+// bucket table has grown past its first 1,024 buckets. Posting lists would
+// cost a few hundred bytes per key, and most tag values name one event.
 //
 //   buckets            links (one per tags.s record)
 //   hash -> head ----> [9] prev=4 slot=7
