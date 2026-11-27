@@ -7,6 +7,7 @@ import "core:testing"
 
 import "../nostr"
 import "../pack"
+import "../policy"
 
 @(test)
 test_append_and_query_one :: proc(t: ^testing.T) {
@@ -426,10 +427,25 @@ test_authors_filter :: proc(pubkeys: ..[32]u8) -> nostr.Filter {
 }
 
 @(private = "file")
-test_query_ids :: proc(t: ^testing.T, s: ^Store, f: ^nostr.Filter, auth: [][32]u8) -> [][32]u8 {
+test_query_ids :: proc(
+	t: ^testing.T,
+	s: ^Store,
+	f: ^nostr.Filter,
+	auth: [][32]u8,
+	access: policy.Read_Access = {},
+) -> [][32]u8 {
 	c := collect_ctx_init()
-	testing.expect_value(t, query_authed(s, f, auth, &c, collect_cb), Error.None)
+	testing.expect_value(t, query_authed(s, f, auth, &c, collect_cb, access), Error.None)
 	return c.ids[:]
+}
+
+@(private = "file")
+hide_reactions :: proc(
+	user: rawptr,
+	principal: ^policy.Principal,
+	ev: ^pack.Event_View,
+) -> policy.Visibility {
+	return .Hide if ev.kind == 7 else .Show
 }
 
 // A filter on full author keys reads the authors' postings. It must return
@@ -500,6 +516,14 @@ test_author_postings_match_scan :: proc(t: ^testing.T) {
 	filters[4].since, filters[4].until = 1020, 1030
 	filters[5].tags = test_tag_filter('t', "topic").tags
 	filters[6].kinds = test_kind_filter(wrap, 1).kinds
+	// These authors hold most of the index, so this filter must scan.
+	most := test_authors_filter(
+		a,
+		test_pubkey(20),
+		test_pubkey(21),
+		test_pubkey(22),
+		test_pubkey(23),
+	)
 
 	for phase in 0 ..< 4 {
 		switch phase {
@@ -514,31 +538,34 @@ test_author_postings_match_scan :: proc(t: ^testing.T) {
 			test_append_ok(t, s, &newer)
 		case:
 		}
-		selected := 0
-		for pubkey in ([2][32]u8{a, b}) {
-			for run in s.postings.by_author[pubkey].runs {
-				selected += len(run.slots)
-			}
-		}
-		testing.expect(t, selected >= 10 && selected * POSTINGS_INDEX_SHARE <= event_count(s))
+		// Only a difference between the postings and the index shows which
+		// one answered. Without a's list, a selective filter finds nothing
+		// and a filter that scans still finds a's events.
+		_, a_list := delete_key(&s.postings.by_author, a)
+		testing.expect_value(t, len(test_query_ids(t, s, &by_a, nil)), 0)
+		testing.expect(t, ids_contain(test_query_ids(t, s, &most, nil), old.id))
+		s.postings.by_author[a] = a_list
 
 		for &f, fi in filters {
 			for auth in ([][][32]u8{nil, {reader}, {a}}) {
-				from_postings := test_query_ids(t, s, &f, auth)
-				entries := s.postings.entries
-				s.postings.entries = -1 // The index scan answers.
-				from_scan := test_query_ids(t, s, &f, auth)
-				s.postings.entries = entries
-				testing.expectf(
-					t,
-					slice.equal(from_postings, from_scan),
-					"phase %d filter %d readers %d: postings %v, scan %v",
-					phase,
-					fi,
-					len(auth),
-					from_postings,
-					from_scan,
-				)
+				for access in ([]policy.Read_Access{{}, {check = hide_reactions}}) {
+					from_postings := test_query_ids(t, s, &f, auth, access)
+					entries := s.postings.entries
+					s.postings.entries = -1 // The index scan answers.
+					from_scan := test_query_ids(t, s, &f, auth, access)
+					s.postings.entries = entries
+					testing.expectf(
+						t,
+						slice.equal(from_postings, from_scan),
+						"phase %d filter %d readers %d policy %v: postings %v, scan %v",
+						phase,
+						fi,
+						len(auth),
+						access.check != nil,
+						from_postings,
+						from_scan,
+					)
+				}
 			}
 		}
 	}

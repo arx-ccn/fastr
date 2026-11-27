@@ -61,8 +61,9 @@ Posting_Run :: struct {
 // Events under one key, newest first within each run.
 @(private)
 Posting_List :: struct {
-	runs: [dynamic]^Posting_Run,
-	last: u32,
+	runs:  [dynamic]^Posting_Run,
+	count: int, // postings across all runs
+	last:  u32,
 }
 
 // In-memory lookup from a key to the index slots of its events, so a
@@ -126,6 +127,7 @@ posting_add :: proc(lists: ^map[[32]u8]Posting_List, key: [32]u8, posting: Posti
 		return
 	}
 	list.last = posting.slot
+	list.count += 1
 	if idx == nil && len(list.runs) > 0 {
 		append(&list.runs[0].slots, posting)
 		return

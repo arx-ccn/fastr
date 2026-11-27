@@ -249,16 +249,13 @@ Posting_Cursor :: struct {
 @(private)
 POSTINGS_INDEX_SHARE :: 8
 
-// Pin each run of `list` behind a cursor and return how many postings they
-// hold. Caller holds known_ids_mu.
+// Pin each run of `list` behind a cursor. Caller holds known_ids_mu.
 @(private)
-cursors_pin :: proc(cursors: ^[dynamic]Posting_Cursor, list: Posting_List) -> (postings: int) {
+cursors_pin :: proc(cursors: ^[dynamic]Posting_Cursor, list: Posting_List) {
 	for run in list.runs {
 		sync.atomic_add(&run.refs, 1)
 		append(cursors, Posting_Cursor{run = run})
-		postings += len(run.slots)
 	}
-	return
 }
 
 // The first posting of a newest-first run that is not newer than `until`.
@@ -463,13 +460,30 @@ query_authed :: proc(
 		if !use_ids && inbox && indexed_tags {
 			use_mailbox = true
 			for &pk in auth_pks {
-				posting_steps += cursors_pin(&cursors, s.postings.by_recipient[pk])
+				list := s.postings.by_recipient[pk]
+				posting_steps += list.count
+				cursors_pin(&cursors, list)
 			}
 		} else if !use_ids && full_authors && indexed_tags {
+			// A repeated key names one list. Count it once, and pin nothing
+			// until the postings are chosen.
+			named := make(Key_Set, context.temp_allocator)
+			lists := make([dynamic]Posting_List, 0, len(fauthors), context.temp_allocator)
 			for author in fauthors {
-				posting_steps += cursors_pin(&cursors, s.postings.by_author[author.bytes])
+				list, held := s.postings.by_author[author.bytes]
+				if !held || author.bytes in named {
+					continue
+				}
+				named[author.bytes] = {}
+				posting_steps += list.count
+				append(&lists, list)
 			}
 			use_authors = posting_steps * POSTINGS_INDEX_SHARE <= total
+			if use_authors {
+				for list in lists {
+					cursors_pin(&cursors, list)
+				}
+			}
 		}
 		sync.atomic_add(&maps.refs, 1)
 	}
