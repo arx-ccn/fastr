@@ -581,7 +581,21 @@ write_field_as_json :: proc(dp: []u8, pos: ^int, buf: ^[dynamic]u8) -> Error {
 		hex_encode(data, out[1:len(out) - 1])
 		return .None
 	}
-	ascii := plain_json_prefix(data)
+	ascii := 0
+	when simd.HAS_HARDWARE_SIMD {
+		if length < 16 && pos^ >= 16 {
+			// End the load at the field boundary and ignore the preceding bytes.
+			v := simd.from_array((cast(^[16]u8)&dp[pos^ - 16])^)
+			mask := transmute(u16)simd.extract_msbs(non_plain_mask(v))
+			if u32(mask) < u32(1) << uint(16 - length) {
+				ascii = length
+			}
+		} else {
+			ascii = plain_json_prefix(data)
+		}
+	} else {
+		ascii = plain_json_prefix(data)
+	}
 	if ascii == length {
 		write_quoted_bytes(data, buf)
 	} else {

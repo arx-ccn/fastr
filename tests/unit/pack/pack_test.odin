@@ -3,6 +3,7 @@ package pack
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:strings"
 import "core:testing"
 
 @(private = "file")
@@ -370,6 +371,19 @@ test_transcode_mixed_tags :: proc(t: ^testing.T) {
 test_transcode_content_escaping :: proc(t: ^testing.T) {
 	e := make_ev(0, 1, nil, "line1\nline2\ttab \"quoted\" back\\slash")
 	testing.expect_value(t, transcode(t, &e, "s"), via_event(t, &e, "s"))
+}
+
+@(test)
+test_transcode_short_field :: proc(t: ^testing.T) {
+	prefix := "3333333333333333"
+	for n in 0 ..= len(prefix) {
+		for suffix in ([4]string{"x", "\"", "\x01", "é"}) {
+			field := strings.concatenate({prefix[:n], suffix}, context.temp_allocator)
+			tags := [2]Tag{{fields = {"p", "\n", field}}, {fields = {"t", field}}}
+			e := make_ev(0, 1, tags[:], field)
+			testing.expect_value(t, transcode(t, &e, "s"), via_event(t, &e, "s"))
+		}
+	}
 }
 
 @(test)

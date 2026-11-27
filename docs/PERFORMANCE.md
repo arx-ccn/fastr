@@ -207,8 +207,9 @@ response construction before the WebSocket write:
   ceilings remain in force.
 - `src/pack/pack.odin` scans unescaped bytes and valid ASCII prefixes in 16-byte
   SIMD blocks. The ASCII scan overlaps the last block when fewer than 16 bytes
-  remain. Strings shorter than 16 bytes use scalar checks. Non-ASCII suffixes
-  still receive full UTF-8 validation. Canonical event-ID encoding is unchanged.
+  remain. For a short packed field it loads the 16 bytes ending at the field
+  boundary and masks out bytes before the field. Bytes outside the plain ASCII
+  prefix still receive UTF-8 validation. Canonical event-ID encoding is unchanged.
 - `src/ws/handler.odin` reserves JSON output capacity from the packed event length,
   avoiding buffer growth for ordinary large-content responses.
 
