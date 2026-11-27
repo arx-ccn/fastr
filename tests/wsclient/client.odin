@@ -14,7 +14,7 @@ Conn :: struct {
 	poff:    int,
 }
 
-ws_connect :: proc(url: string) -> (conn: Conn, err: Error) {
+ws_connect :: proc(url: string, extra_headers := "") -> (conn: Conn, err: Error) {
 	addr := strings.trim_prefix(url, "ws://")
 	if i := strings.index_byte(addr, '/'); i >= 0 {
 		addr = addr[:i]
@@ -32,8 +32,9 @@ ws_connect :: proc(url: string) -> (conn: Conn, err: Error) {
 
 	upgrade := fmt.tprintf(
 		"GET / HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
-		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s\r\n",
 		addr,
+		extra_headers,
 	)
 	if _, send_err := net.send_tcp(sock, transmute([]u8)upgrade); send_err != nil {
 		return {}, .Socket

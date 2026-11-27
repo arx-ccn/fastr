@@ -90,7 +90,6 @@ test_parse_request_upgrade :: proc(t: ^testing.T) {
 	key, ok := websocket_upgrade_key(&req)
 	testing.expect(t, ok)
 	testing.expect_value(t, key, "dGhlIHNhbXBsZSBub25jZQ==")
-	testing.expect(t, is_websocket_upgrade(&req))
 }
 
 @(test)
@@ -103,7 +102,8 @@ test_parse_request_plain_get_nip11 :: proc(t: ^testing.T) {
 	testing.expect_value(t, req.method, "GET")
 	testing.expect_value(t, req.path, "/")
 	testing.expect_value(t, header_get(&req, "accept"), "application/nostr+json")
-	testing.expect(t, !is_websocket_upgrade(&req))
+	_, upgrade := websocket_upgrade_key(&req)
+	testing.expect(t, !upgrade)
 }
 
 @(test)
@@ -117,7 +117,8 @@ test_parse_request_upgrade_missing_version :: proc(t: ^testing.T) {
 	req: Request
 	_, err := parse_request(bytes_of(raw), &req)
 	testing.expect_value(t, err, Error.None)
-	testing.expect(t, !is_websocket_upgrade(&req))
+	_, upgrade := websocket_upgrade_key(&req)
+	testing.expect(t, !upgrade)
 }
 
 @(test)

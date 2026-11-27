@@ -139,12 +139,6 @@ websocket_upgrade_key :: proc(req: ^Request) -> (key: string, ok: bool) #optiona
 	return k, true
 }
 
-// is_websocket_upgrade is a convenience predicate over websocket_upgrade_key.
-is_websocket_upgrade :: proc(req: ^Request) -> bool {
-	_, ok := websocket_upgrade_key(req)
-	return ok
-}
-
 // header_has_token reports whether a comma-separated header value contains
 // token (ASCII case-insensitive), e.g. "Connection: keep-alive, Upgrade".
 @(private)

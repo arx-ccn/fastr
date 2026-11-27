@@ -289,8 +289,7 @@ stats_loop :: proc(ctx: ^Stats_Ctx) {
 
 // Peek at the first bytes of an incoming connection. NIP-11 requests get the
 // relay info document; plain HTTP gets the index page; WebSocket upgrades go
-// to the connection handler. Dispatch ordering: the NIP-11 Accept header
-// wins even when an Upgrade header is also present.
+// to the connection handler even if the client sends the NIP-11 Accept header.
 @(private = "file")
 conn_entry :: proc(ctx: ^Conn_Ctx) {
 	defer {
@@ -317,6 +316,14 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 		return
 	}
 
+	if key, ok := ws.websocket_upgrade_key(&req); ok {
+		if ws.accept_upgrade(ctx.sock, key) != .None {
+			return
+		}
+		ws.handle_connection(ctx.relay, ctx.sock, extra, ctx.conn_id)
+		return
+	}
+
 	if accept, has_accept := ws.header_get(&req, "accept"); has_accept {
 		if strings.contains(accept, "application/nostr+json") {
 			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.nip11)
@@ -324,30 +331,21 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 		}
 	}
 
-	if !ws.is_websocket_upgrade(&req) {
-		// GRASP-01 git smart HTTP: /<npub>/<identifier>.git endpoints.
-		if req.path == "/icon.png" {
-			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.icon)
-			return
-		}
-		if req.path == "/banner.png" {
-			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.banner)
-			return
-		}
-		if req.path == "/tos.txt" {
-			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.tos)
-			return
-		}
-		// Plain browser visit / probe.
-		_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.index)
+	if req.path == "/icon.png" {
+		_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.icon)
+		return
+	}
+	if req.path == "/banner.png" {
+		_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.banner)
+		return
+	}
+	if req.path == "/tos.txt" {
+		_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.tos)
 		return
 	}
 
-	key, _ := ws.websocket_upgrade_key(&req)
-	if ws.accept_upgrade(ctx.sock, key) != .None {
-		return
-	}
-	ws.handle_connection(ctx.relay, ctx.sock, extra, ctx.conn_id)
+	// Plain browser visit / probe.
+	_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.index)
 }
 
 // Import events from a JSONL file into the store at `dir`.

@@ -87,15 +87,15 @@ main :: proc() {
 	}
 
 	url := fmt.tprintf("ws://127.0.0.1:%d", port)
-	conn, connect_err := wsclient.ws_connect(url)
+	conn, connect_err := wsclient.ws_connect(url, "Accept: application/nostr+json\r\n")
 	if connect_err != .None {
-		fail("websocket connect: %v", connect_err)
+		fail("websocket connect with NIP-11 Accept: %v", connect_err)
 	}
 	defer wsclient.conn_close(&conn)
 	if err := net.set_option(conn.sock, .Receive_Timeout, 5 * time.Second); err != nil {
 		fail("set WebSocket receive timeout: %v", err)
 	}
-	fmt.println("upgrade: OK")
+	fmt.println("upgrade with NIP-11 Accept: OK")
 
 	// Expect the NIP-42 AUTH challenge.
 	auth_msg, recv_err := wsclient.recv_text(&conn)

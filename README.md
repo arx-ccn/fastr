@@ -101,6 +101,9 @@ Transcoding to JSON wire format is one pass, zero heap allocations. The event ne
 | 70 | Protected events |
 | 77 | Negentropy sync (server + pull client) |
 
+A valid WebSocket upgrade takes precedence over the NIP-11
+`Accept: application/nostr+json` header.
+
 fastr implements the unassigned [deletion-protection proposal](https://github.com/nostr-protocol/nips/pull/2531).
 An eligible event signed with exactly one `["no_delete"]` tag survives
 same-author deletion requests and author-based vanish purges, including
