@@ -58,10 +58,7 @@ Live_Event :: struct {
 	shared: ^Shared_Event,
 }
 
-Out_Text :: struct {
-	json: string, // ownership transfers to the writer
-}
-
+// Complete WebSocket frames: a stored-event replay or a single reply.
 Out_Batch :: struct {
 	wire: [dynamic]u8, // retain the allocation base and its owning allocator
 	sent: int,
@@ -81,7 +78,6 @@ Out_Close :: struct {
 }
 
 Out_Msg :: union {
-	Out_Text,
 	Out_Batch,
 	Out_Live,
 	Out_Pong,

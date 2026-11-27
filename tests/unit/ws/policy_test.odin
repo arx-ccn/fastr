@@ -58,6 +58,16 @@ reader_is_author :: proc(
 	return .Hide
 }
 
+// The JSON of a queued single-frame reply.
+@(private)
+reply_json :: proc(msg: Out_Msg) -> string {
+	wire := msg.(Out_Batch).wire[:]
+	hdr, err := decode_frame_header(wire)
+	assert(err == .None && hdr.opcode == .Text)
+	assert(hdr.header_len + int(hdr.payload_len) == len(wire))
+	return string(wire[hdr.header_len:])
+}
+
 @(test)
 test_write_policy :: proc(t: ^testing.T) {
 	dir, derr := os.make_directory_temp("", "fastr_policy_*", context.allocator)
@@ -175,7 +185,7 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 	assert(got)
 	testing.expect_value(
 		t,
-		reply.(Out_Text).json,
+		reply_json(reply),
 		`["CLOSED","other","restricted: too many subscriptions"]`,
 	)
 	drop_msg(reply)
@@ -190,9 +200,7 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 		testing.expect_value(t, spy.ops[op], 1)
 		msg, ok := chan.try_recv(o.ch)
 		testing.expect(t, ok)
-		out, is_text := msg.(Out_Text)
-		testing.expect(t, is_text)
-		testing.expect(t, strings.contains(out.json, "auth-required: test policy"))
+		testing.expect(t, strings.contains(reply_json(msg), "auth-required: test policy"))
 		drop_msg(msg)
 	}
 	fanout_subscribe(&r.fanout, "s", {filter}, o)

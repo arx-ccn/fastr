@@ -2,7 +2,7 @@
 // the EVENT/REQ/COUNT/AUTH/NEG-* handlers.
 //
 // Threading model: one reader thread (this proc) + one writer thread per
-// connection. An idle outbox can send a replay without waking the writer.
+// connection. An idle outbox sends replies and replays without waking the writer.
 // Otherwise the writer sends queued frames in order. It also applies the
 // NIP-17/NIP-70 live-event visibility gates using the auth state shared
 // through the outbox.
@@ -50,61 +50,65 @@ Conn_State :: struct {
 // ---------------------------------------------------------------------------
 // Outbound plumbing
 
-// Queue a heap-owned JSON string to the writer. Frees it if the channel is
-// closed or full (a dropped direct response means the socket is going away).
+// A reply starts with room for the shortest frame header; finish_text_frame
+// widens it for payloads over 125 bytes.
 @(private)
-send_text :: proc(cs: ^Conn_State, json: string) {
-	if !outbox_send(cs.outbox, Out_Msg(Out_Text{json = json})) {
-		delete(json)
+REPLY_HEADER_LEN :: 2
+
+// Frame a JSON reply written after `reserved` header bytes and hand it to the
+// outbox, which writes it at once when the socket is idle. Frees it if the
+// outbox is closed or full (a dropped reply means the socket is going away).
+@(private)
+send_reply :: proc(cs: ^Conn_State, buf: ^[dynamic]u8, reserved := REPLY_HEADER_LEN) {
+	finish_text_frame(buf, 0, reserved)
+	if !outbox_send(cs.outbox, Out_Msg(Out_Batch{wire = buf^})) {
+		delete(buf^)
 	}
 }
 
 @(private)
-take_string :: proc(buf: ^[dynamic]u8) -> string {
-	return string(buf[:])
-}
-
-@(private)
 send_ok :: proc(cs: ^Conn_State, id: ^[32]u8, accepted: bool, reason: string) {
-	buf := make([dynamic]u8, 0, 128)
+	buf := make([dynamic]u8, REPLY_HEADER_LEN, 128)
 	nostr.write_ok_json(&buf, id, accepted, reason)
-	send_text(cs, take_string(&buf))
+	send_reply(cs, &buf)
 }
 
 @(private)
 send_notice :: proc(cs: ^Conn_State, message: string) {
-	buf := make([dynamic]u8, 0, 64)
+	buf := make([dynamic]u8, REPLY_HEADER_LEN, 64)
 	nostr.write_notice_json(&buf, message)
-	send_text(cs, take_string(&buf))
+	send_reply(cs, &buf)
 }
 
 @(private)
 send_closed :: proc(cs: ^Conn_State, sub_id: string, message: string) {
-	buf := make([dynamic]u8, 0, 128)
+	buf := make([dynamic]u8, REPLY_HEADER_LEN, 128)
 	nostr.write_closed_json(&buf, sub_id, message)
-	send_text(cs, take_string(&buf))
+	send_reply(cs, &buf)
 }
 
 @(private)
 send_neg_err :: proc(cs: ^Conn_State, sub_id: string, reason: string, max_records := -1) {
-	buf := make([dynamic]u8, 0, 128)
+	buf := make([dynamic]u8, REPLY_HEADER_LEN, 128)
 	nostr.write_neg_err_json(&buf, sub_id, reason, max_records)
-	send_text(cs, take_string(&buf))
+	send_reply(cs, &buf)
 }
 
 @(private)
 send_neg_msg :: proc(cs: ^Conn_State, sub_id: string, msg: []u8) {
-	buf := make([dynamic]u8, 0, 128 + len(msg) * 2)
+	// The hex payload alone fixes the least header length this frame can
+	// have, so a large message is framed without moving it.
+	hdr: [MAX_FRAME_HEADER_LEN]u8 = ---
+	reserved := encode_frame_header(hdr[:], .Text, len(msg) * 2)
+	buf := make([dynamic]u8, reserved, reserved + 128 + len(msg) * 2)
 	nostr.write_neg_msg_json(&buf, sub_id, msg)
-	send_text(cs, take_string(&buf))
+	send_reply(cs, &buf, reserved)
 }
 
 // Free a message's owned resources without sending it.
 @(private)
 drop_msg :: proc(msg: Out_Msg) {
 	switch m in msg {
-	case Out_Text:
-		delete(m.json)
 	case Out_Batch:
 		delete(m.wire)
 	case Out_Live:
@@ -136,11 +140,6 @@ writer_loop :: proc(cs: ^Conn_State) {
 			continue
 		}
 		switch m in msg {
-		case Out_Text:
-			if conn_write_text(&cs.conn, transmute([]u8)m.json) != .None {
-				dead = true
-			}
-			delete(m.json)
 		case Out_Batch:
 			dead = send_all(cs.conn.sock, m.wire[m.sent:]) != .None
 			delete(m.wire)
@@ -236,11 +235,11 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 
 	// NIP-42: send the AUTH challenge immediately on connect.
 	{
-		buf := make([dynamic]u8, 0, 64)
+		buf := make([dynamic]u8, REPLY_HEADER_LEN, 96)
 		append(&buf, "[\"AUTH\",\"")
 		append(&buf, cs.auth.challenge)
 		append(&buf, "\"]")
-		send_text(cs, take_string(&buf))
+		send_reply(cs, &buf)
 	}
 
 	// Read loop.
@@ -667,13 +666,13 @@ handle_count :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 		return
 	}
 	total := store.count_filters(cs.relay.store, filters, access.principal.auth_pks, access)
-	buf := make([dynamic]u8, 0, 96)
+	buf := make([dynamic]u8, REPLY_HEADER_LEN, 96)
 	append(&buf, "[\"COUNT\",")
 	pack.write_json_str(sub_id, &buf)
 	append(&buf, ",{\"count\":")
 	append_u64(&buf, total)
 	append(&buf, "}]")
-	send_text(cs, take_string(&buf))
+	send_reply(cs, &buf)
 }
 
 @(private)
