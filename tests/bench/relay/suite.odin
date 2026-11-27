@@ -135,8 +135,10 @@ report_result :: proc(
 	errors = max(errors, operations - len(all))
 	slice.sort(all[:])
 	rate := f64(len(all)) / max(time.duration_seconds(wall), 0.000000001)
+	// The last field names the latency unit, so the runner rejects rows from
+	// a driver that still reports microseconds.
 	fmt.printfln(
-		"RESULT\t%s\t%d\t%.3f\t%.3f\t%d\t%d\t%d\t%d",
+		"RESULT\t%s\t%d\t%.3f\t%.3f\t%d\t%d\t%d\t%d\tcycles",
 		name,
 		operations,
 		time.duration_milliseconds(wall),
@@ -201,12 +203,12 @@ expect_event :: proc(q: ^Query_Case, ev: ^Raw_Event) {
 // so limited queries have an unambiguous newest-first membership set.
 suite_query :: proc(d: ^Suite_Dataset, name: string, sample: ^Raw_Event) -> Query_Case {
 	q := Query_Case {
-		name     = name,
-		validate = true,
+		name         = name,
+		validate     = true,
 		// Multiple filters have per-filter limits, not a global response order.
 		newest_first = name != "multi_filter",
-		by_id    = make(map[string]int),
-		expected = make([dynamic]^Raw_Event, 0, 500),
+		by_id        = make(map[string]int),
+		expected     = make([dynamic]^Raw_Event, 0, 500),
 	}
 	limit := 100
 	filter: string

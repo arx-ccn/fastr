@@ -44,7 +44,7 @@ RAW="$ARTIFACTS/results.tsv"
 STATUS="$ARTIFACTS/status.tsv"
 RESOURCES="$ARTIFACTS/resources.tsv"
 TIMESTAMP="$(($(date +%s) - 60))"
-printf 'relay\trepeat\tworkload\toperations\twall_ms\tthroughput\tp50_cycles\tp99_cycles\terrors\treturned_events\n' >"$RAW"
+printf 'relay\trepeat\tworkload\toperations\twall_ms\tthroughput\tp50_cycles\tp99_cycles\terrors\treturned_events\tlatency_unit\n' >"$RAW"
 printf 'relay\trepeat\tstatus\texit_code\n' >"$STATUS"
 printf 'relay\trepeat\trss_after_kib\tdb_allocated_after_bytes\tprocess_write_bytes_delta\n' >"$RESOURCES"
 fastr-bench suite --list-workloads >"$MANIFEST" 2>"$ARTIFACTS/manifest.log"
@@ -109,7 +109,8 @@ valid_rows() {
     function error(message) { print message; bad=1 }
     FILENAME == ARGV[1] { expected[$2]=1; next }
     {
-      if (NF != 9) { error("Malformed RESULT row at line " FNR); next }
+      if (NF != 10) { error("Malformed RESULT row at line " FNR "; rebuild fastr-bench if it predates cycle latencies"); next }
+      if ($10 != "cycles") { error("Latency unit is not cycles at line " FNR); next }
       if (!($2 in expected) || seen[$2]++) error("Unexpected or duplicate workload: " $2)
       for (i=3; i<=9; i++)
         if ($i !~ /^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$/) error("Non-numeric metric: " $2)

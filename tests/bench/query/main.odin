@@ -1,6 +1,6 @@
 // Dev tool: store-level query-scan microbenchmark. Builds a fresh store with
 // N synthetic events (no signatures - the store never verifies them), then
-// times query_authed for a set of representative filters. Prints ns/query and
+// times query_authed for a set of representative filters. Prints cycles/query and
 // a result checksum so two builds can be verified to return identical sets.
 // Usage: qbench <data-dir> [events] [iters]
 package main
