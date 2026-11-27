@@ -15,6 +15,7 @@ when tls.ENABLED {
 		slot: tls.Cert_Slot,
 		cert: string,
 		key:  string,
+		wake: linux.Fd,
 	}
 
 	// Set before sigaction; never changed while the handler is installed.
@@ -32,11 +33,11 @@ when tls.ENABLED {
 		}
 	}
 
-	@(private = "file")
-	install_hup :: proc() -> bool {
+	@(private)
+	install_hup :: proc() -> (linux.Fd, bool) {
 		fd, err := linux.eventfd(0, {.NONBLOCK, .CLOEXEC})
 		if err != .NONE {
-			return false
+			return -1, false
 		}
 		hup_fd = fd
 		action := posix.sigaction_t {
@@ -45,16 +46,16 @@ when tls.ENABLED {
 		}
 		if posix.sigaction(.SIGHUP, &action, nil) != .OK {
 			linux.close(fd)
-			return false
+			return -1, false
 		}
-		return true
+		return fd, true
 	}
 
-	@(private = "file")
-	read_hup :: proc() -> linux.Errno {
+	@(private)
+	read_hup :: proc(fd: linux.Fd) -> linux.Errno {
 		counter: u64
 		for {
-			_, err := linux.read(hup_fd, ((^[8]u8)(&counter))[:])
+			_, err := linux.read(fd, ((^[8]u8)(&counter))[:])
 			if err != .EINTR {
 				return err
 			}
@@ -63,13 +64,13 @@ when tls.ENABLED {
 
 	@(private = "file")
 	manual_reload :: proc(state: ^Manual_TLS) {
-		fds := [1]linux.Poll_Fd{{fd = hup_fd, events = {.IN}}}
+		fds := [1]linux.Poll_Fd{{fd = state.wake, events = {.IN}}}
 		for {
 			if tls.poll_until(fds[:]) != .None || tls.poll_failed(fds[0]) {
 				fmt.eprintln("fastr: TLS reload watcher stopped: poll failed")
 				return
 			}
-			if read_hup() != .NONE {
+			if read_hup(state.wake) != .NONE {
 				fmt.eprintln("fastr: TLS reload watcher stopped: read failed")
 				return
 			}
@@ -91,7 +92,8 @@ when tls.ENABLED {
 			fmt.eprintfln("fastr: TLS certificate setup failed: %v", err)
 			os.exit(1)
 		}
-		if !install_hup() {
+		wake, installed := install_hup()
+		if !installed {
 			fmt.eprintln("fastr: cannot install TLS reload signal handler")
 			os.exit(1)
 		}
@@ -100,6 +102,7 @@ when tls.ENABLED {
 			slot = {app = ctx},
 			cert = cert,
 			key = key,
+			wake = wake,
 		}
 		if thread.create_and_start_with_poly_data(state, manual_reload, self_cleanup = true) ==
 		   nil {

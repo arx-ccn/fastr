@@ -3,6 +3,7 @@ trees/
 
 # Odin build artifacts
 /fastr
+/fastr-acme
 /fastr-debug
 fastr-smoke
 # vendored libsecp256k1 (cloned + built by `just vendor`)

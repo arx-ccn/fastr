@@ -3,6 +3,8 @@
 package main
 
 import "core:fmt"
+import "core:mem"
+import "core:net"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -10,6 +12,7 @@ import "core:strings"
 import "../../src/nostr"
 import "../../src/policy"
 import secp "../../src/secp256k1"
+import "../../src/tls"
 import "../../src/ws"
 
 VERSION :: "0.1.0"
@@ -19,11 +22,23 @@ Tls_Files :: struct {
 	cert, key: string,
 }
 
+@(private)
+Acme_Config :: struct {
+	domain, directory: string,
+}
+
+@(private)
+Config_Use :: enum {
+	Serve,
+	Import,
+}
+
 Config :: struct {
 	// Address/port to bind the TCP listener. Default: 0.0.0.0:8080
 	listen_host:                 string,
 	listen_port:                 u16,
 	tls_files:                   Maybe(Tls_Files),
+	acme:                        Maybe(Acme_Config),
 	// Maximum concurrent WebSocket connections. Default: 1024
 	max_connections:             int,
 	// Maximum active subscriptions per connection. Default: 20
@@ -133,7 +148,7 @@ env_u64 :: proc(key: string, default: u64) -> u64 {
 	return n if ok else default
 }
 
-load_config :: proc(allocator := context.allocator) -> Config {
+load_config :: proc(allocator := context.allocator, use := Config_Use.Serve) -> Config {
 	gift_wrap_read: policy.Gift_Wrap_Read
 	raw := os.get_env("FASTR_GIFT_WRAPS_REQUIRE_AUTH", context.temp_allocator)
 	switch raw {
@@ -160,10 +175,15 @@ load_config :: proc(allocator := context.allocator) -> Config {
 	if cert_set || key_set {
 		tls_files = Tls_Files{cert, key}
 	}
+	acme := read_acme_config(use, tls_files, allocator)
 	relay_url, url_found := os.lookup_env("FASTR_URL", allocator)
 	if !url_found {
-		scheme := "wss" if cert != "" && key != "" else "ws"
-		relay_url = fmt.aprintf("%s://%s:%d", scheme, host, port, allocator = allocator)
+		if managed, enabled := acme.?; enabled {
+			relay_url = fmt.aprintf("wss://%s", managed.domain, allocator = allocator)
+		} else {
+			scheme := "wss" if cert != "" && key != "" else "ws"
+			relay_url = fmt.aprintf("%s://%s:%d", scheme, host, port, allocator = allocator)
+		}
 	}
 
 	data_dir, dir_found := os.lookup_env("FASTR_DATA_DIR", allocator)
@@ -282,6 +302,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		listen_host = host,
 		listen_port = u16(port),
 		tls_files = tls_files,
+		acme = acme,
 		max_connections = env_int("FASTR_MAX_CONNECTIONS", 1024),
 		max_subscriptions_per_conn = env_int("FASTR_MAX_SUBSCRIPTIONS", 20),
 		max_filters_per_req = env_int("FASTR_MAX_FILTERS", 32),
@@ -325,6 +346,160 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		sync_peers = parse_sync_peers(allocator),
 		sync_interval = env_u64("FASTR_SYNC_INTERVAL", 3600),
 	}
+}
+
+@(private = "file")
+read_acme_config :: proc(
+	use: Config_Use,
+	files: Maybe(Tls_Files),
+	allocator: mem.Allocator,
+) -> Maybe(Acme_Config) {
+	domain, configured := os.lookup_env("FASTR_ACME_DOMAIN", context.temp_allocator)
+	if use == .Import {
+		if domain == "" {
+			return nil
+		}
+		return Acme_Config{domain = strings.to_lower(domain, allocator)}
+	}
+	tos, tos_set := os.lookup_env("FASTR_ACME_ACCEPT_TOS", context.temp_allocator)
+	directory, directory_set := os.lookup_env("FASTR_ACME_DIRECTORY", context.temp_allocator)
+	if !configured {
+		if tos_set || directory_set {
+			fmt.eprintln("fastr: ACME settings require FASTR_ACME_DOMAIN")
+			os.exit(1)
+		}
+		return nil
+	}
+	when !tls.ENABLED {
+		fmt.eprintln("fastr: inbound TLS is disabled in this build")
+		os.exit(1)
+	}
+	if files != nil {
+		fmt.eprintln("fastr: ACME and manual TLS certificates are mutually exclusive")
+		os.exit(1)
+	}
+	if !valid_acme_domain(domain) {
+		fmt.eprintln("fastr: FASTR_ACME_DOMAIN must be a DNS hostname")
+		os.exit(1)
+	}
+	if tos != "1" {
+		fmt.eprintln("fastr: FASTR_ACME_ACCEPT_TOS=1 is required")
+		os.exit(1)
+	}
+	if !directory_set {
+		directory = "https://acme-v02.api.letsencrypt.org/directory"
+	} else if !valid_acme_directory(directory) {
+		fmt.eprintln(
+			"fastr: FASTR_ACME_DIRECTORY must be an absolute HTTPS URL without userinfo or a fragment",
+		)
+		os.exit(1)
+	}
+	return Acme_Config{strings.to_lower(domain, allocator), strings.clone(directory, allocator)}
+}
+
+@(private)
+valid_acme_domain :: proc(domain: string) -> bool {
+	if len(domain) > 253 ||
+	   strings.index_byte(domain, '.') < 0 ||
+	   domain[len(domain) - 1] == '.' ||
+	   net.parse_address(domain) != nil {
+		return false
+	}
+	remaining := domain
+	for label in strings.split_iterator(&remaining, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label) - 1] == '-' {
+			return false
+		}
+		for b in transmute([]u8)label {
+			if !(b >= 'a' && b <= 'z' ||
+				   b >= 'A' && b <= 'Z' ||
+				   b >= '0' && b <= '9' ||
+				   b == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+@(private = "file")
+url_hex :: proc(b: u8) -> bool {
+	return b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F'
+}
+
+@(private = "file")
+valid_url_host :: proc(host: string) -> bool {
+	if host == "" {
+		return false
+	}
+	// RFC 3986 registered name, with raw UTF-8 for IDNs as in net/url.
+	for b in transmute([]u8)host {
+		if b >= 0x80 || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' {
+			continue
+		}
+		if strings.index_byte("-._~!$&'()*+,;=", b) < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+valid_acme_directory :: proc(url: string) -> bool {
+	if len(url) <= len("https://") || !strings.equal_fold(url[:len("https://")], "https://") {
+		return false
+	}
+	for b, i in transmute([]u8)url {
+		if b <= ' ' || b == 0x7f || b == '#' || b == '\\' {
+			return false
+		}
+		if b == '%' && (i + 2 >= len(url) || !url_hex(url[i + 1]) || !url_hex(url[i + 2])) {
+			return false
+		}
+	}
+	authority := url[len("https://"):]
+	if end := strings.index_any(authority, "/?"); end >= 0 {
+		authority = authority[:end]
+	}
+	if authority == "" || strings.index_byte(authority, '@') >= 0 {
+		return false
+	}
+	port := ""
+	if authority[0] == '[' {
+		end := strings.index_byte(authority, ']')
+		if end < 2 ||
+		   net.parse_address(authority[1:end]) == nil ||
+		   strings.index_byte(authority[1:end], ':') < 0 {
+			return false
+		}
+		port = authority[end + 1:]
+	} else {
+		end := strings.index_byte(authority, ':')
+		host := authority
+		if end >= 0 {
+			host, port = authority[:end], authority[end:]
+		}
+		if !valid_url_host(host) {
+			return false
+		}
+	}
+	if port == "" {
+		return true
+	}
+	if port[0] != ':' || len(port) == 1 {
+		return false
+	}
+	number: u32
+	for b in transmute([]u8)port[1:] {
+		if b < '0' || b > '9' {
+			return false
+		}
+		number = number * 10 + u32(b - '0')
+		if number > u32(max(u16)) {
+			return false
+		}
+	}
+	return number != 0
 }
 
 // Parse FASTR_SYNC_PEERS: comma-separated relay URLs, whitespace-trimmed,

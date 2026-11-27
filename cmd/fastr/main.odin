@@ -39,7 +39,7 @@ main :: proc() {
 	serve()
 }
 
-@(private = "file")
+@(private)
 Conn_Ctx :: struct {
 	relay:   ^ws.Relay,
 	stream:  tls.Server_Stream,
@@ -58,6 +58,13 @@ Conn_Ctx :: struct {
 serve :: proc() {
 	cfg := load_config()
 	slot: ^tls.Cert_Slot
+	when tls.ENABLED {
+		managed: ^Acme_State
+		if acme, configured := cfg.acme.?; configured {
+			managed = prepare_acme(cfg.data_dir, acme)
+			slot = &managed.slot
+		}
+	}
 	if files, configured := cfg.tls_files.?; configured {
 		when !tls.ENABLED {
 			fmt.eprintln("fastr: inbound TLS is disabled in this build")
@@ -182,6 +189,13 @@ serve :: proc() {
 
 	active := new(int)
 	next_conn_id: u64 = 0
+	when tls.ENABLED {
+		if managed != nil &&
+		   thread.create_and_start_with_poly_data(managed, acme_scheduler, self_cleanup = true) ==
+			   nil {
+			acme_start_error("start scheduler", "cannot create thread")
+		}
+	}
 
 	for {
 		client, accepted := accept_client(listener, slot)
@@ -321,7 +335,7 @@ stats_loop :: proc(ctx: ^Stats_Ctx) {
 // Peek at the first bytes of an incoming connection. NIP-11 requests get the
 // relay info document; plain HTTP gets the index page; WebSocket upgrades go
 // to the connection handler even if the client sends the NIP-11 Accept header.
-@(private = "file")
+@(private)
 conn_entry :: proc(ctx: ^Conn_Ctx) {
 	defer {
 		when tls.ENABLED {
@@ -335,10 +349,13 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 
 	when tls.ENABLED {
 		if ctx.slot != nil {
-			ssl := tls.server_ssl_new(ctx.slot)
+			ssl := tls.server_ssl_new(&ctx.stream, ctx.slot)
 			if ssl == nil ||
 			   tls.server_attach(&ctx.stream, ssl) != .None ||
 			   tls.server_handshake(&ctx.stream) != .None {
+				return
+			}
+			if ctx.stream.route == .Challenge {
 				return
 			}
 			ctx.stream.read_start = time.tick_now()
@@ -412,7 +429,7 @@ import_jsonl :: proc(
 	}
 	defer store.store_close(st)
 
-	cfg := load_config()
+	cfg := load_config(use = .Import)
 	relay: ws.Relay
 	plugins: Plugin_State
 	init_relay(&relay, st, &cfg, &plugins)

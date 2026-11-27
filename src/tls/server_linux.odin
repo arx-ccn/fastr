@@ -18,6 +18,9 @@ Server_Stream :: struct {
 	read_start:  time.Tick,
 	read_limit:  time.Duration,
 	close_start: Maybe(time.Tick),
+	slot:        ^Cert_Slot,
+	app_expiry:  i64,
+	route:       Route,
 }
 
 stream_recv :: proc(s: ^Server_Stream, buf: []u8) -> (n: int, err: Error) {
@@ -121,11 +124,11 @@ when ENABLED {
 	}
 
 	server_ctx :: proc(cert, key: string) -> (ctx: ^SSL_CTX, err: Error) {
-		ctx = SSL_CTX_new(TLS_server_method())
+		ctx = server_base_ctx()
 		if ctx == nil {
 			return nil, .Init
 		}
-		err = configure_ctx(ctx, cert, key)
+		err = load_certificate(ctx, cert, key)
 		if err != .None {
 			SSL_CTX_free(ctx)
 			return nil, err
@@ -133,13 +136,23 @@ when ENABLED {
 		return ctx, .None
 	}
 
-	@(private = "file")
-	configure_ctx :: proc(ctx: ^SSL_CTX, cert, key: string) -> Error {
+	@(private)
+	server_base_ctx :: proc() -> ^SSL_CTX {
+		ctx := SSL_CTX_new(TLS_server_method())
+		if ctx == nil {
+			return nil
+		}
 		if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, nil) != 1 {
-			return .Init
+			SSL_CTX_free(ctx)
+			return nil
 		}
 		SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION)
 		SSL_CTX_set_default_passwd_cb(ctx, no_password)
+		return ctx
+	}
+
+	@(private = "file")
+	load_certificate :: proc(ctx: ^SSL_CTX, cert, key: string) -> Error {
 		if SSL_CTX_use_certificate_chain_file(
 			   ctx,
 			   strings.clone_to_cstring(cert, context.temp_allocator),
@@ -168,6 +181,10 @@ when ENABLED {
 
 	server_attach :: proc(s: ^Server_Stream, ssl: ^SSL) -> Error {
 		s.ssl = ssl
+		if s.slot != nil && SSL_set_ex_data(ssl, APP_DATA_INDEX, s) != 1 {
+			s.failed = true
+			return .Init
+		}
 		internal: ^BIO
 		if BIO_new_bio_pair(&internal, RING_SIZE, &s.bio, RING_SIZE) != 1 {
 			s.failed = true
@@ -183,6 +200,10 @@ when ENABLED {
 			ERR_clear_error()
 			r := SSL_accept(s.ssl)
 			if r == 1 {
+				if s.route == .Challenge && !challenge_selected(s.ssl) {
+					s.failed = true
+					return .Handshake
+				}
 				return wait_step(s, .Progress, &budget)
 			}
 			step := ssl_step(s, r)
