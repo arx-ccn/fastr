@@ -90,7 +90,7 @@ when ENABLED {
 
 	@(private = "file")
 	no_password :: proc "c" (buf: [^]u8, size, rwflag: cc.int, user: rawptr) -> cc.int {
-		return 0
+		return -1
 	}
 
 	@(private = "file")

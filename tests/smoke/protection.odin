@@ -16,7 +16,13 @@ Visibility :: enum {
 }
 
 @(private)
-smoke_signed :: proc(kind: u16, content: string, tags: []pack.Tag, signer: u8 = 19) -> pack.Event {
+smoke_signed :: proc(
+	kind: u16,
+	content: string,
+	tags: []pack.Tag,
+	signer: u8 = 19,
+	created_at: i64 = 0,
+) -> pack.Event {
 	sk: [32]u8
 	sk[31] = signer
 	pk, ok := secp.test_pubkey(&sk)
@@ -26,7 +32,7 @@ smoke_signed :: proc(kind: u16, content: string, tags: []pack.Tag, signer: u8 = 
 	ev := pack.Event {
 		pubkey     = pk,
 		kind       = kind,
-		created_at = nostr.unix_now(),
+		created_at = created_at if created_at != 0 else nostr.unix_now(),
 		content    = content,
 		tags       = tags,
 	}
@@ -45,7 +51,7 @@ smoke_publish :: proc(
 	prefix: string = "",
 	message: string = "EVENT",
 ) {
-	if err := wsclient.send_frame(conn.sock, client_event_json(ev, message)); err != .None {
+	if err := wsclient.send_frame(conn, client_event_json(ev, message)); err != .None {
 		fail("send %s: %v", message, err)
 	}
 	raw, err := wsclient.recv_text(conn)
@@ -77,10 +83,8 @@ smoke_hex :: proc(id: [32]u8) -> string {
 @(private)
 smoke_visibility :: proc(conn: ^wsclient.Conn, ev: ^pack.Event, expected: Visibility) {
 	id := smoke_hex(ev.id)
-	if err := wsclient.send_frame(
-		conn.sock,
-		fmt.tprintf(`["REQ","protected",{{"ids":["%s"]}}]`, id),
-	); err != .None {
+	if err := wsclient.send_frame(conn, fmt.tprintf(`["REQ","protected",{{"ids":["%s"]}}]`, id));
+	   err != .None {
 		fail("protection query: %v", err)
 	}
 	seen := 0
@@ -109,11 +113,11 @@ smoke_visibility :: proc(conn: ^wsclient.Conn, ev: ^pack.Event, expected: Visibi
 	if seen != want {
 		fail("protection %s expected %d events, got %d", ev.content, want, seen)
 	}
-	if err := wsclient.send_frame(conn.sock, `["CLOSE","protected"]`); err != .None {
+	if err := wsclient.send_frame(conn, `["CLOSE","protected"]`); err != .None {
 		fail("protection close: %v", err)
 	}
 	if err := wsclient.send_frame(
-		conn.sock,
+		conn,
 		fmt.tprintf(`["COUNT","protected-count",{{"ids":["%s"]}}]`, id),
 	); err != .None {
 		fail("protection count: %v", err)

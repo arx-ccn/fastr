@@ -213,7 +213,7 @@ ingest_worker :: proc(w: ^Worker) {
 	defer wsclient.conn_close(&conn)
 	for ev, i in w.events {
 		t0 := time.read_cycle_counter()
-		if err := wsclient.send_frame(conn.sock, ev.msg); err != .None {
+		if err := wsclient.send_frame(&conn, ev.msg); err != .None {
 			worker_error(w, "websocket send failed")
 			w.errors += len(w.events) - i - 1
 			return
@@ -303,7 +303,7 @@ query_worker :: proc(w: ^Worker) {
 		valid := true
 		complete := false
 		t0 := time.read_cycle_counter()
-		if wsclient.send_frame(conn.sock, request) != .None {
+		if wsclient.send_frame(&conn, request) != .None {
 			worker_error(w, "websocket send failed")
 			w.errors += w.queries - i - 1
 			return
@@ -410,7 +410,7 @@ query_worker :: proc(w: ^Worker) {
 			w.errors += w.queries - i - 1
 			return
 		}
-		if wsclient.send_frame(conn.sock, string(close[:])) != .None {
+		if wsclient.send_frame(&conn, string(close[:])) != .None {
 			worker_error(w, "websocket CLOSE send failed")
 			w.errors += w.queries - i - 1
 			return
@@ -559,7 +559,7 @@ cmd_neg_sync :: proc(url: string, filter_json: string, have_count: int) {
 
 	start := time.tick_now()
 	if err := wsclient.send_frame(
-		conn.sock,
+		&conn,
 		fmt.tprintf(
 			`["NEG-OPEN","neg-bench",%s,"%s"]`,
 			filter_json,
@@ -591,7 +591,7 @@ cmd_neg_sync :: proc(url: string, filter_json: string, have_count: int) {
 			break outer
 		}
 		if err := wsclient.send_frame(
-			conn.sock,
+			&conn,
 			fmt.tprintf(`["NEG-MSG","neg-bench","%s"]`, hex_str(next, context.temp_allocator)),
 		); err != .None {
 			fail("websocket send: %v", err)
@@ -600,7 +600,7 @@ cmd_neg_sync :: proc(url: string, filter_json: string, have_count: int) {
 	}
 	wall := time.tick_since(start)
 
-	if err := wsclient.send_frame(conn.sock, `["NEG-CLOSE","neg-bench"]`); err != .None {
+	if err := wsclient.send_frame(&conn, `["NEG-CLOSE","neg-bench"]`); err != .None {
 		fail("websocket send: %v", err)
 	}
 
@@ -660,8 +660,10 @@ main :: proc() {
 		}
 	}
 	url, url_ok := arg_value(args, "--url")
-	if !url_ok || !strings.has_prefix(url, "ws://") || len(url) <= len("ws://") {
-		fail("--url must be a ws:// URL")
+	plain := strings.has_prefix(url, "ws://") && len(url) > len("ws://")
+	secure := strings.has_prefix(url, "wss://") && len(url) > len("wss://")
+	if !url_ok || (!plain && !secure) {
+		fail("--url must be a ws:// or wss:// URL")
 	}
 
 	switch cmd {

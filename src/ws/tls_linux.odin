@@ -149,7 +149,7 @@ when tls.ENABLED {
 				write_budget.start = time.tick_now()
 				budget = write_budget
 			}
-			filled := tls.server_fill(s)
+			filled := rstep != .Closed && tls.server_fill(s)
 			if s.failed {
 				return
 			}
@@ -194,7 +194,13 @@ when tls.ENABLED {
 					}
 					dst = nil
 					progress = true
-				case .Closed, .Failed:
+				case .Closed:
+					if !draining {
+						return
+					}
+				// The peer ended its TLS writes after requesting a WS close.
+				// Finish the already-started drain without reading again.
+				case .Failed:
 					return
 				case .Want_Read, .Want_Write:
 				}
@@ -226,7 +232,15 @@ when tls.ENABLED {
 				continue
 			}
 
-			fds := [2]linux.Poll_Fd{tls.server_pollfd(s), {fd = -1}}
+			fds := [2]linux.Poll_Fd {
+				tls.server_pollfd(s, {} if rstep == .Closed else {.IN}),
+				{fd = -1},
+			}
+			if .OUT in fds[0].events && budget.limit == 0 {
+				// SSL_read can queue protocol bytes even without delivering a frame.
+				write_budget = {time.tick_now(), tls.SERVER_IO_LIMIT}
+				budget = write_budget
+			}
 			if !draining && out.msg == nil {
 				fds[1] = {
 					fd     = wake,

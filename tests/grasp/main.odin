@@ -6,6 +6,7 @@
 // Usage: graspsmoke [path-to-fastr-binary]   (default ./fastr)
 package main
 
+import "core:crypto"
 import "core:encoding/json"
 import "core:fmt"
 import "core:net"
@@ -16,8 +17,8 @@ import "core:time"
 
 import "../../src/nostr"
 import "../../src/pack"
-import "../wsclient"
 import secp "../../src/secp256k1"
+import "../wsclient"
 
 PORT :: 8971
 
@@ -133,7 +134,7 @@ tag :: proc(fields: ..string) -> pack.Tag {
 // Publish and return (accepted, reason).
 @(private)
 publish :: proc(conn: ^wsclient.Conn, msg: string) -> (bool, string) {
-	if err := wsclient.send_frame(conn.sock, msg); err != .None {
+	if err := wsclient.send_frame(conn, msg); err != .None {
 		fail("websocket send: %v", err)
 	}
 	reply, recv_err := wsclient.recv_text(conn)
@@ -166,7 +167,11 @@ http_get :: proc(path: string) -> string {
 		fail("http_get dial: %v", derr)
 	}
 	defer net.close(sock)
-	req := fmt.tprintf("GET %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n", path, PORT)
+	req := fmt.tprintf(
+		"GET %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n",
+		path,
+		PORT,
+	)
 	if _, err := net.send_tcp(sock, transmute([]u8)req); err != nil {
 		fail("http_get send: %v", err)
 	}
@@ -213,6 +218,40 @@ run_ok :: proc(dir: string, args: ..string) -> string {
 }
 
 @(private)
+push_chunked :: proc(dir, repo_url: string) {
+	state, _, stderr, err := os.process_exec(
+		{
+			working_dir = dir,
+			command = {
+				"env",
+				"GIT_TRACE_CURL=1",
+				"GIT_TRACE_CURL_NO_DATA=1",
+				"git",
+				"-c",
+				"http.version=HTTP/1.1",
+				"-c",
+				"http.postBuffer=65536",
+				"-c",
+				"http.extraHeader=Expect: 100-continue",
+				"push",
+				repo_url,
+				"master",
+			},
+		},
+		context.temp_allocator,
+	)
+	trace := strings.to_lower(string(stderr), context.temp_allocator)
+	if err != nil || state.exit_code != 0 {
+		fail("large push failed: %v\n%s", err, string(stderr))
+	}
+	if !strings.contains(trace, "=> send header: transfer-encoding: chunked") ||
+	   !strings.contains(trace, "<= recv header: http/1.1 100 continue") {
+		fail("large push did not exercise chunked upload and 100 Continue")
+	}
+	fmt.println("chunked upload and 100 Continue: OK")
+}
+
+@(private)
 step :: proc(name: string) {
 	fmt.printfln("--- %s", name)
 }
@@ -239,9 +278,20 @@ main :: proc() {
 	repos := fmt.tprintf("%s/repos", work)
 	data := fmt.tprintf("%s/data", work)
 	service_url := fmt.tprintf("http://127.0.0.1:%d", PORT)
+	relay_url := fmt.tprintf("ws://127.0.0.1:%d", PORT)
+	cert, cert_set := os.lookup_env("FASTR_TLS_CERT_FILE", context.temp_allocator)
+	key, key_set := os.lookup_env("FASTR_TLS_KEY_FILE", context.temp_allocator)
+	secure := cert_set || key_set
+	if secure {
+		if cert == "" || key == "" {
+			fail("TLS smoke needs both FASTR_TLS_CERT_FILE and FASTR_TLS_KEY_FILE")
+		}
+		service_url = fmt.tprintf("https://localhost:%d", PORT)
+		relay_url = fmt.tprintf("wss://localhost:%d", PORT)
+	}
 
 	// Spawn fastr with GRASP enabled.
-	env := make([dynamic]string, 0, 8, context.temp_allocator)
+	env := make([dynamic]string, 0, 11, context.temp_allocator)
 	append(&env, fmt.tprintf("FASTR_PORT=%d", PORT))
 	append(&env, fmt.tprintf("FASTR_DATA_DIR=%s", data))
 	append(&env, "FASTR_GRASP_ENABLED=1")
@@ -249,6 +299,12 @@ main :: proc() {
 	append(&env, fmt.tprintf("FASTR_GRASP_URL=%s", service_url))
 	append(&env, fmt.tprintf("PATH=%s", os.get_env("PATH", context.temp_allocator)))
 	append(&env, fmt.tprintf("HOME=%s", os.get_env("HOME", context.temp_allocator)))
+	if secure {
+		append(&env, "FASTR_ADDR=127.0.0.1")
+		append(&env, fmt.tprintf("FASTR_URL=%s", relay_url))
+		append(&env, fmt.tprintf("FASTR_TLS_CERT_FILE=%s", cert))
+		append(&env, fmt.tprintf("FASTR_TLS_KEY_FILE=%s", key))
+	}
 	// A leftover instance from an earlier run would silently absorb our
 	// traffic with the wrong config — refuse to start over one.
 	if probe, probe_err := net.dial_tcp_from_hostname_and_port_string(
@@ -269,12 +325,12 @@ main :: proc() {
 	}
 	time.sleep(500 * time.Millisecond)
 
-	conn, connect_err := wsclient.ws_connect(fmt.tprintf("ws://127.0.0.1:%d", PORT))
+	conn, connect_err := wsclient.ws_connect(relay_url)
 	if connect_err != .None {
 		fail("websocket connect: %v", connect_err)
 	}
 	defer wsclient.conn_close(&conn)
-	if _, err := wsclient.recv_text(&conn); err != .None { // NIP-42 AUTH challenge
+	if _, err := wsclient.recv_text(&conn); err != .None { 	// NIP-42 AUTH challenge
 		fail("websocket receive: %v", err)
 	}
 
@@ -299,7 +355,7 @@ main :: proc() {
 				tag("d", "smokerepo"),
 				tag("name", "Smoke Repo"),
 				tag("clone", repo_url),
-				tag("relays", fmt.tprintf("ws://127.0.0.1:%d", PORT)),
+				tag("relays", relay_url),
 			},
 			"",
 		),
@@ -320,7 +376,11 @@ main :: proc() {
 	run_ok(src, "git", "init", "-q", "-b", "master", ".")
 	run_ok(src, "git", "config", "user.email", "s@s")
 	run_ok(src, "git", "config", "user.name", "smoke")
-	if os.write_entire_file(fmt.tprintf("%s/readme.md", src), transmute([]u8)string("grasp smoke\n")) != nil {
+	if os.write_entire_file(
+		   fmt.tprintf("%s/readme.md", src),
+		   transmute([]u8)string("grasp smoke\n"),
+	   ) !=
+	   nil {
 		fail("write readme")
 	}
 	run_ok(src, "git", "add", ".")
@@ -356,8 +416,16 @@ main :: proc() {
 	}
 
 	step("push of a tip not in the repo state is rejected")
-	if os.write_entire_file(fmt.tprintf("%s/more.md", src), transmute([]u8)string("more\n")) != nil {
+	if os.write_entire_file(fmt.tprintf("%s/more.md", src), transmute([]u8)string("more\n")) !=
+	   nil {
 		fail("write more")
+	}
+	if secure {
+		blob: [192 * 1024]u8
+		crypto.rand_bytes(blob[:])
+		if os.write_entire_file(fmt.tprintf("%s/blob", src), blob[:]) != nil {
+			fail("write large blob")
+		}
 	}
 	run_ok(src, "git", "add", ".")
 	run_ok(src, "git", "commit", "-qm", "second")
@@ -383,14 +451,37 @@ main :: proc() {
 	if !accepted {
 		fail("updated 30618 rejected")
 	}
-	run_ok(src, "git", "push", "-q", repo_url, "master")
+	if secure {
+		push_chunked(src, repo_url)
+	} else {
+		run_ok(src, "git", "push", "-q", repo_url, "master")
+	}
 
 	step("refs/nostr/<event-id> push is open")
 	fake_id := strings.repeat("ab", 32, context.temp_allocator)
 	run_ok(src, "git", "push", "-q", repo_url, fmt.tprintf("HEAD:refs/nostr/%s", fake_id))
 
 	step("landing page lists branches, commits, and authors")
-	page := http_get(fmt.tprintf("/%s/smokerepo.git", signer.npub))
+	page: string
+	if secure {
+		page = run_ok(
+			work,
+			"curl",
+			"--disable",
+			"--noproxy",
+			"*",
+			"--fail",
+			"--silent",
+			"--show-error",
+			"--max-time",
+			"10",
+			"--cacert",
+			os.get_env("SSL_CERT_FILE", context.temp_allocator),
+			repo_url,
+		)
+	} else {
+		page = http_get(fmt.tprintf("/%s/smokerepo.git", signer.npub))
+	}
 	for needle in ([?]string{"master", "branch", "second", "smoke", "(HEAD)"}) {
 		if !strings.contains(page, needle) {
 			fail("landing page missing %q", needle)
@@ -423,7 +514,9 @@ main :: proc() {
 		fail("clone still shallow after --unshallow")
 	}
 	run_ok(shallow, "git", "fsck")
-	check_profiles(work, abs_fastr, src, &signer, tip2, &conn)
+	if !secure {
+		check_profiles(work, abs_fastr, src, &signer, tip2, &conn)
+	}
 
 	fmt.println("GRASP SMOKE PASS")
 }

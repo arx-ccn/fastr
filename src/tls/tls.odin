@@ -3,6 +3,7 @@
 package tls
 
 import cc "core:c"
+import "core:strings"
 
 ENABLED :: #config(FASTR_TLS, true)
 
@@ -38,6 +39,7 @@ when ENABLED {
 		SSL_CTX_new :: proc(method: ^SSL_METHOD) -> ^SSL_CTX ---
 		SSL_CTX_free :: proc(ctx: ^SSL_CTX) ---
 		SSL_CTX_set_default_verify_paths :: proc(ctx: ^SSL_CTX) -> cc.int ---
+		SSL_CTX_set_verify :: proc(ctx: ^SSL_CTX, mode: cc.int, cb: rawptr) ---
 		SSL_new :: proc(ctx: ^SSL_CTX) -> ^SSL ---
 		SSL_free :: proc(ssl: ^SSL) ---
 		SSL_set_fd :: proc(ssl: ^SSL, fd: cc.int) -> cc.int ---
@@ -69,6 +71,9 @@ when ENABLED {
 	// server name and the expected certificate hostname (verification
 	// against the system trust store is always on).
 	connect :: proc(fd: int, hostname: string) -> (c: Conn, err: Error) {
+		if hostname == "" || strings.index_byte(hostname, 0) >= 0 {
+			return {}, .Init
+		}
 		c.ctx = SSL_CTX_new(TLS_client_method())
 		if c.ctx == nil {
 			return {}, .Init
@@ -77,6 +82,8 @@ when ENABLED {
 			SSL_CTX_free(c.ctx)
 			return {}, .Init
 		}
+		SSL_VERIFY_PEER :: 1
+		SSL_CTX_set_verify(c.ctx, SSL_VERIFY_PEER, nil)
 		c.ssl = SSL_new(c.ctx)
 		if c.ssl == nil {
 			SSL_CTX_free(c.ctx)
@@ -90,8 +97,17 @@ when ENABLED {
 		hbuf := make([]u8, len(hostname) + 1, context.temp_allocator)
 		copy(hbuf, hostname)
 		host := cstring(raw_data(hbuf))
-		SSL_ctrl(c.ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, rawptr(host))
-		SSL_set1_host(c.ssl, host)
+		if SSL_ctrl(
+			   c.ssl,
+			   SSL_CTRL_SET_TLSEXT_HOSTNAME,
+			   TLSEXT_NAMETYPE_host_name,
+			   rawptr(host),
+		   ) !=
+			   1 ||
+		   SSL_set1_host(c.ssl, host) != 1 {
+			shutdown(&c)
+			return {}, .Init
+		}
 		if SSL_connect(c.ssl) != 1 {
 			shutdown(&c)
 			return {}, .Handshake

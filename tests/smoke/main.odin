@@ -86,8 +86,33 @@ main :: proc() {
 		}
 	}
 
-	url := fmt.tprintf("ws://127.0.0.1:%d", port)
-	conn, connect_err := wsclient.ws_connect(url, "Accept: application/nostr+json\r\n")
+	url := os.get_env("FASTR_SMOKE_URL", context.temp_allocator)
+	if url == "" {
+		url = fmt.tprintf("ws://127.0.0.1:%d", port)
+	}
+	dial := os.get_env("FASTR_SMOKE_DIAL", context.temp_allocator)
+	when ODIN_OS == .Linux {
+		if len(os.args) > 1 {
+			secp.init()
+			switch os.args[1] {
+			case "tls-reload":
+				if len(os.args) != 4 {
+					fail("usage: fastr-smoke tls-reload <workdir> <wait-seconds>")
+				}
+				seconds, ok := strconv.parse_int(os.args[3])
+				if !ok || seconds < 1 || seconds > 300 {
+					fail("rotate wait must be 1–300 seconds")
+				}
+				tls_reload(url, dial, os.args[2], time.Duration(seconds) * time.Second)
+			case "tls-backpressure":
+				tls_backpressure(url, dial)
+			case:
+				fail("unknown mode %s", os.args[1])
+			}
+			return
+		}
+	}
+	conn, connect_err := wsclient.ws_connect(url, "Accept: application/nostr+json\r\n", dial)
 	if connect_err != .None {
 		fail("websocket connect with NIP-11 Accept: %v", connect_err)
 	}
@@ -132,7 +157,7 @@ main :: proc() {
 	}
 	ev.sig = sig
 
-	if err := wsclient.send_frame(conn.sock, client_event_json(&ev)); err != .None {
+	if err := wsclient.send_frame(&conn, client_event_json(&ev)); err != .None {
 		fail("websocket send: %v", err)
 	}
 	ok_msg, ok_err := wsclient.recv_text(&conn)
@@ -148,7 +173,7 @@ main :: proc() {
 	fmt.println("EVENT -> OK true")
 
 	// REQ it back.
-	if err := wsclient.send_frame(conn.sock, `["REQ","smoke",{"kinds":[1]}]`); err != .None {
+	if err := wsclient.send_frame(&conn, `["REQ","smoke",{"kinds":[1]}]`); err != .None {
 		fail("websocket send: %v", err)
 	}
 	got_event := false
@@ -179,7 +204,7 @@ main :: proc() {
 	fmt.println("REQ -> EVENT + EOSE")
 
 	// COUNT.
-	if err := wsclient.send_frame(conn.sock, `["COUNT","c1",{"kinds":[1]}]`); err != .None {
+	if err := wsclient.send_frame(&conn, `["COUNT","c1",{"kinds":[1]}]`); err != .None {
 		fail("websocket send: %v", err)
 	}
 	count_msg, count_err := wsclient.recv_text(&conn)
@@ -198,7 +223,7 @@ main :: proc() {
 	}
 	fmt.printfln("COUNT -> %d", count)
 
-	if err := wsclient.send_frame(conn.sock, `["CLOSE","smoke"]`); err != .None {
+	if err := wsclient.send_frame(&conn, `["CLOSE","smoke"]`); err != .None {
 		fail("websocket close subscription: %v", err)
 	}
 	smoke_deletion_protection(&conn)
@@ -236,7 +261,7 @@ whitelist_denied :: proc(conn: ^wsclient.Conn, ev: ^pack.Event, prefix: string) 
 		{`["NEG-OPEN","private",{},"61"]`, "NEG-ERR"},
 	}
 	for test in tests {
-		if err := wsclient.send_frame(conn.sock, test.request); err != .None {
+		if err := wsclient.send_frame(conn, test.request); err != .None {
 			fail("whitelist request: %v", err)
 		}
 		raw, err := wsclient.recv_text(conn)

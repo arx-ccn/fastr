@@ -75,7 +75,7 @@ event_id :: proc(raw: string) -> string {
 
 @(private)
 has_event :: proc(conn: ^wsclient.Conn, id: string) -> bool {
-	_ = wsclient.send_frame(conn.sock, fmt.tprintf(`["REQ","probe",{{"ids":["%s"]}}]`, id))
+	_ = wsclient.send_frame(conn, fmt.tprintf(`["REQ","probe",{{"ids":["%s"]}}]`, id))
 	found := false
 	for {
 		raw, err := wsclient.recv_text(conn)
@@ -86,7 +86,7 @@ has_event :: proc(conn: ^wsclient.Conn, id: string) -> bool {
 		if verb == "EVENT" {found = true}
 		if verb == "EOSE" {break}
 	}
-	_ = wsclient.send_frame(conn.sock, `["CLOSE","probe"]`)
+	_ = wsclient.send_frame(conn, `["CLOSE","probe"]`)
 	return found
 }
 
@@ -174,7 +174,7 @@ check_profiles :: proc(work, binary, src: string, signer: ^Signer, tip: string, 
 			}
 		}
 	}
-	_ = wsclient.send_frame(conn.sock, `["REQ","private",{}]`)
+	_ = wsclient.send_frame(&conn, `["REQ","private",{}]`)
 	closed, _ := wsclient.recv_text(&conn)
 	if !strings.contains(closed, "auth-required:") {fail("unauthenticated REQ was not denied")}
 	accepted, reason = publish(&conn, event_json(signer, 1, nil, "private"))
