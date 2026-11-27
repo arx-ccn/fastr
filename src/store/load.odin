@@ -132,8 +132,10 @@ load_tombstones :: proc(
 	total := index_entry_count(index_buf)
 
 	// Build id -> (kind, pubkey, offset) lookup for O(1) e-tag target
-	// resolution.
-	id_map := make(map[[32]u8]Deletion_Target, context.temp_allocator)
+	// resolution. It holds every stored event, so it is sized once, on the
+	// heap, and freed on return: an arena would keep it, and every table it
+	// outgrew, for as long as the calling thread lives.
+	id_map := make(map[[32]u8]Deletion_Target, total)
 	defer delete(id_map)
 	for i in 0 ..< total {
 		e := index_entry_at(index_buf, i)
