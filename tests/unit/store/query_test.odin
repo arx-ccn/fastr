@@ -316,8 +316,8 @@ test_wrap_candidate_visibility :: proc(t: ^testing.T) {
 	testing.expect_value(t, query_authed(s, &by_id, keys[:], &exact, collect_cb), Error.None)
 	// The untagged event follows a visible one: its tag end alone is not proof.
 	testing.expect(t, slice.equal(exact.ids[:], [][32]u8{visible.id}))
-	mailbox := s.mailbox
-	defer s.mailbox = mailbox
+	postings := s.postings
+	defer s.postings = postings
 	for phase in 0 ..< 5 {
 		switch phase {
 		case 1:
@@ -331,9 +331,9 @@ test_wrap_candidate_visibility :: proc(t: ^testing.T) {
 			testing.expect_value(t, len(c.ids), 0)
 			f.ids = nil
 		case 3:
-			s.mailbox.tag_bytes -= TAG_ENTRY_SIZE
+			s.postings.tag_bytes -= TAG_ENTRY_SIZE
 		case 4:
-			s.mailbox = {}
+			s.postings = {}
 		case:
 		}
 		c := collect_ctx_init()

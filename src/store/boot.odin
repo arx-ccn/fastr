@@ -36,16 +36,16 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 		clear(&s.known_ids)
 		clear(&s.scan_ceiling)
 		reserve(&s.scan_ceiling, total)
-		mailbox_destroy(&s.mailbox)
+		postings_destroy(&s.postings)
 		tags := tags_g.data
-		s.mailbox = {
+		s.postings = {
 			entries = -1,
 		}
 		if u64(total) <= u64(max(u32)) &&
 		   len(tags) % TAG_ENTRY_SIZE == 0 &&
 		   u64(len(tags) / TAG_ENTRY_SIZE) <= u64(max(u32)) {
-			s.mailbox = {
-				by_recipient = make(map[[32]u8]Mailbox),
+			s.postings = {
+				by_recipient = make(map[[32]u8]Posting_List),
 				entries      = total,
 				tag_bytes    = len(tags),
 			}
@@ -56,7 +56,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 			e := index_entry_at(idx, i)
 			ceil = max(ceil, e.created_at)
 			append(&s.scan_ceiling, ceil)
-			if s.mailbox.entries >= 0 {
+			if s.postings.entries >= 0 {
 				for tag_pos < len(tags) && endian.unchecked_get_u64le(tags[tag_pos:]) < e.offset {
 					tag_pos += TAG_ENTRY_SIZE
 				}
@@ -66,7 +66,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 				}
 				if e.kind == nostr.KIND_GIFT_WRAP {
 					mailbox_add(
-						&s.mailbox,
+						&s.postings,
 						u32(i),
 						u32(tag_pos / TAG_ENTRY_SIZE),
 						tags[start:tag_pos],
@@ -78,7 +78,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 				tag_end = u32(tag_pos / TAG_ENTRY_SIZE),
 			}
 		}
-		for _, box in s.mailbox.by_recipient {
+		for _, box in s.postings.by_recipient {
 			slice.sort_by_with_data(box.runs[0].slots[:], slot_newer, raw_data(idx))
 		}
 	}

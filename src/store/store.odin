@@ -77,8 +77,8 @@ Store :: struct {
 	// fall back to a full scan on mismatch or out-of-range.
 	known_ids_mu:           sync.RW_Mutex,
 	known_ids:              map[[32]u8]Event_Slot,
-	// known_ids_mu also protects mailbox postings and REQ snapshot publication.
-	mailbox:                Mailbox_Index,
+	// known_ids_mu also protects the postings and REQ snapshot publication.
+	postings:               Postings,
 	query_maps:             ^Query_Maps,
 	// Query early-exit: scan_ceiling[i] is the maximum created_at over index
 	// entries [0..=i] (monotone in i). Scanning newest-slot-first, once the
@@ -415,7 +415,7 @@ store_close :: proc(s: ^Store) {
 	delete(s.kinds_with_expiry)
 	delete(s.authors_with_expiry)
 	delete(s.known_ids)
-	mailbox_destroy(&s.mailbox)
+	postings_destroy(&s.postings)
 	delete(s.scan_ceiling)
 	delete(s.dir)
 	free(s)

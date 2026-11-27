@@ -43,26 +43,26 @@ Event_Slot :: struct {
 }
 
 @(private)
-Mailbox_Run :: struct {
+Posting_Run :: struct {
 	slots: [dynamic]Event_Slot,
 	refs:  int,
 }
 
 @(private)
-Mailbox :: struct {
-	runs: [dynamic]^Mailbox_Run,
+Posting_List :: struct {
+	runs: [dynamic]^Posting_Run,
 	last: u32,
 }
 
 @(private)
-Mailbox_Index :: struct {
-	by_recipient: map[[32]u8]Mailbox,
+Postings :: struct {
+	by_recipient: map[[32]u8]Posting_List,
 	entries:      int, // -1 until rebuilt after a compaction swap, or out of u32 range.
 	tag_bytes:    int,
 }
 
 @(private)
-mailbox_release :: proc(run: ^Mailbox_Run) {
+posting_release :: proc(run: ^Posting_Run) {
 	if sync.atomic_sub(&run.refs, 1) == 1 {
 		allocator := run.slots.allocator
 		delete(run.slots)
@@ -71,9 +71,9 @@ mailbox_release :: proc(run: ^Mailbox_Run) {
 }
 
 @(private)
-mailbox_destroy :: proc(m: ^Mailbox_Index) {
+postings_destroy :: proc(m: ^Postings) {
 	for _, box in m.by_recipient {
-		for run in box.runs do mailbox_release(run)
+		for run in box.runs do posting_release(run)
 		delete(box.runs)
 	}
 	delete(m.by_recipient)
@@ -91,7 +91,7 @@ slot_newer :: proc(a, b: Event_Slot, data: rawptr) -> bool {
 // Boot appends to one run and sorts it once. Live writes combine smaller
 // runs geometrically; a query can retain the old runs across publication.
 @(private)
-mailbox_add :: proc(m: ^Mailbox_Index, slot, tag_end: u32, tags: []u8, idx: rawptr = nil) {
+mailbox_add :: proc(m: ^Postings, slot, tag_end: u32, tags: []u8, idx: rawptr = nil) {
 	for pos := 0; pos < len(tags); pos += TAG_ENTRY_SIZE {
 		tag := tags[pos:pos + TAG_ENTRY_SIZE]
 		if tag[8] != 'p' || tag[41] != 32 {
@@ -101,7 +101,7 @@ mailbox_add :: proc(m: ^Mailbox_Index, slot, tag_end: u32, tags: []u8, idx: rawp
 		box, ok := &m.by_recipient[pk]
 		if !ok {
 			m.by_recipient[pk] = {
-				runs = make([dynamic]^Mailbox_Run, 0, 1),
+				runs = make([dynamic]^Posting_Run, 0, 1),
 			}
 			box, _ = &m.by_recipient[pk]
 		} else if box.last == slot {
@@ -117,7 +117,7 @@ mailbox_add :: proc(m: ^Mailbox_Index, slot, tag_end: u32, tags: []u8, idx: rawp
 			n -= 1
 			count += len(box.runs[n].slots)
 		}
-		run := new(Mailbox_Run)
+		run := new(Posting_Run)
 		run^ = {
 			slots = make([dynamic]Event_Slot, 0, count),
 			refs  = 1,
@@ -125,7 +125,7 @@ mailbox_add :: proc(m: ^Mailbox_Index, slot, tag_end: u32, tags: []u8, idx: rawp
 		append(&run.slots, Event_Slot{slot, tag_end})
 		for old in box.runs[n:] {
 			append(&run.slots, ..old.slots[:])
-			mailbox_release(old)
+			posting_release(old)
 		}
 		resize(&box.runs, n)
 		if count > 1 do slice.sort_by_with_data(run.slots[:], slot_newer, idx)

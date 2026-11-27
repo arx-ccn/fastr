@@ -513,25 +513,25 @@ append_classified :: proc(
 			tag_end = u32(w.tags.offset / TAG_ENTRY_SIZE),
 		}
 		s.known_ids[ev.id] = pos
-		if s.mailbox.entries == int(slot) &&
-		   s.mailbox.tag_bytes == int(before_tags) &&
+		if s.postings.entries == int(slot) &&
+		   s.postings.tag_bytes == int(before_tags) &&
 		   slot < u64(max(u32)) &&
 		   w.tags.offset / TAG_ENTRY_SIZE <= u64(max(u32)) {
 			if ev.kind == nostr.KIND_GIFT_WRAP {
 				// The writer mutex keeps the mapping stable and all record bytes
 				// are written, including the slot not yet visible to readers.
 				mailbox_add(
-					&s.mailbox,
+					&s.postings,
 					pos.slot,
 					pos.tag_end,
 					tag_buf[:],
 					&s.index.current.ptr[HEADER_SIZE],
 				)
 			}
-			s.mailbox.entries += 1
-			s.mailbox.tag_bytes = int(w.tags.offset)
+			s.postings.entries += 1
+			s.postings.tag_bytes = int(w.tags.offset)
 		} else {
-			s.mailbox.entries = -1
+			s.postings.entries = -1
 		}
 		publish_query_maps(s)
 		mapped_file_publish_len(&s.data, w.data.offset)

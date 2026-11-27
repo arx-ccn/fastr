@@ -234,13 +234,13 @@ event_matches_filter :: proc(f: ^nostr.Filter, ev: ^pack.Event) -> bool {
 }
 
 @(private)
-Mailbox_Cursor :: struct {
-	run:  ^Mailbox_Run,
+Posting_Cursor :: struct {
+	run:  ^Posting_Run,
 	next: int,
 }
 
 @(private)
-mailbox_next :: proc(cursors: []Mailbox_Cursor, idx: rawptr) -> Event_Slot {
+mailbox_next :: proc(cursors: []Posting_Cursor, idx: rawptr) -> Event_Slot {
 	best := -1
 	result: Event_Slot
 	for &c, i in cursors {
@@ -313,7 +313,7 @@ query_authed :: proc(
 	idx, data, tags_buf: []u8
 	local_id: [1]Event_Slot
 	cand: []Event_Slot
-	local_run: [1]Mailbox_Cursor
+	local_run: [1]Posting_Cursor
 	run_storage := local_run[:]
 	cursors := run_storage[:0]
 	mailbox_steps := 0
@@ -348,14 +348,14 @@ query_authed :: proc(
 		}
 		data = query_map_slice(maps.data, &s.data)
 		tags_buf = query_map_slice(maps.tags, &s.tags)
-		indexed_tags = total == s.mailbox.entries && len(tags_buf) == s.mailbox.tag_bytes
+		indexed_tags = total == s.postings.entries && len(tags_buf) == s.postings.tag_bytes
 		if !use_ids && inbox && indexed_tags {
 			use_mailbox = true
 			for &pk in auth_pks {
-				for run in s.mailbox.by_recipient[pk].runs {
+				for run in s.postings.by_recipient[pk].runs {
 					n := len(cursors)
 					if n == len(run_storage) {
-						grown := make([]Mailbox_Cursor, n * 2, context.temp_allocator)
+						grown := make([]Posting_Cursor, n * 2, context.temp_allocator)
 						copy(grown, cursors)
 						run_storage = grown
 					}
@@ -371,7 +371,7 @@ query_authed :: proc(
 		sync.atomic_add(&maps.refs, 1)
 	}
 	defer query_maps_release(s, maps)
-	defer for &c in cursors do mailbox_release(c.run)
+	defer for &c in cursors do posting_release(c.run)
 	steps := total
 	use_slots := use_ids || use_mailbox
 	ordered := use_mailbox || use_ids && indexed_tags
