@@ -1,9 +1,9 @@
 // Per-connection lifecycle: writer thread, read loop, message dispatch, and
 // the EVENT/REQ/COUNT/AUTH/NEG-* handlers.
 //
-// Threading model: one reader thread (this proc) + one writer thread per
-// connection. An idle outbox sends replies, replays and live events without
-// waking the writer. Otherwise the writer sends queued frames in order.
+// A plaintext connection starts a writer only when a frame needs queueing.
+// An idle outbox writes directly. The TLS connection thread owns both reads
+// and writes.
 // Whichever thread writes a live event applies the NIP-17/NIP-70 visibility
 // gates, using the auth state reached through the outbox.
 //
@@ -15,6 +15,7 @@
 package ws
 
 import "core:encoding/endian"
+import "core:mem"
 import "core:slice"
 import "core:strings"
 import "core:sync"
@@ -40,6 +41,7 @@ Neg_Session :: struct {
 Conn_State :: struct {
 	relay:            ^Relay,
 	conn:             Conn,
+	scratch:          mem.Dynamic_Arena,
 	outbox:           ^Outbox,
 	auth:             Auth_State,
 	whitelist_member: bool, // Set once by the reader after verified NIP-42 AUTH.
@@ -75,9 +77,22 @@ reply_buffer :: proc(cs: ^Conn_State, header, capacity: int) -> [dynamic]u8 {
 @(private)
 send_reply :: proc(cs: ^Conn_State, buf: ^[dynamic]u8, reserved := REPLY_HEADER_LEN) {
 	finish_text_frame(buf, 0, reserved)
-	if !outbox_send(cs.outbox, Out_Msg(Out_Batch{wire = buf^}), &cs.replay_spare) {
+	send_frame(cs, buf)
+}
+
+@(private)
+send_frame :: proc(cs: ^Conn_State, buf: ^[dynamic]u8) {
+	if !outbox_send(cs.outbox, Out_Batch{wire = buf^}, &cs.replay_spare) {
 		delete(buf^)
 	}
+}
+
+@(private)
+send_close :: proc(cs: ^Conn_State, code: u16) {
+	n := MAX_FRAME_HEADER_LEN + 2
+	buf := reply_buffer(cs, n, n)
+	non_zero_resize(&buf, len(encode_close(buf[:], code, "")))
+	send_frame(cs, &buf)
 }
 
 @(private)
@@ -112,8 +127,7 @@ send_neg_err :: proc(cs: ^Conn_State, sub_id: string, reason: string, max_record
 send_neg_msg :: proc(cs: ^Conn_State, sub_id: string, msg: []u8) {
 	// The hex payload alone fixes the least header length this frame can
 	// have, so a large message is framed without moving it.
-	hdr: [MAX_FRAME_HEADER_LEN]u8 = ---
-	reserved := encode_frame_header(hdr[:], .Text, len(msg) * 2)
+	reserved := frame_header_len(len(msg) * 2)
 	buf := reply_buffer(cs, reserved, reserved + 128 + len(msg) * 2)
 	nostr.write_neg_msg_json(&buf, sub_id, msg)
 	send_reply(cs, &buf, reserved)
@@ -128,9 +142,6 @@ drop_msg :: proc(msg: Out_Msg) {
 	case Out_Live:
 		delete(m.live.sub_id)
 		shared_event_release(m.live.shared)
-	case Out_Pong:
-		delete(m.payload)
-	case Out_Close:
 	}
 }
 
@@ -175,17 +186,26 @@ writer_loop :: proc(cs: ^Conn_State) {
 			free_all(context.temp_allocator)
 			delete(m.live.sub_id)
 			shared_event_release(m.live.shared)
-		case Out_Pong:
-			if conn_write_pong(&cs.conn, m.payload) != .None {
-				dead = true
-			}
-			delete(m.payload)
-		case Out_Close:
-			if conn_write_close(&cs.conn, m.code) != .None {
-				dead = true
-			}
 		}
 	}
+}
+
+// Caller holds send_mu. Publish the channel before the writer can read it.
+@(private)
+outbox_start_writer :: proc(o: ^Outbox) -> bool {
+	ch, err := chan.create(chan.Chan(Out_Msg), OUTBOX_CAPACITY, context.allocator)
+	if err == nil {
+		o.ch = ch
+		o.writer = thread.create_and_start_with_poly_data(o.state, writer_loop)
+		if o.writer != nil {
+			return true
+		}
+		chan.destroy(ch)
+		o.ch = {}
+	}
+	o.failed = true
+	linux.shutdown(linux.Fd(o.state.conn.stream.sock), .RDWR)
+	return false
 }
 
 // Whether a queued live event may still be written: its subscription has
@@ -270,17 +290,24 @@ handle_connection :: proc(
 
 	cs := new(Conn_State)
 	defer free(cs)
+	mem.dynamic_arena_init(&cs.scratch, block_size = 16 * 1024, out_band_size = 16 * 1024)
+	defer mem.dynamic_arena_destroy(&cs.scratch)
+	context.temp_allocator = mem.dynamic_arena_allocator(&cs.scratch)
 	cs.relay = relay
 	conn_init(&cs.conn, stream, relay.cfg.max_message_bytes, preload)
 	defer conn_destroy(&cs.conn)
 
 	cs.outbox = new(Outbox)
-	ch, ch_err := chan.create(chan.Chan(Out_Msg), OUTBOX_CAPACITY, context.allocator)
-	assert(ch_err == nil)
-	cs.outbox.ch = ch
 	cs.outbox.state = cs
 	cs.outbox.wake = wake
 	cs.outbox.conn_id = conn_id
+	when tls.ENABLED {
+		if wake != nil {
+			ch, err := chan.create(chan.Chan(Out_Msg), OUTBOX_CAPACITY, context.allocator)
+			assert(err == nil)
+			cs.outbox.ch = ch
+		}
+	}
 	defer {
 		chan.destroy(cs.outbox.ch)
 		delete(cs.replay_spare)
@@ -288,7 +315,6 @@ handle_connection :: proc(
 	}
 
 	auth_state_init(&cs.auth)
-	cs.neg_subs = make(map[string]^Neg_Session)
 	defer {
 		for sub_id, session in cs.neg_subs {
 			neg_session_destroy(session)
@@ -299,7 +325,6 @@ handle_connection :: proc(
 			neg_session_destroy(cs.neg_spare)
 		}
 		auth_state_destroy(&cs.auth)
-		free_all(context.temp_allocator)
 	}
 
 	when tls.ENABLED {
@@ -314,28 +339,22 @@ handle_connection :: proc(
 
 @(private)
 plain_ws_loop :: proc(cs: ^Conn_State) {
-	writer := thread.create_and_start_with_poly_data(cs, writer_loop)
-	if writer == nil {
-		return
-	}
 	begin_auth(cs)
+	terminal := u16(0)
 	for {
 		incoming, err := conn_next(&cs.conn)
 		if err != .None {
-			if code := close_code_for_error(err); code != 0 {
-				_ = outbox_send(cs.outbox, Out_Msg(Out_Close{code = code}))
-			}
+			terminal = close_code_for_error(err)
 			break
 		}
 		if incoming.event == .Close {
-			_ = outbox_send(cs.outbox, Out_Msg(Out_Close{code = incoming.close_code}))
+			terminal = incoming.close_code
 			break
 		}
 		consume_incoming(cs, incoming)
 	}
-	close_outbox(cs)
-	thread.join(writer)
-	thread.destroy(writer)
+	close_outbox(cs, terminal)
+	outbox_join_writer(cs.outbox)
 }
 
 @(private)
@@ -354,22 +373,40 @@ consume_incoming :: proc(cs: ^Conn_State, incoming: Incoming) {
 		if incoming.msg_type == .Text {
 			dispatch_text(cs, string(incoming.data))
 		}
-		free_all(context.temp_allocator)
-	case .Ping:
-		payload := make([]u8, len(incoming.data))
-		copy(payload, incoming.data)
-		if !outbox_send(cs.outbox, Out_Msg(Out_Pong{payload = payload})) {
-			delete(payload)
+		// Retain at most four blocks after an unusually large request.
+		if len(cs.scratch.used_blocks) >= 4 {
+			mem.dynamic_arena_free_all(&cs.scratch)
+		} else {
+			mem.dynamic_arena_reset(&cs.scratch)
 		}
+	case .Ping:
+		n := MAX_FRAME_HEADER_LEN + len(incoming.data)
+		buf := reply_buffer(cs, n, n)
+		non_zero_resize(&buf, len(encode_frame(buf[:], .Pong, incoming.data)))
+		send_frame(cs, &buf)
 	case .Close, .Pong, .None:
 	}
 }
 
 @(private)
-close_outbox :: proc(cs: ^Conn_State) {
+close_outbox :: proc(cs: ^Conn_State, terminal: u16 = 0) {
 	// The shard lock waits out any broadcaster that can still see the outbox.
-	fanout_unsubscribe_all(&cs.relay.fanout, cs.outbox)
+	if cs.live_count != 0 {
+		fanout_unsubscribe_all(&cs.relay.fanout, cs.outbox)
+		cs.live_count = 0
+	}
+	if terminal != 0 {
+		send_close(cs, terminal)
+	}
 	chan.close(cs.outbox.ch)
+}
+
+@(private)
+outbox_join_writer :: proc(o: ^Outbox) {
+	if writer := o.writer; writer != nil {
+		thread.join(writer)
+		thread.destroy(writer)
+	}
 }
 
 @(private)
@@ -557,16 +594,16 @@ Req_Query_Ctx :: struct {
 // payload outgrowing its reserved header needs to move.
 @(private)
 finish_text_frame :: proc(buf: ^[dynamic]u8, start, reserved: int) {
-	hdr: [MAX_FRAME_HEADER_LEN]u8 = ---
 	payload_start := start + reserved
 	payload_end := len(buf^)
-	n := encode_frame_header(hdr[:], .Text, payload_end - payload_start)
+	length := payload_end - payload_start
+	n := frame_header_len(length)
 	assert(n >= reserved)
 	if n > reserved {
 		non_zero_resize(buf, payload_end + n - reserved)
 		copy(buf^[start + n:], buf^[payload_start:payload_end])
 	}
-	copy(buf^[start:start + n], hdr[:n])
+	put_frame_header(buf^[start:start + n], 0x80 | u8(Opcode.Text), length, n)
 }
 
 @(private)
@@ -740,9 +777,7 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 	non_zero_resize(&qctx.wire, start + 2)
 	nostr.write_eose_json(&qctx.wire, sub_id)
 	finish_text_frame(&qctx.wire, start, 2)
-	if !outbox_send(cs.outbox, Out_Msg(Out_Batch{wire = qctx.wire}), &cs.replay_spare) {
-		delete(qctx.wire)
-	}
+	send_frame(cs, &qctx.wire)
 }
 
 // ---------------------------------------------------------------------------

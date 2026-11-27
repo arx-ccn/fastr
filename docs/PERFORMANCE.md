@@ -168,11 +168,14 @@ of a new ID can publish only one record.
 entries, indexed by the first key byte. Parsing a key costs a field square
 root, about a tenth of a verification.
 
-The reader thread frames OK, NOTICE, CLOSED, COUNT, AUTH, and NEG-* replies
-and writes them with a nonblocking send when the socket has no frame pending.
-Otherwise the writer thread sends them in order. Replies and stored-event
-replays reuse the same buffer after a completed send. WebSocket unmasking
-copies 16 bytes at a time and preserves the mask offset across reads.
+Plaintext connections attempt nonblocking writes when no frame is pending.
+They start a writer thread only when a frame needs queueing. The writer
+resumes partial frames before later frames. Replies and stored-event replays
+reuse the same buffer after a completed send. WebSocket unmasking copies
+16 bytes at a time and preserves the mask offset across reads.
+The WebSocket handshake writes its base64 accept key without allocating.
+WebSocket message scratch is reset after each message and retains at most
+64 KiB of blocks per connection.
 After NEG-CLOSE, each connection can reuse one inventory with space for at
 most 64 items. Reconciliation replies use message scratch until framed.
 

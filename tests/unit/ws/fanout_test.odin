@@ -13,7 +13,6 @@ import "core:sync"
 import "core:sync/chan"
 import "core:sys/linux"
 import "core:testing"
-import "core:thread"
 import "core:time"
 
 import "../nostr"
@@ -517,23 +516,14 @@ test_perf_queries :: proc(t: ^testing.T) {
 
 @(test)
 test_partial_replay_order :: proc(t: ^testing.T) {
-	pair: [2]linux.Fd
-	assert(linux.socketpair(.UNIX, .STREAM, linux.Protocol(0), &pair) == .NONE)
-	defer linux.close(pair[0])
-	defer linux.close(pair[1])
-	sndbuf: i32 = 4096
-	assert(linux.setsockopt(pair[0], linux.SOL_SOCKET, .SNDBUF, &sndbuf) == .NONE)
-
-	o := make_outbox(1, 2)
-	defer outbox_destroy(o)
-	cs := Conn_State {
-		outbox = o,
-	}
-	stream := tls.Server_Stream {
-		sock = net.TCP_Socket(pair[0]),
-	}
-	cs.conn.stream = &stream
-	o.state = &cs
+	context.allocator = runtime.default_allocator()
+	r: Relay
+	fanout_init(&r.fanout)
+	defer fanout_destroy(&r.fanout)
+	c: Live_Conn
+	live_conn_open(&c, &r, 1, 4096)
+	defer live_conn_close(&c)
+	o := c.cs.outbox
 
 	PAYLOAD :: 128 * 1024
 	first := make([]u8, MAX_FRAME_HEADER_LEN + PAYLOAD)
@@ -541,28 +531,15 @@ test_partial_replay_order :: proc(t: ^testing.T) {
 	h := encode_frame_header(first, .Binary, PAYLOAD)
 	for &b, i in first[h:] {b = u8(i % 251)}
 	second := []u8{0x81, 1, 'x'}
-	assert(outbox_send(o, Out_Msg(Out_Batch{wire = slice.clone_to_dynamic(first)})))
-	got := make([]u8, len(first) + len(second) + 1)
-	defer delete(got)
-	count, err := linux.recv(pair[1], got, {.DONTWAIT})
-	assert(err == .NONE && 0 < count && count < len(first))
-	assert(outbox_send(o, Out_Msg(Out_Batch{wire = slice.clone_to_dynamic(second)})))
-	chan.close(o.ch)
-	w := thread.create_and_start_with_poly_data(&cs, proc(cs: ^Conn_State) {
-		writer_loop(cs)
-		linux.shutdown(linux.Fd(cs.conn.stream.sock), .WR)
-	})
-	defer thread.destroy(w)
-	for count < len(got) {
-		n, recv_err := linux.recv(pair[1], got[count:], {})
-		assert(recv_err == .NONE)
-		if n == 0 {break}
-		count += n
-	}
-	linux.shutdown(pair[1], .RD)
-	thread.join(w)
-	testing.expect(t, slice.equal(got[:len(first)], first))
-	testing.expect(t, slice.equal(got[len(first):count], second))
+	pong := []u8{0x8a, 1, 'p'}
+	close := []u8{0x88, 2, 0x03, 0xe8}
+	assert(outbox_send(o, Out_Batch{wire = slice.clone_to_dynamic(first)}))
+	assert(o.writer != nil)
+	assert(outbox_send(o, Out_Batch{wire = slice.clone_to_dynamic(second)}))
+	consume_incoming(&c.cs, {.Ping, .Binary, {'p'}, 0})
+	send_close(&c.cs, 1000)
+	want := slice.concatenate([][]u8{first, second, pong, close}, context.temp_allocator)
+	testing.expect(t, slice.equal(peer_read_exact(&c, len(want)), want))
 }
 
 @(test)
@@ -613,9 +590,14 @@ Live_Conn :: struct {
 }
 
 @(private = "file")
-live_conn_open :: proc(c: ^Live_Conn, r: ^Relay, id: u64, capacity: int, sndbuf: i32 = 0) {
+live_conn_open :: proc(c: ^Live_Conn, r: ^Relay, id: u64, sndbuf: i32 = 0) {
 	pair: [2]linux.Fd
 	assert(linux.socketpair(.UNIX, .STREAM, linux.Protocol(0), &pair) == .NONE)
+	timeout := linux.Time_Val {
+		seconds = 2,
+	}
+	assert(linux.setsockopt(pair[0], linux.SOL_SOCKET, .SNDTIMEO, &timeout) == .NONE)
+	assert(linux.setsockopt(pair[1], linux.SOL_SOCKET, .RCVTIMEO, &timeout) == .NONE)
 	if sndbuf > 0 {
 		size := sndbuf
 		assert(linux.setsockopt(pair[0], linux.SOL_SOCKET, .SNDBUF, &size) == .NONE)
@@ -624,14 +606,19 @@ live_conn_open :: proc(c: ^Live_Conn, r: ^Relay, id: u64, capacity: int, sndbuf:
 	c.cs.relay = r
 	c.stream.sock = net.TCP_Socket(pair[0])
 	c.cs.conn.stream = &c.stream
-	c.cs.outbox = make_outbox(id, capacity)
-	c.cs.outbox.state = &c.cs
+	c.cs.outbox = new(Outbox)
+	c.cs.outbox^ = {
+		state   = &c.cs,
+		conn_id = id,
+	}
 }
 
 @(private = "file")
 live_conn_close :: proc(c: ^Live_Conn) {
-	fanout_unsubscribe_all(&c.cs.relay.fanout, c.cs.outbox)
+	close_outbox(&c.cs)
+	outbox_join_writer(c.cs.outbox)
 	outbox_destroy(c.cs.outbox)
+	delete(c.cs.replay_spare)
 	linux.close(linux.Fd(c.cs.conn.stream.sock))
 	linux.close(c.peer)
 }
@@ -685,6 +672,21 @@ publish :: proc(r: ^Relay, ev: ^pack.Event) {
 	shared_event_release(shared)
 }
 
+@(test)
+test_plain_control_frames_do_not_start_writer :: proc(t: ^testing.T) {
+	r: Relay
+	fanout_init(&r.fanout)
+	defer fanout_destroy(&r.fanout)
+	c: Live_Conn
+	live_conn_open(&c, &r, 1)
+	defer live_conn_close(&c)
+
+	consume_incoming(&c.cs, {.Ping, .Binary, {'p'}, 0})
+	send_close(&c.cs, CLOSE_NO_STATUS)
+	testing.expect(t, slice.equal(peer_read(&c), []u8{0x8a, 1, 'p', 0x88, 0}))
+	testing.expect(t, c.cs.outbox.writer == nil && c.cs.outbox.ch.impl == nil)
+}
+
 // With no writer on the socket, the broadcasting thread writes the frame
 // itself, and applies the visibility rules the writer would.
 @(test)
@@ -693,11 +695,12 @@ test_live_event_written_direct :: proc(t: ^testing.T) {
 	fanout_init(&r.fanout)
 	defer fanout_destroy(&r.fanout)
 	c: Live_Conn
-	live_conn_open(&c, &r, 1, 8)
+	live_conn_open(&c, &r, 1)
 	defer live_conn_close(&c)
 	o := c.cs.outbox
 	SUB :: "quo\"ted"
 	fanout_subscribe(&r.fanout, SUB, {nostr.Filter{}}, o)
+	c.cs.live_count = 1
 
 	note := fixtures.test_make_event(1, 1, 1000, nil)
 	publish(&r, &note)
@@ -706,7 +709,7 @@ test_live_event_written_direct :: proc(t: ^testing.T) {
 		slice.equal(peer_read(&c), live_wire(SUB, &note)),
 		"the frame as the writer sends it",
 	)
-	testing.expect(t, chan.len(o.ch) == 0 && o.pending == 0, "nothing left for the writer")
+	testing.expect(t, o.ch.impl == nil && o.writer == nil, "the live frame did not start a writer")
 
 	// A gift wrap goes to its recipient only, and a protected event to its
 	// author only, judged by the keys authenticated when the frame is written.
@@ -744,36 +747,25 @@ test_live_frames_keep_order :: proc(t: ^testing.T) {
 	fanout_init(&r.fanout)
 	defer fanout_destroy(&r.fanout)
 	c: Live_Conn
-	live_conn_open(&c, &r, 1, 4, 4096)
+	live_conn_open(&c, &r, 1, 4096)
 	defer live_conn_close(&c)
 	o := c.cs.outbox
 	fanout_subscribe(&r.fanout, "s", {nostr.Filter{}}, o)
+	c.cs.live_count = 1
 
 	big := fixtures.test_make_event(1, 1, 1000, nil)
 	big.content = strings.repeat("x", 40 * 1024, context.temp_allocator)
 	small := fixtures.test_make_event(1, 1, 1001, nil)
 	publish(&r, &big)
-	testing.expect_value(t, o.pending, 1)
+	assert(o.writer != nil)
 	first, second := live_wire("s", &big), live_wire("s", &small)
-	got := make([dynamic]u8, context.temp_allocator)
-	append(&got, ..peer_read(&c))
-	testing.expect(t, 0 < len(got) && len(got) < len(first), "the broadcast began the frame")
-	// The socket has room again, but the writer owns it now.
 	publish(&r, &small)
-	testing.expect_value(t, o.pending, 2)
-	testing.expect_value(t, len(peer_read(&c)), 0)
-
-	chan.close(o.ch)
-	w := thread.create_and_start_with_poly_data(&c.cs, proc(cs: ^Conn_State) {
-		writer_loop(cs)
-		linux.shutdown(linux.Fd(cs.conn.stream.sock), .WR)
-	})
-	defer thread.destroy(w)
-	append(&got, ..peer_read_exact(&c, len(first) + len(second) - len(got)))
-	linux.shutdown(c.peer, .RD)
-	thread.join(w)
 	want := slice.concatenate([][]u8{first, second}, context.temp_allocator)
-	testing.expect(t, slice.equal(got[:], want), "both frames whole, in broadcast order")
+	testing.expect(
+		t,
+		slice.equal(peer_read_exact(&c, len(want)), want),
+		"both frames whole, in broadcast order",
+	)
 }
 
 // An event waiting in a shard queue must not go to a replacement REQ.
@@ -810,10 +802,11 @@ test_expiry_in_fanout_queue :: proc(t: ^testing.T) {
 	fanout_init(&r.fanout)
 	defer fanout_destroy(&r.fanout)
 	c: Live_Conn
-	live_conn_open(&c, &r, 1, 8)
+	live_conn_open(&c, &r, 1)
 	defer live_conn_close(&c)
 	o := c.cs.outbox
 	fanout_subscribe(&r.fanout, "s", {nostr.Filter{}}, o)
+	c.cs.live_count = 1
 	ev := fixtures.test_make_event(1, 1, 1000, {{fields = {"expiration", "4102444800"}}})
 	shared := shared_event_new(event_clone(&ev, context.allocator))
 	defer shared_event_release(shared)
@@ -860,8 +853,9 @@ test_broadcasters_keep_order :: proc(t: ^testing.T) {
 	fanout_start(&r.fanout)
 	conns: [4]Live_Conn
 	for &c, i in conns {
-		live_conn_open(&c, &r, u64(1 + i), 8)
+		live_conn_open(&c, &r, u64(1 + i))
 		fanout_subscribe(&r.fanout, "live", {nostr.Filter{}}, c.cs.outbox)
+		c.cs.live_count = 1
 	}
 	queued := make_outbox(5, EVENTS)
 	fanout_subscribe(&r.fanout, "queued", {nostr.Filter{}}, queued)
@@ -895,6 +889,8 @@ test_broadcasters_keep_order :: proc(t: ^testing.T) {
 	}
 
 	for &c in conns {
+		chan.close(c.cs.outbox.ch)
+		outbox_join_writer(c.cs.outbox)
 		outbox_destroy(c.cs.outbox)
 		linux.close(linux.Fd(c.cs.conn.stream.sock))
 		linux.close(c.peer)

@@ -150,23 +150,39 @@ encode_frame_header :: proc(buf: []u8, opcode: Opcode, payload_len: int, fin := 
 	if fin {
 		b0 |= 0x80
 	}
-	buf[0] = b0
+	n := frame_header_len(payload_len)
+	put_frame_header(buf, b0, payload_len, n)
+	return n
+}
+
+@(private)
+frame_header_len :: #force_inline proc(payload_len: int) -> int {
 	switch {
 	case payload_len < 126:
-		buf[1] = u8(payload_len)
 		return 2
 	case payload_len <= 0xFFFF:
+		return 4
+	case:
+		return MAX_FRAME_HEADER_LEN
+	}
+}
+
+@(private)
+put_frame_header :: #force_inline proc(buf: []u8, b0: u8, payload_len, n: int) {
+	buf[0] = b0
+	switch n {
+	case 2:
+		buf[1] = u8(payload_len)
+	case 4:
 		buf[1] = 126
 		buf[2] = u8(payload_len >> 8)
 		buf[3] = u8(payload_len)
-		return 4
-	case:
+	case MAX_FRAME_HEADER_LEN:
 		buf[1] = 127
 		l := u64(payload_len)
 		for i in 0 ..< 8 {
 			buf[2 + i] = u8(l >> uint(56 - 8 * i))
 		}
-		return 10
 	}
 }
 

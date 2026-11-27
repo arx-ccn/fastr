@@ -6,6 +6,7 @@
 // releases.
 package pack
 
+import "base:runtime"
 import "core:encoding/endian"
 import "core:simd"
 import "core:strings"
@@ -499,6 +500,16 @@ write_json_str_canonical :: proc(s: string, buf: ^[dynamic]u8) {
 		// the only escapable bytes are the seven listed below; everything
 		// else (including raw control bytes) passes through unchanged.
 		start := i
+		when simd.HAS_HARDWARE_SIMD {
+			// A conservative mask: let the scalar path distinguish the other C0 bytes.
+			for len(bytes) - i >= 16 {
+				v := simd.from_array((cast(^[16]u8)&bytes[i])^)
+				if simd.extract_msbs(json_escape_mask(v)) != {} {
+					break
+				}
+				i += 16
+			}
+		}
 		scan: for i < len(bytes) {
 			switch bytes[i] {
 			case '"', '\\', 0x08, '\t', '\n', 0x0c, '\r':
@@ -536,6 +547,15 @@ write_json_str_canonical :: proc(s: string, buf: ^[dynamic]u8) {
 json_escape_mask :: #force_inline proc(v: simd.u8x16) -> simd.u8x16 {
 	return(
 		simd.lanes_lt(v, simd.u8x16(0x20)) |
+		simd.lanes_eq(v, simd.u8x16('"')) |
+		simd.lanes_eq(v, simd.u8x16('\\')) \
+	)
+}
+
+@(private)
+non_plain_mask :: #force_inline proc(v: simd.u8x16) -> simd.u8x16 {
+	return(
+		transmute(simd.u8x16)simd.lanes_lt(transmute(simd.i8x16)v, simd.i8x16(0x20)) |
 		simd.lanes_eq(v, simd.u8x16('"')) |
 		simd.lanes_eq(v, simd.u8x16('\\')) \
 	)
@@ -581,12 +601,7 @@ plain_json_prefix :: proc(data: []u8) -> int {
 			b := simd.from_array((cast(^[16]u8)&data[i + 16])^)
 			c := simd.from_array((cast(^[16]u8)&data[i + 32])^)
 			d := simd.from_array((cast(^[16]u8)&data[i + 48])^)
-			mask :=
-				(a | b | c | d) |
-				(json_escape_mask(a) |
-						json_escape_mask(b) |
-						json_escape_mask(c) |
-						json_escape_mask(d))
+			mask := non_plain_mask(a) | non_plain_mask(b) | non_plain_mask(c) | non_plain_mask(d)
 			if simd.extract_msbs(mask) != {} {
 				break
 			}
@@ -594,7 +609,7 @@ plain_json_prefix :: proc(data: []u8) -> int {
 		}
 		#no_bounds_check for len(data) - i >= 16 {
 			v := simd.from_array((cast(^[16]u8)&data[i])^)
-			if simd.extract_msbs(v | json_escape_mask(v)) != {} {
+			if simd.extract_msbs(non_plain_mask(v)) != {} {
 				break
 			}
 			i += 16
@@ -620,10 +635,12 @@ write_quoted_bytes :: #force_inline proc(data: []u8, buf: ^[dynamic]u8) {
 wire_span :: #force_inline proc(buf: ^[dynamic]u8, size: int) -> []u8 {
 	start := len(buf)
 	end := start + size
-	if end > cap(buf) {
+	if end <= cap(buf) {
+		(^runtime.Raw_Dynamic_Array)(buf).len = end
+	} else {
 		non_zero_reserve(buf, max(end, cap(buf) * 2))
+		non_zero_resize(buf, end)
 	}
-	non_zero_resize(buf, end)
 	return buf[start:end]
 }
 
@@ -671,7 +688,8 @@ transcode_to_event_json :: proc(dp: []u8, sub_id: string, buf: ^[dynamic]u8) -> 
 		non_zero_resize(buf, start)
 	}
 
-	non_zero_append(buf, "[\"EVENT\",")
+	HEAD :: "[\"EVENT\","
+	copy(wire_span(buf, len(HEAD)), HEAD)
 	sub := transmute([]u8)sub_id
 	if plain_json_prefix(sub) == len(sub) {
 		write_quoted_bytes(sub, buf)
@@ -716,28 +734,29 @@ transcode_to_event_json :: proc(dp: []u8, sub_id: string, buf: ^[dynamic]u8) -> 
 
 	for t in 0 ..< tag_count {
 		if t > 0 {
-			non_zero_append(buf, ',')
+			wire_span(buf, 1)[0] = ','
 		}
 		if pos >= tag_end {
 			return .Invalid
 		}
 		nf := int(tag_blob[pos])
 		pos += 1
-		non_zero_append(buf, '[')
+		wire_span(buf, 1)[0] = '['
 		for f in 0 ..< nf {
 			if f > 0 {
-				non_zero_append(buf, ',')
+				wire_span(buf, 1)[0] = ','
 			}
 			write_field_as_json(tag_blob, &pos, buf) or_return
 		}
-		non_zero_append(buf, ']')
+		wire_span(buf, 1)[0] = ']'
 	}
 
 	if pos != tag_end {
 		return .Invalid
 	}
 
-	non_zero_append(buf, "],\"content\":")
+	CONTENT :: "],\"content\":"
+	copy(wire_span(buf, len(CONTENT)), CONTENT)
 	write_field_as_json(dp, &pos, buf) or_return
 
 	SIG :: `,"sig":"`

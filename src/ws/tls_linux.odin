@@ -20,6 +20,9 @@ when tls.ENABLED {
 	@(private = "file")
 	tls_take :: proc(o: ^Outbox) -> Out_Msg {
 		sync.guard(&o.send_mu)
+		if o.pending == 0 {
+			return nil
+		}
 		msg, _ := chan.try_recv(o.ch)
 		return msg
 	}
@@ -52,24 +55,22 @@ when tls.ENABLED {
 
 	@(private = "file")
 	tls_prepare :: proc(cs: ^Conn_State, out: ^Tls_Output) {
-		#partial switch m in out.msg {
-		case Out_Batch:
-			out.parts[0] = m.wire[m.sent:]
-		case Out_Pong:
-			out.parts[0] = encode_frame(out.scratch[:], .Pong, m.payload)
-		case Out_Live:
-			if !live_allowed(cs, m.live) {
-				return
-			}
-			clear(&out.json)
-			nostr.write_event_head(m.live.sub_id, &out.json)
-			append(&out.json, ..m.live.shared.json)
-			if len(out.json) <= WRITE_STACK_LIMIT {
-				out.parts[0] = encode_frame(out.scratch[:], .Text, out.json[:])
-			} else {
-				n := encode_frame_header(out.scratch[:], .Text, len(out.json))
-				out.parts = {out.scratch[:n], out.json[:]}
-			}
+		if batch, ok := &out.msg.(Out_Batch); ok {
+			out.parts[0] = batch.wire[batch.sent:]
+			return
+		}
+		live := out.msg.(Out_Live).live
+		if !live_allowed(cs, live) {
+			return
+		}
+		clear(&out.json)
+		nostr.write_event_head(live.sub_id, &out.json)
+		append(&out.json, ..live.shared.json)
+		if len(out.json) <= WRITE_STACK_LIMIT {
+			out.parts[0] = encode_frame(out.scratch[:], .Text, out.json[:])
+		} else {
+			n := encode_frame_header(out.scratch[:], .Text, len(out.json))
+			out.parts = {out.scratch[:n], out.json[:]}
 		}
 	}
 
@@ -121,27 +122,31 @@ when tls.ENABLED {
 			if out.msg == nil && len(out.parts[0]) == 0 {
 				out.msg = tls_take(o)
 			}
-			now := time.tick_now()
 			pending := tls.server_pending(s)
 			close_start, draining := s.close_start.?
-			if out.msg == nil && len(out.parts[0]) == 0 && pending == 0 {
+			writing := out.msg != nil || len(out.parts[0]) != 0 || pending != 0
+			if !writing {
 				write_budget = {}
 				if draining && terminal == 0 {
 					return
 				}
-			} else if write_budget.limit == 0 {
-				write_budget = {now, tls.SERVER_IO_LIMIT}
 			}
 			budget := write_budget
 			if draining {
 				budget = {close_start, tls.SERVER_CLOSE_LIMIT}
 			}
-			if budget.limit != 0 && time.tick_diff(budget.start, now) >= budget.limit {
-				s.failed = true
-				return
+			if writing || draining {
+				now := time.tick_now()
+				if budget.limit == 0 {
+					write_budget = {now, tls.SERVER_IO_LIMIT}
+					budget = write_budget
+				} else if time.tick_diff(budget.start, now) >= budget.limit {
+					s.failed = true
+					return
+				}
 			}
 
-			sent := tls.server_flush(s)
+			sent := tls.server_flush(s) if pending != 0 else 0
 			if sent < 0 {
 				return
 			}
@@ -206,7 +211,11 @@ when tls.ENABLED {
 				}
 			}
 
-			if !retried && rstep != .Want_Write && wstep == .Progress && tls.server_can_write(s) {
+			if !retried &&
+			   rstep != .Want_Write &&
+			   wstep == .Progress &&
+			   (out.msg != nil || len(out.parts[0]) != 0 || terminal != 0) &&
+			   tls.server_can_write(s) {
 				if len(out.parts[0]) == 0 {
 					if out.msg != nil {
 						tls_prepare(cs, &out)

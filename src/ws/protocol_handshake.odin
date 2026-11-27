@@ -15,7 +15,8 @@ ACCEPT_KEY_LEN :: 28
 HANDSHAKE_RESPONSE_LEN :: len(HANDSHAKE_PREFIX) + ACCEPT_KEY_LEN + 4
 
 @(private)
-HANDSHAKE_PREFIX :: "HTTP/1.1 101 Switching Protocols\r\n" +
+HANDSHAKE_PREFIX ::
+	"HTTP/1.1 101 Switching Protocols\r\n" +
 	"Upgrade: websocket\r\n" +
 	"Connection: Upgrade\r\n" +
 	"Access-Control-Allow-Origin: *\r\n" +
@@ -25,7 +26,6 @@ HANDSHAKE_PREFIX :: "HTTP/1.1 101 Switching Protocols\r\n" +
 
 // compute_accept_key derives Sec-WebSocket-Accept =
 // base64(SHA1(key + GUID)) for the client's Sec-WebSocket-Key.
-// Scratch goes through context.temp_allocator; the result is by value.
 compute_accept_key :: proc(key: string) -> (out: [ACCEPT_KEY_LEN]u8) {
 	ctx: sha1.Context
 	sha1.init(&ctx)
@@ -34,8 +34,8 @@ compute_accept_key :: proc(key: string) -> (out: [ACCEPT_KEY_LEN]u8) {
 	sha1.update(&ctx, transmute([]u8)guid)
 	digest: [sha1.DIGEST_SIZE]u8
 	sha1.final(&ctx, digest[:])
-	encoded := base64.encode(digest[:], base64.ENC_TABLE, context.temp_allocator)
-	copy(out[:], encoded)
+	_, err := base64.encode_into_buf(out[:], digest[:])
+	assert(err == nil)
 	return out
 }
 

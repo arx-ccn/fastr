@@ -103,7 +103,5 @@ is_hex :: proc(s: []u8) -> bool {
 
 // Encode `src` as lowercase hex, appending directly to `buf`.
 hex_encode_into :: proc(src: []u8, buf: ^[dynamic]u8) {
-	base := len(buf)
-	resize(buf, base + len(src) * 2)
-	hex_encode(src, buf[base:])
+	hex_encode(src, wire_span(buf, len(src) * 2))
 }

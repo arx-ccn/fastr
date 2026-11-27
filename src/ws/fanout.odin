@@ -76,7 +76,7 @@ Live_Event :: struct {
 	shared: ^Shared_Event,
 }
 
-// Complete WebSocket frames: a stored-event replay or a single reply.
+// One or more complete WebSocket frames, including control replies.
 Out_Batch :: struct {
 	wire: [dynamic]u8, // retain the allocation base and its owning allocator
 	sent: int,
@@ -86,20 +86,9 @@ Out_Live :: struct {
 	live: Live_Event,
 }
 
-// Control frames share the same ordered outbox as replay and live events.
-Out_Pong :: struct {
-	payload: []u8, // owned copy (max 125 bytes)
-}
-
-Out_Close :: struct {
-	code: u16,
-}
-
 Out_Msg :: union {
 	Out_Batch,
 	Out_Live,
-	Out_Pong,
-	Out_Close,
 }
 
 // Per-connection outbound endpoint registered with the fanout.
@@ -109,6 +98,7 @@ Outbox :: struct {
 	// The connection, for the threads that write to its socket while no
 	// writer owns it. Nil in an outbox that only queues.
 	state:   ^Conn_State,
+	writer:  ^thread.Thread,
 	wake:    Maybe(linux.Fd),
 	send_mu: sync.Mutex,
 	pending: int, // queued plus currently being written
@@ -118,14 +108,13 @@ Outbox :: struct {
 }
 
 @(private)
-outbox_send :: proc(o: ^Outbox, msg: Out_Msg, spare: ^[dynamic]u8 = nil) -> bool {
+outbox_send :: proc(o: ^Outbox, batch: Out_Batch, spare: ^[dynamic]u8 = nil) -> bool {
 	sync.guard(&o.send_mu)
 	if o.failed {
 		return false
 	}
-	msg := msg
-	if batch, ok := &msg.(Out_Batch);
-	   ok && o.pending == 0 && o.state != nil && (!tls.ENABLED || o.state.conn.stream.ssl == nil) {
+	batch := batch
+	if o.pending == 0 && o.state != nil && (!tls.ENABLED || o.state.conn.stream.ssl == nil) {
 		// No writer owns the socket. Don't block the reader on a slow client.
 		fd := linux.Fd(o.state.conn.stream.sock)
 		n, err := linux.send(fd, batch.wire[:], {.DONTWAIT, .NOSIGNAL})
@@ -144,15 +133,19 @@ outbox_send :: proc(o: ^Outbox, msg: Out_Msg, spare: ^[dynamic]u8 = nil) -> bool
 	}
 	// With pending == 0 the channel is empty. A partial batch's suffix is
 	// therefore admitted before any later producer can acquire send_mu.
-	return outbox_enqueue(o, msg)
+	// The reader already owns the TLS loop, so it doesn't need a wakeup.
+	return outbox_enqueue(o, Out_Msg(batch), wake_owner = false)
 }
 
 // Caller holds send_mu. The TLS owner cannot check the queue between the
 // wake and publication, even if it has already read the eventfd counter.
 @(private)
-outbox_enqueue :: #force_inline proc(o: ^Outbox, msg: Out_Msg) -> bool {
+outbox_enqueue :: #force_inline proc(o: ^Outbox, msg: Out_Msg, wake_owner := true) -> bool {
+	if o.ch.impl == nil && (o.state == nil || !outbox_start_writer(o)) {
+		return false
+	}
 	when tls.ENABLED {
-		if fd, ok := o.wake.?; ok && o.pending == 0 {
+		if fd, ok := o.wake.?; wake_owner && ok && o.pending == 0 {
 			one: u64 = 1
 			for {
 				_, err := linux.write(fd, ((^[8]u8)(&one))[:])
@@ -171,6 +164,12 @@ outbox_enqueue :: #force_inline proc(o: ^Outbox, msg: Out_Msg) -> bool {
 	}
 	o.pending += 1
 	return true
+}
+
+@(private)
+outbox_is_closed :: #force_inline proc(o: ^Outbox) -> bool {
+	// Socket outboxes unregister before closing. The channel may not exist yet.
+	return o.state == nil && chan.is_closed(o.ch)
 }
 
 // Lay out one EVENT frame in `buf`: the header right-aligned in its first
@@ -217,17 +216,15 @@ outbox_send_live :: proc(
 			return true
 		}
 		if err == .NONE && n > 0 {
-			// The frame is begun and must be finished. With pending == 0
-			// the channel is empty, so only a closed channel refuses it.
+			// A partial frame must finish before a later producer writes.
 			rest := Out_Batch {
 				wire = scratch^,
 				sent = start + int(n),
 			}
-			if !chan.try_send(o.ch, Out_Msg(rest)) {
+			if !outbox_enqueue(o, Out_Msg(rest)) {
 				return false
 			}
 			scratch^ = {}
-			o.pending += 1
 			return true
 		}
 		// Nothing went out: the socket is full or broken. The writer finds
@@ -625,13 +622,13 @@ broadcast_shard :: proc(f: ^Fanout_Shard, delivery: Shard_Delivery, scratch: ^[d
 				if sub.key >= delivery.key_end || !nostr.filter_matches(sub.filters, &shared.ev) {
 					continue
 				}
-				if chan.is_closed(sub.outbox.ch) {
+				if outbox_is_closed(sub.outbox) {
 					needs_prune = true
 					continue
 				}
 				// False: full (slow client) or closed, and the event is dropped.
 				if !outbox_send_live(sub.outbox, sub.key, sub.sub_id, shared, scratch) &&
-				   chan.is_closed(sub.outbox.ch) {
+				   outbox_is_closed(sub.outbox) {
 					needs_prune = true
 				}
 			}
@@ -641,7 +638,7 @@ broadcast_shard :: proc(f: ^Fanout_Shard, delivery: Shard_Delivery, scratch: ^[d
 	if needs_prune {
 		sync.guard(&f.mu)
 		#reverse for sub in f.subs {
-			if chan.is_closed(sub.outbox.ch) {
+			if outbox_is_closed(sub.outbox) {
 				remove_sub(f, sub)
 			}
 		}

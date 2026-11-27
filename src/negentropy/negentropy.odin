@@ -15,6 +15,7 @@
 package negentropy
 
 import "core:crypto/sha2"
+import "core:encoding/endian"
 import "core:math/bits"
 import "core:slice"
 
@@ -176,20 +177,16 @@ fingerprint :: proc(
 	for i in begin ..< end {
 		id := &s.items[i].id
 		carry: u64
-		for limb in 0 ..< 4 {
-			v: u64
-			for b in 0 ..< 8 {
-				v |= u64(id[limb * 8 + b]) << uint(8 * b)
-			}
+		#unroll for limb in 0 ..< 4 {
+			v := endian.unchecked_get_u64le(id[limb * 8:])
 			acc[limb], carry = bits.add_u64(acc[limb], v, carry)
 		}
 	}
 
 	input: [ID_SIZE + 10]u8
-	for limb in 0 ..< 4 {
-		for b in 0 ..< 8 {
-			input[limb * 8 + b] = u8(acc[limb] >> uint(8 * b))
-		}
+	#unroll for limb in 0 ..< 4 {
+		word := transmute([8]u8)u64le(acc[limb])
+		copy(input[limb * 8:], word[:])
 	}
 	n := encode_var_int_buf(input[ID_SIZE:], u64(end - begin))
 
@@ -363,32 +360,31 @@ reconcile :: proc(
 
 			if skip {
 				skip = false
+				// Keep the old size accounting: the skip prefix is committed
+				// together with the ID list, after selecting its range.
 				encode_bound(n, &o, prev_bound)
 				encode_var_int(&o, u64(Mode.Skip))
 			}
 
-			response_ids := make([dynamic]u8, context.temp_allocator)
-			num_response_ids := 0
 			end_bound := curr_bound
 
 			for i in lower ..< upper {
-				if exceeded_frame_size_limit(n, len(full) + len(response_ids)) {
+				if exceeded_frame_size_limit(n, len(full) + (i - lower) * ID_SIZE) {
 					end_bound = bound_from_item(n.storage.items[i])
 					// Shrink upper so the remaining range gets a fingerprint.
 					upper = i
 					break
 				}
-				append(&response_ids, ..n.storage.items[i].id[:])
-				num_response_ids += 1
 			}
-
-			encode_bound(n, &o, end_bound)
-			encode_var_int(&o, u64(Mode.Id_List))
-			encode_var_int(&o, u64(num_response_ids))
-			append(&o, ..response_ids[:])
 
 			append(&full, ..o[:])
 			clear(&o)
+			encode_bound(n, &full, end_bound)
+			encode_var_int(&full, u64(Mode.Id_List))
+			encode_var_int(&full, u64(upper - lower))
+			for i in lower ..< upper {
+				append(&full, ..n.storage.items[i].id[:])
+			}
 		}
 
 		if exceeded_frame_size_limit(n, len(full) + len(o)) {

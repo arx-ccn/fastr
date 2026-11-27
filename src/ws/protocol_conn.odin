@@ -52,17 +52,7 @@ read_request :: proc(
 	err: Error,
 ) {
 	total := 0
-	for {
-		consumed, perr := parse_request(buf[:total], req)
-		if perr == .None {
-			return buf[consumed:total], .None
-		}
-		if perr != .Incomplete {
-			return nil, perr
-		}
-		if total == len(buf) {
-			return nil, .Http_Headers_Too_Large
-		}
+	for total < len(buf) {
 		n, rerr := tls.stream_recv(stream, buf[total:])
 		if rerr != .None {
 			return nil, .Socket
@@ -71,7 +61,15 @@ read_request :: proc(
 			return nil, .Closed
 		}
 		total += n
+		consumed, perr := parse_request(buf[:total], req)
+		if perr == .None {
+			return buf[consumed:total], .None
+		}
+		if perr != .Incomplete {
+			return nil, perr
+		}
 	}
+	return nil, .Http_Headers_Too_Large
 }
 
 // accept_upgrade sends the 101 Switching Protocols response for the
