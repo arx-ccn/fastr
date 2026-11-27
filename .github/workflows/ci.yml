@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  ODIN_RELEASE: dev-2026-05
+  ODIN_RELEASE: dev-2026-11a
 
 jobs:
   test:

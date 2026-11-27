@@ -1,15 +1,11 @@
 // zlib stream read/write for loose objects and pack entries.
 //
-// Reading uses core:compress/zlib (inflate). Odin core has no DEFLATE
-// compressor, so writing emits spec-valid *stored* (BTYPE=00) blocks:
-// ~5 bytes of framing per 64 KiB plus the 2-byte header and 4-byte adler32
-// trailer. Larger on disk/wire than real compression, but byte-valid for
-// every zlib reader including stock git.
+// Writing emits uncompressed DEFLATE blocks with five bytes of framing per
+// block, plus a two-byte zlib header and a four-byte Adler-32 trailer.
 package git
 
-import "core:bytes"
 import "core:compress"
-import "core:compress/zlib"
+import "core:compress/deflate"
 import "core:hash"
 
 // Maximum payload of one stored DEFLATE block (16-bit LEN field).
@@ -49,10 +45,8 @@ zlib_store :: proc(data: []u8, allocator := context.allocator) -> []u8 {
 
 // Inflate one zlib stream from the front of `src`.
 //
-// Returns the decompressed bytes (allocated from `allocator`), and the
-// number of bytes of `src` the stream occupied — callers parsing packfiles
-// use `consumed` to find the next entry. `expected_size >= 0` pre-sizes the
-// output and lets the inflater stop exactly at that size.
+// `consumed` includes the validated Adler-32 trailer, so it points to the
+// next pack entry. A nonnegative `expected_size` must match the decoded length.
 zlib_inflate :: proc(
 	src: []u8,
 	expected_size := -1,
@@ -62,24 +56,15 @@ zlib_inflate :: proc(
 	consumed: int,
 	err: Error,
 ) {
-	buf: bytes.Buffer
-	bytes.buffer_init_allocator(&buf, 0, max(expected_size, 0), allocator)
+	buffer: [dynamic]u8
+	buffer.allocator = allocator
+	input := src
+	ctx := compress.init_context_from_slice(&input, output = &buffer)
 
-	ctx: compress.Context_Memory_Input
-	ctx.input_data = src
-	ctx.output = &buf
-
-	zerr := zlib.inflate_from_context(&ctx, false, expected_size, allocator)
-	if zerr != nil {
-		bytes.buffer_destroy(&buf)
+	zerr := deflate.inflate_zlib_from_context(&ctx, expected_size, allocator = allocator)
+	if zerr != nil || (expected_size >= 0 && len(buffer) != expected_size) {
+		delete(buffer)
 		return nil, 0, .Corrupt
 	}
-	// The inflater's bit buffer may hold whole bytes pulled from input_data
-	// but never consumed by the stream — subtract them back out.
-	consumed = len(src) - len(ctx.input_data) - int(ctx.num_bits / 8)
-	if expected_size >= 0 && bytes.buffer_length(&buf) != expected_size {
-		bytes.buffer_destroy(&buf)
-		return nil, 0, .Corrupt
-	}
-	return bytes.buffer_to_bytes(&buf), consumed, .None
+	return buffer[:], len(src) - len(ctx.window), .None
 }

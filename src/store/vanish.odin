@@ -13,10 +13,7 @@ save_recipients :: proc(s: ^Store) -> Error {
 	sync.shared_guard(&s.recipients_mu)
 	tmp := path_join(s.dir, "recipient.r.tmp")
 	f, err := os.open(tmp, {.Write, .Create, .Trunc}, os.Permissions_Default)
-	if err != nil {
-		return .Io
-	}
-	{
+	if err == nil {
 		defer os.close(f)
 		header := FILE_HEADER
 		write_exact(f, header[:]) or_return
@@ -24,6 +21,8 @@ save_recipients :: proc(s: ^Store) -> Error {
 			key := id
 			write_exact(f, key[:]) or_return
 		}
+	} else {
+		return .Io
 	}
 	if os.rename(tmp, path_join(s.dir, "recipient.r")) != nil {
 		return .Io

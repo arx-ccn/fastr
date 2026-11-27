@@ -10,7 +10,7 @@
 # -----------------------------------------------------------------------------
 FROM docker.io/library/debian:trixie AS odin-builder
 
-ARG ODIN_RELEASE=dev-2026-09
+ARG ODIN_RELEASE=dev-2026-11a
 
 RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   curl ca-certificates git \

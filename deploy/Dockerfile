@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Odin toolchain (pinned monthly release).
-ARG ODIN_RELEASE=dev-2026-05
+ARG ODIN_RELEASE=dev-2026-11a
 RUN curl -fsSL -o /tmp/odin.tar.gz \
     "https://github.com/odin-lang/Odin/releases/download/${ODIN_RELEASE}/odin-linux-amd64-${ODIN_RELEASE}.tar.gz" \
     && mkdir -p /opt/odin && tar -xzf /tmp/odin.tar.gz -C /opt/odin --strip-components=1 \

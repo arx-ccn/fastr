@@ -9,6 +9,57 @@ import "core:testing"
 import "../git"
 
 @(test)
+test_read_body_gzip :: proc(t: ^testing.T) {
+	// 64 ASCII zeroes compressed with gzip -n.
+	data := [24]u8 {
+		0x1f,
+		0x8b,
+		0x08,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x03,
+		0x33,
+		0x30,
+		0xa0,
+		0x0c,
+		0x00,
+		0x00,
+		0xcb,
+		0xe4,
+		0xb1,
+		0x34,
+		0x40,
+		0x00,
+		0x00,
+		0x00,
+	}
+	info := Body_Info {
+		content_length = len(data),
+		gzip           = true,
+	}
+	body, err := read_body({}, data[:], info, 64, context.temp_allocator)
+	testing.expect_value(t, err, Body_Error.None)
+	testing.expect_value(
+		t,
+		string(body),
+		"0000000000000000000000000000000000000000000000000000000000000000",
+	)
+
+	body, err = read_body({}, data[:], info, 32, context.temp_allocator)
+	testing.expect_value(t, err, Body_Error.Too_Large)
+	testing.expect(t, body == nil)
+
+	data[16] ~= 1
+	body, err = read_body({}, data[:], info, 64, context.temp_allocator)
+	testing.expect_value(t, err, Body_Error.Malformed)
+	testing.expect(t, body == nil)
+}
+
+@(test)
 test_pkt_roundtrip :: proc(t: ^testing.T) {
 	buf := make([dynamic]u8, 0, 64, context.temp_allocator)
 	pkt_write_string(&buf, "hello\n")

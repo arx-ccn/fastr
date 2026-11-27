@@ -5,8 +5,8 @@
 // Expect: 100-continue.
 package githttp
 
-import "core:bytes"
-import "core:compress/gzip"
+import "core:compress"
+import "core:compress/deflate"
 import "core:net"
 
 Body_Error :: enum {
@@ -57,17 +57,22 @@ read_body :: proc(
 
 	if info.gzip {
 		defer delete(raw, allocator)
-		buf: bytes.Buffer
-		bytes.buffer_init_allocator(&buf, 0, len(raw) * 2, allocator)
-		if gerr := gzip.load_from_bytes(raw, &buf, len(raw), -1); gerr != nil {
-			bytes.buffer_destroy(&buf)
+		buffer: [dynamic]u8
+		buffer.allocator = allocator
+		if gerr := deflate.inflate_gzip_from_bytes(
+			&buffer,
+			raw,
+			max_output_size = max_bytes,
+			allocator = allocator,
+		); gerr != nil {
+			delete(buffer)
+			if gerr == compress.General_Error.Output_Too_Short ||
+			   gerr == compress.GZIP_Error.Output_Exceeds_COMPRESS_OUTPUT_ALLOCATE_MAX {
+				return nil, .Too_Large
+			}
 			return nil, .Malformed
 		}
-		if bytes.buffer_length(&buf) > max_bytes {
-			bytes.buffer_destroy(&buf)
-			return nil, .Too_Large
-		}
-		return bytes.buffer_to_bytes(&buf), .None
+		return buffer[:], .None
 	}
 	return raw, .None
 }
