@@ -735,11 +735,12 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 	// bound instead.
 	paged := &filters[18]
 	paged.until, paged.limit = 1300, 1
-	// With thirty records to pass for five of this author's 60 events, this
-	// one seeks in the author's postings.
+	// This author has 60 events, 30 of them at or below the bound, and the
+	// tag is on 30 events. With that many records to pass for what the seek
+	// in the author's postings leaves, this one seeks.
 	seek := &filters[19]
 	seek.authors = test_authors_filter(test_pubkey(30)).authors
-	seek.until, seek.limit = 1300, 5
+	seek.until, seek.limit = 1300, 20
 	// Two chain records are few enough to pass, bound or not.
 	reply_before := &filters[20]
 	reply_before.authors = test_authors_filter(a).authors
@@ -797,14 +798,16 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 		common_head.prev = common_prev
 
 		// The two filters that `until` keeps off their chains do not notice
-		// when a chain is cut to one record.
-		for bounded in ([]^nostr.Filter{paged, seek}) {
+		// when a chain is cut to one record: one finds its single event and
+		// the other all 15 of the author's tagged events below the bound.
+		kept := [2]int{1, 15}
+		for bounded, k in ([]^nostr.Filter{paged, seek}) {
 			spec := build_tag_specs(bounded)[0]
 			bucket := tag_bucket(chains.buckets, tag_value_hash(spec.name, spec.values[0]))
 			head := &chains.links.links[bucket.head]
 			prev := head.prev
 			head.prev = TAG_NONE
-			testing.expect_value(t, len(test_query_ids(t, s, bounded, nil)), bounded.limit.?)
+			testing.expect_value(t, len(test_query_ids(t, s, bounded, nil)), kept[k])
 			head.prev = prev
 		}
 

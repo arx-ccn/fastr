@@ -311,22 +311,14 @@ cursor_sift :: proc(heads: []Posting_Cursor, i: int, idx: rawptr) {
 	}
 }
 
-// Start every cursor at its first posting the kinds and `until` allow, and
-// return the heap of those that have one. A finished cursor stays in the
-// backing array, which owns its run reference, past the end of the heap.
+// Move every cursor on to its first posting the kinds allow, and return the
+// heap of those that have one. A finished cursor stays in the backing array,
+// which owns its run reference, past the end of the heap.
 @(private)
-cursors_heap :: proc(
-	cursors: []Posting_Cursor,
-	kinds: []u16,
-	until: Maybe(i64),
-	idx: rawptr,
-) -> []Posting_Cursor {
+cursors_heap :: proc(cursors: []Posting_Cursor, kinds: []u16, idx: rawptr) -> []Posting_Cursor {
 	heads := cursors
 	for i := len(heads) - 1; i >= 0; i -= 1 {
 		c := &heads[i]
-		if newest, bounded := until.?; bounded {
-			c.next = posting_until(c.run.slots[:], newest, idx)
-		}
 		if !cursor_seek(c, kinds) {
 			last := len(heads) - 1
 			heads[i], heads[last] = heads[last], heads[i]
@@ -548,6 +540,7 @@ query_authed :: proc(
 	// Tag records follow increasing data offsets, including after compaction.
 	// Ordered reads reset the cursor from each candidate's stored tag_end.
 	specs := build_tag_specs(filter)
+	newest, bounded := filter.until.?
 
 	// Pin the mappings, posting runs and tag links under the publication
 	// lock. No pointers into the lookup maps escape the lock.
@@ -620,20 +613,14 @@ query_authed :: proc(
 			}
 			if len(specs) > 0 {
 				tag_heads, tag_steps = tag_chain_heads(&s.postings.by_tag, specs)
-				// What the chains have to beat: the author postings when they
-				// qualify, else the scan. The chains must name fewer events.
-				rival := posting_steps if use_authors else total
-				use_tags = tag_steps * TAG_INDEX_SHARE <= total && tag_steps < rival
-				// A chain has no way to start at `until`: it passes every
-				// record above the bound. The postings and the scan start
-				// there, and reach the limit in about limit * rival / records
-				// steps when every record is one of theirs.
-				if _, bounded := filter.until.?; use_tags && bounded {
-					use_tags = tag_steps * tag_steps <= limit * rival
-				}
-				if use_tags {
-					use_authors = false
-				}
+				use_tags = tag_steps * TAG_INDEX_SHARE <= total
+			}
+			// With both plans in reach and no `until`, the counts decide now
+			// and only the winner is pinned. With `until` both are pinned:
+			// the choice waits for the seek, which runs outside this lock.
+			if use_authors && use_tags && !bounded {
+				use_authors = posting_steps <= tag_steps
+				use_tags = !use_authors
 			}
 			if use_authors {
 				for list in lists {
@@ -651,6 +638,26 @@ query_authed :: proc(
 	defer for &c in cursors do posting_release(c.run)
 	defer if links != nil {
 		tag_links_release(links)
+	}
+
+	// Seek each pinned run to `until`. What the runs hold from there on is
+	// all that the postings can return.
+	if bounded && len(cursors) > 0 {
+		posting_steps = 0
+		for &c in cursors {
+			c.next = posting_until(c.run.slots[:], newest, raw_data(idx))
+			posting_steps += len(c.run.slots) - c.next
+		}
+	}
+	// The chains have to beat the plan they replace: the author postings
+	// when those qualify, else the scan. They must name fewer events. And a
+	// chain has no way to start at `until`: it passes every record above the
+	// bound. The postings and the scan start there, and reach the limit in
+	// about limit * rival / records steps when every record is one of theirs.
+	if use_tags {
+		rival := posting_steps if use_authors else total
+		use_tags = tag_steps < rival && (!bounded || tag_steps * tag_steps <= limit * rival)
+		use_authors = use_authors && !use_tags
 	}
 	steps := total
 	use_postings := use_mailbox || use_authors
@@ -675,7 +682,7 @@ query_authed :: proc(
 			return .None
 		}
 		if use_postings {
-			heads = cursors_heap(cursors[:], posting_kinds, filter.until, raw_data(idx))
+			heads = cursors_heap(cursors[:], posting_kinds, raw_data(idx))
 		}
 		if use_tags {
 			pq.init(
