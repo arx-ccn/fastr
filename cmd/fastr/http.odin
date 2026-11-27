@@ -11,6 +11,15 @@ import "core:strings"
 
 import "../../src/nostr"
 
+@(private = "file")
+REPO_NADDR :: "naddr1qqz5vctnw3eqz9rhwden5te0wfjkccte9ehxw6t59ejx2aszypnxw52cucecl6ylmfqcus4qhu4852cny5zd6drlq9dp39cmv3zrqqcyqqq80xgkgl8x7"
+
+@(private = "file")
+COMMITTISH_REPO_URL :: "https://committish.app/" + REPO_NADDR
+
+@(private = "file")
+GITWORKSHOP_REPO_URL :: "https://gitworkshop.dev/" + REPO_NADDR
+
 Limitation :: struct {
 	max_message_length:     int,
 	max_subscriptions:      int,
@@ -105,7 +114,7 @@ relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> 
 		supported_grasps = supported_grasps,
 		repo_acceptance_criteria = acceptance,
 		curation = cfg.grasp_curation if cfg.grasp_enabled else "",
-		software = "https://github.com/arx-ccn/fastr",
+		software = GITWORKSHOP_REPO_URL,
 		version = VERSION,
 		limitation = Limitation {
 			max_message_length = cfg.max_message_bytes,
@@ -292,7 +301,11 @@ a{color:#00ff41;text-decoration:none}a:hover{text-decoration:underline}
 Your relay is slow. Your memory usage is embarrassing. Your disk is screaming. You already knew this in your heart. We just made it impossible to ignore.<br><br>
 We did it, nostr!
 </p>
-<p class="sub">connect with a nostr client &mdash; <a href="https://github.com/arx-ccn/fastr">github</a> &mdash; <a href="https://git.arx-ccn.com/fastr/fastr">gitea</a></p>
+<p class="sub">connect with a nostr client &mdash; <a href="` +
+	COMMITTISH_REPO_URL +
+	`">Committish</a> &mdash; <a href="` +
+	GITWORKSHOP_REPO_URL +
+	`">GitWorkshop</a></p>
 </div>
 </body>
 </html>`

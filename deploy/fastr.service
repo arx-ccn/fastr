@@ -1,6 +1,6 @@
 [Unit]
 Description=fastr Nostr relay
-Documentation=https://github.com/arx-ccn/fastr
+Documentation=https://gitworkshop.dev/naddr1qqz5vctnw3eqz9rhwden5te0wfjkccte9ehxw6t59ejx2aszypnxw52cucecl6ylmfqcus4qhu4852cny5zd6drlq9dp39cmv3zrqqcyqqq80xgkgl8x7
 After=network.target
 Wants=network.target
 
