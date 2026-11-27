@@ -8,6 +8,13 @@ import "core:sync"
 
 import "../pack"
 
+// Whether the index holds an event with this id. Tombstoned and expired
+// entries count until compaction removes them.
+store_has_id :: proc(s: ^Store, id: [32]u8) -> bool {
+	sync.shared_guard(&s.known_ids_mu)
+	return id in s.known_ids
+}
+
 // Fetch the stored event with the given id. Excludes NIP-09 tombstoned and
 // NIP-40 expired events. The returned event is deserialized with `allocator`.
 event_by_id :: proc(

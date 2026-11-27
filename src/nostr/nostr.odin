@@ -648,11 +648,23 @@ leading_zero_bits :: proc(id: ^[32]u8) -> int {
 	return bits
 }
 
-// Full NIP-01 cryptographic validation.
+// Skip is only for an event whose id the store already holds: the id check
+// below proves the content is the content that was verified on arrival.
+// A caller that skips the signature must not store the event.
+Signature_Check :: enum {
+	Verify,
+	Skip,
+}
+
+// NIP-01 validation: timestamp window, canonical id, and signature.
 // Returns ok, or a reason string suitable for ["OK", id, false, reason].
-// No per-thread parsed-pubkey cache (#97) yet — every validation parses the
-// x-only pubkey via libsecp256k1.
-validate_event :: proc(ev: ^pack.Event) -> (reason: string, ok: bool) {
+validate_event :: proc(
+	ev: ^pack.Event,
+	signature := Signature_Check.Verify,
+) -> (
+	reason: string,
+	ok: bool,
+) {
 	now := unix_now()
 	if ev.created_at < 0 {
 		return "invalid: created_at negative", false
@@ -663,7 +675,7 @@ validate_event :: proc(ev: ^pack.Event) -> (reason: string, ok: bool) {
 	if event_id_hash(ev) != ev.id {
 		return "invalid: bad event id", false
 	}
-	if !secp.verify(&ev.sig, &ev.id, &ev.pubkey) {
+	if signature == .Verify && !secp.verify(&ev.sig, &ev.id, &ev.pubkey) {
 		return "invalid: bad signature", false
 	}
 	return "", true
