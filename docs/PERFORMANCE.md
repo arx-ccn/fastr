@@ -39,6 +39,11 @@ prefix timestamp ceiling when the result heap first fills and periodically
 afterward. The strict timestamp comparison preserves ties and handles events
 ingested out of chronological order.
 
+An 8 KiB bitset records the first two ID bytes of confirmed tombstones.
+A missing prefix skips the tombstone map; a hit still checks the full ID.
+Removing a tombstone leaves its bit set until the tracker is rebuilt, so
+another tombstone with the same prefix stays visible to the check.
+
 A single-filter REQ already receives unique, ordered IDs from its store query.
 For multiple filters, the handler seeds a deduplication set from the first
 query's results before executing the second filter. This avoids a membership

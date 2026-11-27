@@ -1097,12 +1097,9 @@ query_authed :: proc(
 			}
 		}
 
-		// 11. NIP-09: tombstone check — only entries that matched the filter
-		//     pay the map-key hash.
-		if has_tombstones {
-			if v, ok := s.tombstones.map_[id^]; ok && v.confirmed {
-				continue
-			}
+		// 11. NIP-09: most matching IDs can skip the tombstone map lookup.
+		if has_tombstones && tombstone_confirmed(&s.tombstones, id^) {
+			continue
 		}
 
 		// 12. Exact heap tiebreak (created_at == worst requires id comparison).
@@ -1518,7 +1515,7 @@ scan_count_at :: proc(
 			continue
 		}
 		if check_dead || .Protected in flags || .Covered not_in flags {
-			if v, ok := s.tombstones.map_[entry.id]; ok && v.confirmed {
+			if tombstone_confirmed(&s.tombstones, entry.id) {
 				continue
 			}
 			if entry.pubkey in s.vanished && !entry.no_delete && entry.kind != nostr.KIND_VANISH {
@@ -1778,7 +1775,7 @@ collect_negentropy :: proc(
 			}
 			// NIP-09: skip tombstoned events.
 			if check_dead || .Protected in flags || .Covered not_in flags {
-				if v, ok := s.tombstones.map_[entry.id]; ok && v.confirmed {
+				if tombstone_confirmed(&s.tombstones, entry.id) {
 					continue
 				}
 				// NIP-62: skip events from vanished pubkeys.

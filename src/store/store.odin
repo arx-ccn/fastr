@@ -443,8 +443,7 @@ store_is_tombstoned :: proc(s: ^Store, id: [32]u8) -> bool {
 		}
 	}
 	sync.shared_guard(&s.tombstones_mu)
-	v, ok := s.tombstones.map_[id]
-	return ok && v.confirmed
+	return tombstone_confirmed(&s.tombstones, id)
 }
 
 // Check if a pubkey has been vanished (NIP-62).

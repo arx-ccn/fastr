@@ -298,6 +298,7 @@ test_nip09_e_tag_deletion_k_tag_filter_survives_restart :: proc(t: ^testing.T) {
 		s := test_open(t, dir)
 		e1 := test_make_event(1, 1, 1_000, nil)
 		e0 := test_make_event(1, 0, 2_000, nil)
+		copy(e0.id[:2], e1.id[:2])
 		test_append_ok(t, s, &e1)
 		test_append_ok(t, s, &e0)
 		e1_id = e1.id
@@ -320,6 +321,11 @@ test_nip09_e_tag_deletion_k_tag_filter_survives_restart :: proc(t: ^testing.T) {
 	defer store_close(s)
 	testing.expect(t, store_is_tombstoned(s, e1_id), "kind-1 tombstone survives restart")
 	testing.expect(t, !store_is_tombstoned(s, e0_id), "kind-0 stays untombstoned (k-tag filtered)")
+	f := test_kind_filter(0, 1)
+	c := collect_ctx_init()
+	testing.expect_value(t, query_authed(s, &f, nil, &c, collect_cb), Error.None)
+	testing.expect_value(t, len(c.ids), 1)
+	testing.expect(t, ids_contain(c.ids[:], e0_id), "prefix collision cannot hide kind-0")
 }
 
 @(test)

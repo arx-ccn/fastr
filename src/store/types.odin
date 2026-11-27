@@ -77,7 +77,7 @@ Addressable_Coord :: struct {
 }
 
 // Set of 32-byte keys (pubkeys / event ids).
-Key_Set :: map[[32]u8]struct {}
+Key_Set :: map[[32]u8]struct{}
 
 // One (value bytes, value_len) pair of a tag filter spec.
 // value_len 0xFF (VALUE_LEN_HASHED) means `bytes` holds a SHA-256 hash.
@@ -108,6 +108,7 @@ Tombstone_Map :: map[[32]u8]Tombstone_Value
 // (preemptive) entries and total candidate pubkeys, avoiding O(N) scans.
 Tombstone_Tracker :: struct {
 	map_:                     Tombstone_Map,
+	confirmed_prefixes:       [1024]u64, // one bit per two-byte ID prefix
 	// Number of entries that are preemptive.
 	pending_entries_count:    int,
 	// Total candidate pubkeys across all preemptive entries.
@@ -116,14 +117,41 @@ Tombstone_Tracker :: struct {
 
 tombstone_tracker_init :: proc(t: ^Tombstone_Tracker, m: Tombstone_Map) {
 	t.map_ = m
+	t.confirmed_prefixes = {}
 	t.pending_entries_count = 0
 	t.pending_candidates_count = 0
-	for _, v in m {
-		if !v.confirmed {
+	for id, v in m {
+		if v.confirmed {
+			tombstone_mark_prefix(t, id)
+		} else {
 			t.pending_entries_count += 1
 			t.pending_candidates_count += len(v.candidates)
 		}
 	}
+}
+
+@(private = "file")
+tombstone_prefix_bit :: #force_inline proc(id: [32]u8) -> (word: int, mask: u64) {
+	key := int(id[0]) | (int(id[1]) << 8)
+	return key >> 6, u64(1) << uint(key & 63)
+}
+
+@(private = "file")
+tombstone_mark_prefix :: #force_inline proc(t: ^Tombstone_Tracker, id: [32]u8) {
+	word, mask := tombstone_prefix_bit(id)
+	t.confirmed_prefixes[word] |= mask
+}
+
+// A miss rules out a tombstone. A hit still needs the full ID and map value.
+// Bits stay set after removal until the tracker is rebuilt. Hold its read lock.
+@(private)
+tombstone_confirmed :: #force_inline proc(t: ^Tombstone_Tracker, id: [32]u8) -> bool {
+	word, mask := tombstone_prefix_bit(id)
+	if t.confirmed_prefixes[word] & mask == 0 {
+		return false
+	}
+	v, found := t.map_[id]
+	return found && v.confirmed
 }
 
 tombstone_tracker_destroy :: proc(t: ^Tombstone_Tracker) {
@@ -147,7 +175,10 @@ tombstone_insert_confirmed :: proc(t: ^Tombstone_Tracker, id: [32]u8) -> bool {
 		t.pending_candidates_count -= len(prior.candidates)
 		delete(prior.candidates)
 	}
-	t.map_[id] = Tombstone_Value{confirmed = true}
+	t.map_[id] = Tombstone_Value {
+		confirmed = true,
+	}
+	tombstone_mark_prefix(t, id)
 	return true
 }
 
@@ -156,7 +187,10 @@ tombstone_insert_confirmed :: proc(t: ^Tombstone_Tracker, id: [32]u8) -> bool {
 tombstone_insert_preemptive_new :: proc(t: ^Tombstone_Tracker, id: [32]u8, pubkey: [32]u8) {
 	set := make(Key_Set)
 	set[pubkey] = {}
-	t.map_[id] = Tombstone_Value{confirmed = false, candidates = set}
+	t.map_[id] = Tombstone_Value {
+		confirmed  = false,
+		candidates = set,
+	}
 	t.pending_entries_count += 1
 	t.pending_candidates_count += 1
 }
@@ -198,7 +232,9 @@ Tombstone_Prior :: struct {
 tombstone_restore_prior :: proc(t: ^Tombstone_Tracker, id: [32]u8, prior: Tombstone_Prior) {
 	tombstone_remove(t, id)
 	if prior.present {
-		if !prior.value.confirmed {
+		if prior.value.confirmed {
+			tombstone_mark_prefix(t, id)
+		} else {
 			t.pending_entries_count += 1
 			t.pending_candidates_count += len(prior.value.candidates)
 		}
