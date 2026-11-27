@@ -33,7 +33,7 @@ nd_visible :: proc(t: ^testing.T, s: ^Store, ev: ^pack.Event) {
 }
 
 // Write records exactly as a pre-support relay did, including no marker bit.
-@(private = "file")
+@(private)
 nd_legacy :: proc(t: ^testing.T, dir: string, events: ..pack.Event) {
 	data, de := open_rw(path_join(dir, "data.n"))
 	idx, ie := open_rw(path_join(dir, "index.o"))

@@ -454,6 +454,10 @@ hide_reactions :: proc(
 test_author_postings_match_scan :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
+	// Append refuses an expired event, so one from a's past is written the
+	// way an earlier run would have left it.
+	expired := test_make_event(1, 1, 1045, test_tags(test_expiry_tag(1)))
+	nd_legacy(t, dir, expired)
 	s := test_open(t, dir)
 	defer store_close(s)
 	a, b, reader := test_pubkey(1), test_pubkey(2), test_pubkey(9)
@@ -492,7 +496,7 @@ test_author_postings_match_scan :: proc(t: ^testing.T) {
 			anonymous,
 			[][32]u8{deletion.id, reaction.id, tied[0].id, tied[1].id, old.id, backdated.id},
 		),
-		"newest first, lower id on a tie; deleted, protected and wrapped events hidden",
+		"newest first, lower id on a tie; deleted, protected, wrapped and expired events hidden",
 	)
 	as_reader := test_query_ids(t, s, &by_a, {reader})
 	testing.expect(t, ids_contain(as_reader, to_reader.id), "a recipient reads its gift wrap")
