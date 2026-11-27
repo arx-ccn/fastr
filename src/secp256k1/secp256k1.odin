@@ -75,12 +75,29 @@ init :: proc() {
 	assert(g_ctx != nil, "secp256k1 context_create failed")
 }
 
+// Parsed keys by first pubkey byte, one table per thread. Parsing takes a
+// field square root, about a tenth of a verification, and a connection
+// mostly verifies the same few authors.
+@(private)
+Parsed_Key :: struct {
+	pubkey32: [32]u8,
+	parsed:   Xonly_Pubkey,
+	valid:    bool,
+}
+
+@(private, thread_local)
+parsed_keys: [256]Parsed_Key
+
 // Verify a BIP-340 Schnorr signature over a 32-byte message (the event id)
 // against a 32-byte x-only pubkey. Returns false on malformed pubkey too.
 verify :: proc(sig: ^[64]u8, msg32: ^[32]u8, pubkey32: ^[32]u8) -> bool {
-	pk: Xonly_Pubkey
-	if xonly_pubkey_parse(g_ctx, &pk, &pubkey32[0]) != 1 {
+	key := &parsed_keys[pubkey32[0]]
+	if !key.valid || key.pubkey32 != pubkey32^ {
+		key.valid = xonly_pubkey_parse(g_ctx, &key.parsed, &pubkey32[0]) == 1
+		key.pubkey32 = pubkey32^
+	}
+	if !key.valid {
 		return false
 	}
-	return schnorrsig_verify(g_ctx, &sig[0], &msg32[0], 32, &pk) == 1
+	return schnorrsig_verify(g_ctx, &sig[0], &msg32[0], 32, &key.parsed) == 1
 }
