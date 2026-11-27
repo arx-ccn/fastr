@@ -47,12 +47,13 @@ scans as before. `POSTINGS_INDEX_SHARE` in `src/store/query.odin` records the
 measurement behind that cutoff. Exact-ID lookups and authenticated gift-wrap
 inbox reads keep their own paths and take precedence. A query also scans
 while the postings do not match its snapshot of the index, which lasts from a
-compaction swap until the rebuild that follows it. Author prefixes, tag
-filters, and `kinds` filters other than that inbox read still scan.
+compaction swap until the rebuild that follows it. A filter without full
+author keys still scans: author prefixes, tags, and `kinds` select no
+postings on their own, apart from that inbox read.
 
 A posting is 12 bytes. Every event has one under its author, and a gift wrap
 has one more under each recipient. The maps, lists, and runs that hold them
-come on top; the benchmark notes record the measured growth.
+come on top.
 
 The in-process performance fixtures exercise fanout, exact-ID and broad store
 queries, REQ handling, subscription replacement, recipient lookup, and author

@@ -561,12 +561,14 @@ from process start, in millions. Three passes.
 |---|---:|---:|
 | Cycles to first EOSE | 5,027–5,299 | 6,668–6,877 |
 | Instructions to first EOSE | 10,270–10,287 | 14,817–14,851 |
-| Anonymous RSS at first EOSE, MB | 539.0–539.4 | 135.8–137.1 |
+| Anonymous RSS at first EOSE, MiB | 526.4–526.8 | 132.7–133.9 |
 
 Boot sorts each author's postings by time. The eight connections interleaved
 this data set, so the sort had work to do. On 400,000 events from one author,
 stored in time order, boot took 976–982 million cycles before and
-960–1,001 million after, and RSS fell from 271.3–271.7 MB to 62.3–64.4 MB.
+960–1,001 million after, and RSS fell from 264.9–265.3 MiB to 60.9–62.9 MiB.
+The RSS figures cover both changes together: the boot ID map that is now
+freed, and the postings that are now kept.
 
 These runs do not cover kernel cycles, cold page cache, deletions, more than
 nine authors over the wire, or queries during compaction. The in-process
