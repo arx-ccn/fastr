@@ -190,6 +190,29 @@ test_decode_masked_hello :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_mask_across_input_chunks :: proc(t: ^testing.T) {
+	msg := "0123456789abcdefghijklmnopqrstuvwxyz!?"
+	frames: [dynamic]u8
+	defer delete(frames)
+	push_client_frame(&frames, .Text, bytes_of(msg))
+	r: Reader
+	reader_init(&r, 1024)
+	defer reader_destroy(&r)
+	// The first input contains the header and three payload bytes. The
+	// remaining payload has a shifted key and fits both vector and tail loads.
+	split := 9
+	event, consumed, err := reader_feed(&r, frames[:split])
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, event, Event.None)
+	testing.expect_value(t, consumed, split)
+	event, consumed, err = reader_feed(&r, frames[split:])
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, event, Event.Message)
+	testing.expect_value(t, consumed, len(frames) - split)
+	testing.expect_value(t, string(reader_message(&r)), msg)
+}
+
+@(test)
 test_decode_fragmented_message :: proc(t: ^testing.T) {
 	frames: [dynamic]u8
 	defer delete(frames)

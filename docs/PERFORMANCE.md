@@ -55,6 +55,9 @@ needs event payloads for covered entries;
 content search and read-policy hooks still need the records. Recipient-only
 mode requires authentication as the requested key. The relay rebuilds the
 covering metadata at startup and after compaction without changing disk format.
+NIP-77 merges fully covered mailbox runs and visits timestamp groups oldest
+first without sorting the matched IDs again. If the filter can require a
+record read, it keeps the original traversal and sorts the result.
 
 A filter whose `authors` are all full 32-byte keys reads those authors'
 postings: in-memory runs of index slots, newest first, built at boot and
@@ -138,10 +141,15 @@ Client `EVENT` and `AUTH` messages, relay `EVENT` messages, bare JSONL
 events and HTTP auth events use the same field decoder. It reads the
 seven event fields without building a JSON object tree. Tag strings and
 content belong to the caller's allocator; the input buffer can be reused.
-The decoder checks the syntax of unknown fields and trailing envelope
-elements. The GRASP watcher still requires exactly three envelope elements.
-Duplicate keys, trailing commas, trailing data and
-out-of-range timestamps or kinds are rejected before ingest.
+The event decoder checks unknown fields and trailing envelope elements. The
+GRASP watcher still requires exactly three envelope elements. Duplicate keys,
+trailing commas, trailing data, and out-of-range timestamps or kinds are
+rejected before ingest.
+
+REQ, COUNT, CLOSE, and NIP-77 requests use simdjson On-Demand for standard
+filter fields. The relay copies returned strings into its own allocator.
+Frames above 16 KiB, NIP-50 search, extension fields, and inputs the fast
+path rejects use the original JSON decoder and error replies.
 
 Before it checks a signature, `ingest_event` asks the store whether an event
 with the same ID and the same signature was appended since the store was
@@ -159,8 +167,11 @@ root, about a tenth of a verification.
 
 The reader thread frames OK, NOTICE, CLOSED, COUNT, AUTH, and NEG-* replies
 and writes them with a nonblocking send when the socket has no frame pending.
-Otherwise the writer thread sends them in order. Stored-event replays already
-took this path.
+Otherwise the writer thread sends them in order. Replies and stored-event
+replays reuse the same buffer after a completed send. WebSocket unmasking
+copies 16 bytes at a time and preserves the mask offset across reads.
+After NEG-CLOSE, each connection can reuse one inventory with space for at
+most 64 items. Reconciliation replies use message scratch until framed.
 
 [Measurements](BENCHMARKS.md#ingest-replies-and-author-postings-2026-11-27)
 cover ingest, author filters, boot time, and memory.

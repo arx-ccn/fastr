@@ -46,6 +46,7 @@ Conn_State :: struct {
 	live_count:       int, // reader owns admission; the fanout owns subscription IDs
 	replay_spare:     [dynamic]u8, // empty unless the reader completed the last write
 	neg_subs:         map[string]^Neg_Session, // heap-owned keys and sessions
+	neg_spare:        ^Neg_Session,
 }
 
 // ---------------------------------------------------------------------------
@@ -56,41 +57,53 @@ Conn_State :: struct {
 @(private)
 REPLY_HEADER_LEN :: 2
 
+@(private)
+reply_buffer :: proc(cs: ^Conn_State, header, capacity: int) -> [dynamic]u8 {
+	buf := cs.replay_spare
+	cs.replay_spare = nil
+	if buf == nil {
+		return make([dynamic]u8, header, capacity)
+	}
+	reserve(&buf, capacity)
+	non_zero_resize(&buf, header)
+	return buf
+}
+
 // Frame a JSON reply written after `reserved` header bytes and hand it to the
 // outbox, which writes it at once when the socket is idle. Frees it if the
 // outbox is closed or full (a dropped reply means the socket is going away).
 @(private)
 send_reply :: proc(cs: ^Conn_State, buf: ^[dynamic]u8, reserved := REPLY_HEADER_LEN) {
 	finish_text_frame(buf, 0, reserved)
-	if !outbox_send(cs.outbox, Out_Msg(Out_Batch{wire = buf^})) {
+	if !outbox_send(cs.outbox, Out_Msg(Out_Batch{wire = buf^}), &cs.replay_spare) {
 		delete(buf^)
 	}
 }
 
 @(private)
 send_ok :: proc(cs: ^Conn_State, id: ^[32]u8, accepted: bool, reason: string) {
-	buf := make([dynamic]u8, REPLY_HEADER_LEN, 128)
+	buf := reply_buffer(cs, REPLY_HEADER_LEN, 128)
 	nostr.write_ok_json(&buf, id, accepted, reason)
 	send_reply(cs, &buf)
 }
 
 @(private)
 send_notice :: proc(cs: ^Conn_State, message: string) {
-	buf := make([dynamic]u8, REPLY_HEADER_LEN, 64)
+	buf := reply_buffer(cs, REPLY_HEADER_LEN, 64)
 	nostr.write_notice_json(&buf, message)
 	send_reply(cs, &buf)
 }
 
 @(private)
 send_closed :: proc(cs: ^Conn_State, sub_id: string, message: string) {
-	buf := make([dynamic]u8, REPLY_HEADER_LEN, 128)
+	buf := reply_buffer(cs, REPLY_HEADER_LEN, 128)
 	nostr.write_closed_json(&buf, sub_id, message)
 	send_reply(cs, &buf)
 }
 
 @(private)
 send_neg_err :: proc(cs: ^Conn_State, sub_id: string, reason: string, max_records := -1) {
-	buf := make([dynamic]u8, REPLY_HEADER_LEN, 128)
+	buf := reply_buffer(cs, REPLY_HEADER_LEN, 128)
 	nostr.write_neg_err_json(&buf, sub_id, reason, max_records)
 	send_reply(cs, &buf)
 }
@@ -101,7 +114,7 @@ send_neg_msg :: proc(cs: ^Conn_State, sub_id: string, msg: []u8) {
 	// have, so a large message is framed without moving it.
 	hdr: [MAX_FRAME_HEADER_LEN]u8 = ---
 	reserved := encode_frame_header(hdr[:], .Text, len(msg) * 2)
-	buf := make([dynamic]u8, reserved, reserved + 128 + len(msg) * 2)
+	buf := reply_buffer(cs, reserved, reserved + 128 + len(msg) * 2)
 	nostr.write_neg_msg_json(&buf, sub_id, msg)
 	send_reply(cs, &buf, reserved)
 }
@@ -282,6 +295,9 @@ handle_connection :: proc(
 			delete(sub_id)
 		}
 		delete(cs.neg_subs)
+		if cs.neg_spare != nil {
+			neg_session_destroy(cs.neg_spare)
+		}
 		auth_state_destroy(&cs.auth)
 		free_all(context.temp_allocator)
 	}
@@ -324,7 +340,7 @@ plain_ws_loop :: proc(cs: ^Conn_State) {
 
 @(private)
 begin_auth :: proc(cs: ^Conn_State) {
-	buf := make([dynamic]u8, REPLY_HEADER_LEN, 96)
+	buf := reply_buffer(cs, REPLY_HEADER_LEN, 96)
 	append(&buf, "[\"AUTH\",\"")
 	append(&buf, cs.auth.challenge)
 	append(&buf, "\"]")
@@ -452,8 +468,17 @@ remove_live_sub :: proc(cs: ^Conn_State, sub_id: string) {
 remove_neg_session :: proc(cs: ^Conn_State, sub_id: string) {
 	if session, found := cs.neg_subs[sub_id]; found {
 		key, _ := delete_key(&cs.neg_subs, sub_id)
-		neg_session_destroy(session)
 		delete(key)
+		// Keep at most one small inventory per connection after NEG-CLOSE.
+		SPARE_RECORDS :: 64
+		if cs.neg_spare == nil && cap(session.storage.items) <= SPARE_RECORDS {
+			clear(&session.storage.items)
+			session.storage.sealed = false
+			session.neg = {}
+			cs.neg_spare = session
+		} else {
+			neg_session_destroy(session)
+		}
 	}
 }
 
@@ -732,7 +757,7 @@ handle_count :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 		return
 	}
 	total := store.count_filters(cs.relay.store, filters, access.principal.auth_pks, access)
-	buf := make([dynamic]u8, REPLY_HEADER_LEN, 96)
+	buf := reply_buffer(cs, REPLY_HEADER_LEN, 96)
 	append(&buf, "[\"COUNT\",")
 	pack.write_json_str(sub_id, &buf)
 	append(&buf, ",{\"count\":")
@@ -831,8 +856,12 @@ handle_neg_open :: proc(cs: ^Conn_State, sub_id: string, filter: ^nostr.Filter, 
 		return
 	}
 
-	session := new(Neg_Session)
-	session.storage = negentropy.storage_make()
+	session := cs.neg_spare
+	cs.neg_spare = nil
+	if session == nil {
+		session = new(Neg_Session)
+		session.storage = negentropy.storage_make()
+	}
 
 	fill := Neg_Fill_Ctx {
 		storage = &session.storage,
@@ -875,14 +904,13 @@ handle_neg_open :: proc(cs: ^Conn_State, sub_id: string, filter: ^nostr.Filter, 
 	}
 	session.neg = neg
 
-	reply, rec_err := negentropy.reconcile(&session.neg, msg)
+	reply, rec_err := negentropy.reconcile(&session.neg, msg, context.temp_allocator)
 	if rec_err != .None {
 		send_neg_err(cs, sub_id, neg_error_reason(rec_err))
 		neg_session_destroy(session)
 		return
 	}
 	send_neg_msg(cs, sub_id, reply)
-	delete(reply)
 	// Session lives until the client sends NEG-CLOSE.
 	cs.neg_subs[strings.clone(sub_id)] = session
 }
@@ -894,12 +922,11 @@ handle_neg_msg :: proc(cs: ^Conn_State, sub_id: string, msg: []u8) {
 		send_neg_err(cs, sub_id, "session not found")
 		return
 	}
-	reply, err := negentropy.reconcile(&session.neg, msg)
+	reply, err := negentropy.reconcile(&session.neg, msg, context.temp_allocator)
 	if err != .None {
 		send_neg_err(cs, sub_id, neg_error_reason(err))
 		remove_neg_session(cs, sub_id)
 		return
 	}
 	send_neg_msg(cs, sub_id, reply)
-	delete(reply)
 }

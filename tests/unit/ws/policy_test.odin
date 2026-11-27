@@ -243,6 +243,61 @@ test_request_and_live_policy :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_neg_close_then_open :: proc(t: ^testing.T) {
+	dir, derr := os.make_directory_temp("", "fastr_neg_reopen_*", context.allocator)
+	assert(derr == nil)
+	defer {os.remove_all(dir); delete(dir)}
+	st, serr := store.store_open(dir)
+	assert(serr == .None)
+	defer store.store_close(st)
+	ev := fixtures.signed_event(1, 1, 1000)
+	aerr, _ := store.store_append(st, &ev)
+	assert(aerr == .None)
+	r := Relay {
+		store = st,
+		cfg = {
+			max_subscriptions_per_conn = 1,
+			max_filter_values = 1,
+			max_neg_records = 10,
+			max_message_bytes = DEFAULT_MAX_MESSAGE_BYTES,
+			max_subid_length = 64,
+		},
+	}
+	ch, err := chan.create(chan.Chan(Out_Msg), 8, context.allocator)
+	assert(err == nil)
+	defer chan.destroy(ch)
+	o := Outbox {
+		ch = ch,
+	}
+	cs := Conn_State {
+		relay  = &r,
+		outbox = &o,
+	}
+	defer {
+		remove_neg_session(&cs, "n")
+		if cs.neg_spare != nil {neg_session_destroy(cs.neg_spare)}
+		delete(cs.neg_subs)
+	}
+
+	dispatch_text(&cs, `["NEG-OPEN","n",{"kinds":[1]},"6100000200"]`)
+	msg, got := chan.try_recv(ch)
+	assert(got)
+	testing.expect(t, strings.has_prefix(reply_json(msg), `["NEG-MSG","n","6100000201`))
+	drop_msg(msg)
+	dispatch_text(&cs, `["NEG-CLOSE","n"]`)
+	dispatch_text(&cs, `["NEG-MSG","n","6100000200"]`)
+	msg, got = chan.try_recv(ch)
+	assert(got)
+	testing.expect_value(t, reply_json(msg), `["NEG-ERR","n","session not found"]`)
+	drop_msg(msg)
+	dispatch_text(&cs, `["NEG-OPEN","n",{"kinds":[2]},"6100000200"]`)
+	msg, got = chan.try_recv(ch)
+	assert(got)
+	testing.expect_value(t, reply_json(msg), `["NEG-MSG","n","6100000200"]`)
+	drop_msg(msg)
+}
+
+@(test)
 test_marked_ingress_validate :: proc(t: ^testing.T) {
 	dir, derr := os.make_directory_temp("", "fastr_marker_ingress_*", context.allocator)
 	assert(derr == nil)

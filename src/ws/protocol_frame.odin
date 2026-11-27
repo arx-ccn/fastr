@@ -17,6 +17,8 @@
 // every byte twice on the hot path for no benefit.
 package ws
 
+import "base:intrinsics"
+
 // Default cap on an assembled message (the FASTR_MAX_MESSAGE_BYTES default,
 // 2 MiB).
 DEFAULT_MAX_MESSAGE_BYTES :: 2 * 1024 * 1024
@@ -123,11 +125,17 @@ copy_masked :: proc(dst, src: []u8, mask: [4]u8, offset: u64) {
 		mask[(offset + 2) & 3],
 		mask[(offset + 3) & 3],
 	}
+	word := transmute(u32)key
+	Mask_Vector :: #simd[4]u32
+	wide := Mask_Vector{word, word, word, word}
 	i := 0
+	for ; i + 16 <= len(src); i += 16 {
+		chunk := intrinsics.unaligned_load((^Mask_Vector)(&src[i]))
+		intrinsics.unaligned_store((^Mask_Vector)(&dst[i]), intrinsics.simd_bit_xor(chunk, wide))
+	}
 	for ; i + 4 <= len(src); i += 4 {
-		#unroll for j in 0 ..< 4 {
-			dst[i + j] = src[i + j] ~ key[j]
-		}
+		chunk := intrinsics.unaligned_load((^u32)(&src[i]))
+		intrinsics.unaligned_store((^u32)(&dst[i]), chunk ~ word)
 	}
 	for ; i < len(src); i += 1 {
 		dst[i] = src[i] ~ key[i & 3]
