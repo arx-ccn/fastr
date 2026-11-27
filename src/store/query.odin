@@ -433,6 +433,15 @@ tag_chain_next :: proc(
 	return {}, false
 }
 
+// Whether every event at or below `slot` is older than `ts`. False when the
+// ceiling cannot tell: it describes another layout than `layout`, the one
+// the query's snapshot was taken in, or it ends before `slot`.
+@(private)
+ceiling_below :: proc(s: ^Store, slot: int, layout: u64, ts: i64) -> bool {
+	sync.shared_guard(&s.scan_ceiling_mu)
+	return s.ceiling_layout == layout && slot < len(s.scan_ceiling) && s.scan_ceiling[slot] < ts
+}
+
 // Where a scan bounded by since or until goes on from slot `i`, the highest
 // slot of its block left to visit: the highest slot at or below `i` whose
 // block may hold a match. Reports false when no slot below can match.
@@ -448,15 +457,18 @@ zone_entry :: proc(
 	found: bool,
 ) {
 	sync.shared_guard(&s.scan_ceiling_mu)
+	if s.ceiling_layout != layout {
+		return i, true
+	}
 	floor, has_floor := since.?
 	newest, bounded := until.?
 	for entry = i; entry >= 0; {
-		// The ceiling bounds every slot from here down, in any layout.
+		// The ceiling bounds every slot from here down.
 		if has_floor && entry < len(s.scan_ceiling) && s.scan_ceiling[entry] < floor {
 			return entry, false
 		}
 		block := entry / ZONE_SLOTS
-		if s.zones_layout != layout || block >= len(s.zones) {
+		if block >= len(s.zones) {
 			return entry, true
 		}
 		zone := s.zones[block]
@@ -817,13 +829,7 @@ query_authed :: proc(
 		//    1024 slots down.
 		if pq.len(heap) == limit && (i & 1023 == 1023 || use_tags && i + 1024 <= ceiling_checked) {
 			ceiling_checked = i
-			worst_ts := pq.peek(heap).created_at
-			stop: bool
-			{
-				sync.shared_guard(&s.scan_ceiling_mu)
-				stop = i < len(s.scan_ceiling) && s.scan_ceiling[i] < worst_ts
-			}
-			if stop {
+			if ceiling_below(s, i, layout, pq.peek(heap).created_at) {
 				break
 			}
 		}
@@ -1017,13 +1023,7 @@ query_authed :: proc(
 		if pq.len(heap) == limit && i > 0 {
 			// Check immediately on first fill instead of scanning to the
 			// next 1024-slot boundary. Ties still require further scanning.
-			stop: bool
-			{
-				sync.shared_guard(&s.scan_ceiling_mu)
-				stop =
-					i - 1 < len(s.scan_ceiling) && s.scan_ceiling[i - 1] < pq.peek(heap).created_at
-			}
-			if stop {
+			if ceiling_below(s, i - 1, layout, pq.peek(heap).created_at) {
 				break
 			}
 		}

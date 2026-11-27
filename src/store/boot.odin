@@ -36,7 +36,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 		clear(&s.scan_ceiling)
 		reserve(&s.scan_ceiling, total)
 		clear(&s.zones)
-		s.zones_layout = s.layout
+		s.ceiling_layout = s.layout
 		s.session_slot = total
 		postings_destroy(&s.postings)
 		tags := tags_g.data

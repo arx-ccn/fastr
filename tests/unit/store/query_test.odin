@@ -797,6 +797,19 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 		chains.links.links[oldest_rare].prev = TAG_NONE
 		testing.expect(t, slice.equal(joined, shared), "records of another value must not match")
 
+		// Compaction publishes the ceiling of its new layout while a query
+		// may still read the old files. A ceiling of another layout must not
+		// stop a chain at `since` or at a full heap, whatever it holds.
+		since_ids := test_query_ids(t, s, &filters[7], nil)
+		newest_ids := test_query_ids(t, s, &newest_two, nil)
+		ceiling := slice.clone(s.scan_ceiling[:], context.temp_allocator)
+		slice.fill(s.scan_ceiling[:], min(i64))
+		s.ceiling_layout += 1
+		testing.expect(t, slice.equal(test_query_ids(t, s, &filters[7], nil), since_ids))
+		testing.expect(t, slice.equal(test_query_ids(t, s, &newest_two, nil), newest_ids))
+		s.ceiling_layout -= 1
+		copy(s.scan_ceiling[:], ceiling)
+
 		for &f, fi in filters {
 			for auth in ([][][32]u8{nil, {reader}, {a}}) {
 				for access in ([]policy.Read_Access{{}, {check = hide_reactions}}) {
@@ -940,8 +953,7 @@ test_time_zones_skip_blocks :: proc(t: ^testing.T) {
 		}
 
 		// Only a wrong zone shows that the scan consults them: with block 1
-		// marked too new, its events go missing. A zone built for another
-		// layout must be ignored, wrong or not.
+		// marked too new, its events go missing.
 		f := nostr.Filter {
 			until = 11_500,
 			limit = 50,
@@ -954,13 +966,33 @@ test_time_zones_skip_blocks :: proc(t: ^testing.T) {
 			!slice.equal(test_query_ids(t, s, &f, nil), want),
 			"zones must be consulted",
 		)
-		s.zones_layout += 1
-		testing.expect(
-			t,
-			slice.equal(test_query_ids(t, s, &f, nil), want),
-			"stale zones must be ignored",
-		)
-		s.zones_layout -= 1
+
+		// Compaction publishes the zones and the ceiling of its new layout
+		// while a query may still read the old files. Built for another
+		// layout, neither may pass a block, end a scan at `since`, or end it
+		// at a full heap, whatever they hold.
+		ceiling := slice.clone(s.scan_ceiling[:], context.temp_allocator)
+		slice.fill(s.scan_ceiling[:], min(i64))
+		s.ceiling_layout += 1
+		for w, wi in ([]Window{{0, 11_500, 50}, {12_900, max(i64), 500}, {0, max(i64), 10}}) {
+			stale := nostr.Filter {
+				since = w.since,
+				until = w.until,
+				limit = w.limit,
+			}
+			testing.expectf(
+				t,
+				slice.equal(
+					test_query_ids(t, s, &stale, nil),
+					test_newest_within(stored[:], w.since, w.until, w.limit),
+				),
+				"phase %d stale window %d",
+				phase,
+				wi,
+			)
+		}
+		s.ceiling_layout -= 1
+		copy(s.scan_ceiling[:], ceiling)
 		s.zones[1] = honest
 	}
 }

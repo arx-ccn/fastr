@@ -90,19 +90,21 @@ Store :: struct {
 	// survivor, no remaining entry can enter the top-N — the scan stops.
 	// Ordering invariant: appends push here BEFORE publishing the index
 	// length; compaction swaps the rebuilt array in BEFORE publishing the
-	// shrunken index. A reader may therefore see a ceiling that is longer or
-	// newer than its index snapshot (safe: post-compact values still bound
-	// every entry the snapshot can serve) but never a stale shorter one
-	// (readers skip the test for slots past len(scan_ceiling)).
+	// shrunken index. A reader may therefore see a ceiling that is longer
+	// than its index snapshot but never a stale shorter one (readers skip the
+	// test for slots past len(scan_ceiling)).
 	scan_ceiling_mu:        sync.RW_Mutex,
 	scan_ceiling:           [dynamic]i64,
 	// Oldest and newest created_at of each block of ZONE_SLOTS index slots,
 	// under scan_ceiling_mu. A scan bounded by since or until passes over a
-	// block whose range rules it out. A zone describes slots, and a
-	// compaction renumbers them, so readers use the zones only while
-	// zones_layout equals the layout their snapshot was taken in.
+	// block whose range rules it out.
 	zones:                  [dynamic]Time_Zone,
-	zones_layout:           u64,
+	// The layout that scan_ceiling and zones describe, under scan_ceiling_mu.
+	// Compaction renumbers the slots and drops events that a query pinned to
+	// the old files can still serve, such as one that expired after the query
+	// began. Readers use the ceiling and the zones only while this equals the
+	// layout their snapshot was taken in.
+	ceiling_layout:         u64,
 	// Counts compaction swaps; under known_ids_mu.
 	layout:                 u64,
 	// Store directory path (owned copy) - needed for compaction temp files.
