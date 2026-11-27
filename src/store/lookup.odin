@@ -7,6 +7,7 @@ package store
 import "core:encoding/endian"
 import "core:sync"
 
+import "../nostr"
 import "../pack"
 
 // Whether an event with this id and this exact signature was appended since
@@ -98,7 +99,7 @@ event_by_id :: proc(
 	}
 
 	entry := index_entry_at(idx, slot)
-	if index_entry_is_expired(&entry, unix_now()) {
+	if index_entry_is_expired(&entry, nostr.unix_now()) {
 		return {}, false
 	}
 	start, end, bok := blob_bounds(idx, slot, total, len(data_g.data), entry.offset)

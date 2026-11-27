@@ -207,7 +207,7 @@ test_boot_rebuild_count_addressable_not_double_counted :: proc(t: ^testing.T) {
 test_boot_rebuild_restores_expiry_taint :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
-	base_now := unix_now()
+	base_now := nostr.unix_now()
 	expire_at := base_now + 60
 	{
 		s := test_open(t, dir)

@@ -6,7 +6,6 @@ import "core:encoding/endian"
 import "core:os"
 import "core:strings"
 import "core:sync"
-import "core:time"
 
 // Static reason strings for (Error, reason) returns. They are sent verbatim
 // on the wire; the ws handler formats the NIP-01 OK/NEG-ERR reply from them.
@@ -115,11 +114,6 @@ Store :: struct {
 	// Nth on-disk write inside append_classified fails with .Io and the
 	// field resets to 0. Plain field accessed atomically; tests arm it.
 	fail_next_write:        u8,
-}
-
-// Current unix timestamp in seconds.
-unix_now :: proc() -> i64 {
-	return time.time_to_unix(time.now())
 }
 
 @(private)

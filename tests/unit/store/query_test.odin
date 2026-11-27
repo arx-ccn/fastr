@@ -1517,7 +1517,7 @@ test_count_kind_fastpath_drops_expired_entries :: proc(t: ^testing.T) {
 	s := test_open(t, dir)
 	defer store_close(s)
 
-	base_now := unix_now()
+	base_now := nostr.unix_now()
 	expire_at := base_now + 60
 
 	for sk in 1 ..= u8(5) {
@@ -1539,7 +1539,7 @@ test_count_author_only_filter_drops_expired_entries :: proc(t: ^testing.T) {
 	s := test_open(t, dir)
 	defer store_close(s)
 
-	base_now := unix_now()
+	base_now := nostr.unix_now()
 	expire_at := base_now + 60
 
 	pk: [32]u8

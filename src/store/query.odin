@@ -736,7 +736,7 @@ query_authed :: proc(
 	tag_end := len(tags_buf) / TAG_ENTRY_SIZE
 	walk: Tag_Walk = .Sparse if use_ids && !indexed_tags else .Sequential
 
-	now := unix_now()
+	now := nostr.unix_now()
 
 	// NIP-01: results must be the top-N by (created_at desc, id asc), not
 	// the last-N appended (#57, #108). Bounded heap whose root is the worst
@@ -1079,7 +1079,7 @@ query_authed :: proc(
 // NIP-45: count events matching a single filter (in-memory counters when
 // possible, exact scan otherwise).
 store_count :: proc(s: ^Store, filter: ^nostr.Filter) -> u64 {
-	return count_authors(s, filter, nil, unix_now(), {})
+	return count_authors(s, filter, nil, nostr.unix_now(), {})
 }
 
 count_filters :: proc(
@@ -1088,7 +1088,7 @@ count_filters :: proc(
 	auth_pks: [][32]u8,
 	access: policy.Read_Access = {},
 ) -> u64 {
-	return count_filters_at(s, filters, auth_pks, unix_now(), access)
+	return count_filters_at(s, filters, auth_pks, nostr.unix_now(), access)
 }
 
 // Same as count_filters but with an explicit `now`; used by the #117 expiry
@@ -1390,7 +1390,7 @@ iter_negentropy :: proc(
 		delete(tag_sets, context.temp_allocator)
 	}
 
-	now := unix_now()
+	now := nostr.unix_now()
 	items := make([dynamic]Neg_Item, context.temp_allocator)
 
 	{

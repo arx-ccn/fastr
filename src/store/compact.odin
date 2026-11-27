@@ -17,7 +17,7 @@ import "../nostr"
 // Returns the number of events retained after compaction.
 store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 	context.allocator = s.allocator
-	now := unix_now()
+	now := nostr.unix_now()
 
 	idx_g := mapped_file_slice(&s.index)
 	defer slice_release(idx_g)

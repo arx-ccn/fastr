@@ -15,9 +15,11 @@ import "core:time"
 import "../pack"
 import secp "../secp256k1"
 
-// Current unix timestamp in seconds.
-unix_now :: proc() -> i64 {
-	return time.time_to_unix(time.now())
+when ODIN_OS != .Linux || ODIN_ARCH == .i386 || ODIN_ARCH == .arm32 {
+	// Current Unix timestamp in seconds.
+	unix_now :: proc() -> i64 {
+		return time.time_to_unix(time.now())
+	}
 }
 
 // Decode exactly len(out) bytes from a lowercase hex string of length 2*len(out).

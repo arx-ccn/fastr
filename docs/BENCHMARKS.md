@@ -750,3 +750,26 @@ rose from 178–183k to 188–191k events/s; duplicate ingest rose from
 zero publisher errors. Raw output: `decoder-{base,final}-cpu.txt`,
 `decoder-base-1.txt`, `decoder-comparison.txt` and `decoder-final-ingest.txt` under
 `~/.cache/fastr-bench/juice/raw/`.
+
+## Linux vDSO wall clock
+
+Compared `469a61e6b242` with the libc clock change on a Ryzen AI Max+ 395
+with glibc 2.44. Both builds used the Odin `dev-2026-11a` release
+(`9a69916`) and `-o:speed`. The relay ran on CPUs 8–15 with a tmpfs store
+and no subscribers. The driver ran on CPUs 0–7.
+
+Five paired passes alternated build order. Each relay started with an empty
+store and received 400,000 events from eight `fastr-bench ingest` connections,
+then the same signed events again without restarting. All runs had zero
+publisher errors and retained exactly 400,000 index records.
+
+| Workload | Before median events/s (range) | After median events/s (range) | Median change |
+|---|---:|---:|---:|
+| Fresh ingest | 190,653 (181,961–191,248) | 192,571 (188,878–197,668) | +1.0% |
+| Duplicate ingest | 551,504 (539,156–561,370) | 546,158 (538,725–560,041) | -1.0% |
+
+Throughput ranges overlapped. A separate `strace -f -e trace=clock_gettime`
+run counted 10,000 relay syscalls before and zero after for each 10,000-event
+phase (fresh and duplicate). Startup counted one before and zero after.
+The timing runs were not traced. Raw results are in
+`~/.cache/fastr-bench/vdso-ulE6Ox/` (`timing.tsv` and `trace.tsv`).

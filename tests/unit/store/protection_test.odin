@@ -23,7 +23,7 @@ nd_visible :: proc(t: ^testing.T, s: ^Store, ev: ^pack.Event) {
 	testing.expect_value(t, store_count(s, &f), u64(1))
 	scan := f
 	scan.since = i64(0)
-	testing.expect_value(t, count_filters_at(s, {scan}, nil, unix_now()), u64(1))
+	testing.expect_value(t, count_filters_at(s, {scan}, nil, nostr.unix_now()), u64(1))
 	c = collect_ctx_init()
 	err, _ := iter_negentropy(s, &f, nil, 100, &c, nd_sync_cb)
 	testing.expect_value(t, err, Error.None)
@@ -363,7 +363,7 @@ test_nd_mixed_coordinate :: proc(t: ^testing.T) {
 		1,
 		1,
 		1000,
-		test_tags(test_tag("no_delete"), test_expiry_tag(unix_now() + 3600)),
+		test_tags(test_tag("no_delete"), test_expiry_tag(nostr.unix_now() + 3600)),
 	)
 	addressable := fixtures.signed_event(1, 30023, 1000, test_tags(test_tag("d", "entry")))
 	replaceable := fixtures.signed_event(1, 0, 1000)
@@ -484,7 +484,7 @@ test_nd_legacy_future_time :: proc(t: ^testing.T) {
 	marked := fixtures.signed_event(
 		1,
 		1,
-		unix_now() + nostr.CREATED_AT_WINDOW + 100,
+		nostr.unix_now() + nostr.CREATED_AT_WINDOW + 100,
 		test_tags(test_tag("no_delete")),
 	)
 	req := fixtures.signed_event(1, 5, 2000, test_tags(test_tag("e", test_hex(marked.id[:]))))

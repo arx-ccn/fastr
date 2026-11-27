@@ -234,7 +234,7 @@ append_classified :: proc(
 	// is persisted into the index entry so read paths can distinguish "had a
 	// tag" from "no tag" even when the stored expiry value is 0.
 	expiry_ts, has_expiry := nostr.event_expiry(ev)
-	if has_expiry && expiry_ts <= unix_now() {
+	if has_expiry && expiry_ts <= nostr.unix_now() {
 		return .Invalid_Event, REASON_EXPIRED
 	}
 	expiry := expiry_ts if has_expiry else 0

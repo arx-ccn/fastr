@@ -24,7 +24,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 	idx := idx_g.data
 	dtags_buf := dtags_g.data
 	total := index_entry_count(idx)
-	now := unix_now()
+	now := nostr.unix_now()
 
 	// Collect ALL event IDs for O(1) dedup, including tombstoned/vanished/
 	// expired ones. Same pass rebuilds the query early-exit ceiling (the
