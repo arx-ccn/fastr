@@ -1234,6 +1234,7 @@ Inventory_Walk :: struct {
 	idx, data, tags: []u8,
 	slots:           int,
 	mailbox:         bool,
+	key:             [32]u8,
 	cursors:         [dynamic]Posting_Cursor,
 	runs_left:       int,
 	next:            int,
@@ -1265,6 +1266,7 @@ inventory_open :: proc(
 	key, named := mailbox_key(&filters[0])
 	if named && (access.gift_wrap_read == .Public || pk_in(auth, key)) {
 		w.mailbox = true
+		w.key = key
 		w.cursors = make([dynamic]Posting_Cursor, context.temp_allocator)
 		cursors_pin(&w.cursors, s.postings.by_recipient[key])
 		w.runs_left = len(w.cursors)
@@ -1281,20 +1283,62 @@ inventory_close :: proc(s: ^Store, w: ^Inventory_Walk) {
 }
 
 @(private)
-inventory_next :: proc(w: ^Inventory_Walk) -> int {
+inventory_next :: proc(w: ^Inventory_Walk) -> (int, Posting_Flags) {
 	if !w.mailbox && w.next < w.slots {
 		w.next += 1
-		return w.next - 1
+		return w.next - 1, {}
 	}
 	for w.runs_left > 0 {
 		c := &w.cursors[w.runs_left - 1]
 		if c.next < len(c.run.slots) {
 			c.next += 1
-			return int(c.run.slots[c.next - 1].slot)
+			p := &c.run.slots[c.next - 1]
+			return int(p.slot), p.flags
 		}
 		w.runs_left -= 1
 	}
-	return -1
+	return -1, {}
+}
+
+@(private)
+mailbox_count :: proc(
+	s: ^Store,
+	f: ^nostr.Filter,
+	auth: [][32]u8,
+	access: policy.Read_Access,
+) -> Maybe(u64) {
+	if access.check != nil ||
+	   access.gift_wrap_read != .Public ||
+	   len(auth) != 0 ||
+	   f.ids != nil ||
+	   f.authors != nil ||
+	   f.since != nil ||
+	   f.until != nil ||
+	   f.search != nil {
+		return nil
+	}
+	key, named := mailbox_key(f)
+	if !named {
+		return nil
+	}
+	n: u32
+	{
+		sync.shared_guard(&s.known_ids_mu)
+		if s.postings.entries != int(mapped_file_load_len(&s.index) / INDEX_ENTRY_SIZE) ||
+		   s.postings.tag_bytes != int(mapped_file_load_len(&s.tags)) {
+			return nil
+		}
+		n = s.postings.by_recipient[key].literals
+	}
+	if n == max(u32) {
+		return nil
+	}
+	sync.shared_guard(&s.tombstones_mu)
+	sync.shared_guard(&s.vanished_mu)
+	if s.vanish_pending || key in s.mailbox_deleted {
+		return nil
+	}
+	return u64(n)
 }
 
 @(private)
@@ -1305,6 +1349,11 @@ scan_count_at :: proc(
 	now: i64,
 	access: policy.Read_Access,
 ) -> u64 {
+	if len(filters) == 1 {
+		if n, ok := mailbox_count(s, &filters[0], auth_pks, access).?; ok {
+			return n
+		}
+	}
 	walk := inventory_open(s, filters, auth_pks, access)
 	defer inventory_close(s, &walk)
 	idx, data := walk.idx, walk.data
@@ -1312,6 +1361,7 @@ scan_count_at :: proc(
 
 	sync.shared_guard(&s.tombstones_mu)
 	sync.shared_guard(&s.vanished_mu)
+	check_dead := !walk.mailbox || s.vanish_pending || walk.key in s.mailbox_deleted
 
 	require_recipient := !walk.mailbox && access.gift_wrap_read == .Recipient
 	nip17_set: Offset_Set
@@ -1351,17 +1401,19 @@ scan_count_at :: proc(
 	}
 
 	total: u64
-	entry_loop: for i := inventory_next(&walk); i >= 0; i = inventory_next(&walk) {
+	entry_loop: for i, flags := inventory_next(&walk); i >= 0; i, flags = inventory_next(&walk) {
 		entry := index_entry_at(idx, i)
 		// NIP-40: skip events whose expiration has passed (#118).
 		if index_entry_is_expired(&entry, now) {
 			continue
 		}
-		if v, ok := s.tombstones.map_[entry.id]; ok && v.confirmed {
-			continue
-		}
-		if entry.pubkey in s.vanished && !entry.no_delete && entry.kind != nostr.KIND_VANISH {
-			continue
+		if check_dead || .Protected in flags || .Covered not_in flags {
+			if v, ok := s.tombstones.map_[entry.id]; ok && v.confirmed {
+				continue
+			}
+			if entry.pubkey in s.vanished && !entry.no_delete && entry.kind != nostr.KIND_VANISH {
+				continue
+			}
 		}
 		if require_recipient &&
 		   entry.kind == nostr.KIND_GIFT_WRAP &&
@@ -1393,6 +1445,12 @@ scan_count_at :: proc(
 			break
 		}
 		if !any_filter_passes {
+			continue
+		}
+		if .Covered in flags && filters[0].search == nil {
+			if .Literal in flags && (.Protected not_in flags || pk_in(auth_pks, entry.pubkey)) {
+				total += 1
+			}
 			continue
 		}
 
@@ -1503,19 +1561,24 @@ iter_negentropy :: proc(
 	{
 		sync.shared_guard(&s.tombstones_mu)
 		sync.shared_guard(&s.vanished_mu)
-		for i := inventory_next(&walk); i >= 0; i = inventory_next(&walk) {
+		check_dead := !walk.mailbox || s.vanish_pending || walk.key in s.mailbox_deleted
+		for i, flags := inventory_next(&walk); i >= 0; i, flags = inventory_next(&walk) {
 			entry := index_entry_at(idx, i)
 			// NIP-40: skip expired events (#118).
 			if index_entry_is_expired(&entry, now) {
 				continue
 			}
 			// NIP-09: skip tombstoned events.
-			if v, ok := s.tombstones.map_[entry.id]; ok && v.confirmed {
-				continue
-			}
-			// NIP-62: skip events from vanished pubkeys.
-			if entry.pubkey in s.vanished && !entry.no_delete && entry.kind != nostr.KIND_VANISH {
-				continue
+			if check_dead || .Protected in flags || .Covered not_in flags {
+				if v, ok := s.tombstones.map_[entry.id]; ok && v.confirmed {
+					continue
+				}
+				// NIP-62: skip events from vanished pubkeys.
+				if entry.pubkey in s.vanished &&
+				   !entry.no_delete &&
+				   entry.kind != nostr.KIND_VANISH {
+					continue
+				}
 			}
 			if require_recipient &&
 			   entry.kind == nostr.KIND_GIFT_WRAP &&
@@ -1539,7 +1602,11 @@ iter_negentropy :: proc(
 			}
 			// Match REQ visibility before exposing even an event ID.
 			authed := pk_in(auth_pks, entry.pubkey)
-			if has_search || !authed || access.check != nil {
+			if !has_search && .Covered in flags {
+				if !authed && .Protected in flags {
+					continue
+				}
+			} else if has_search || !authed || access.check != nil {
 				start, end, bok := blob_bounds(idx, i, walk.slots, len(data), entry.offset)
 				if !bok {
 					return .Io, ""

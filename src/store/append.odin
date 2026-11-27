@@ -238,6 +238,10 @@ append_classified :: proc(
 		return .Invalid_Event, REASON_EXPIRED
 	}
 	expiry := expiry_ts if has_expiry else 0
+	flags: Posting_Flags
+	if ev.kind == nostr.KIND_GIFT_WRAP {
+		flags = mailbox_flags(ev.tags, ev.content, has_expiry)
+	}
 
 	// Serialize before locking - no allocations inside the critical section.
 	pack_buf := make([dynamic]u8, 0, 2048, context.temp_allocator)
@@ -412,6 +416,8 @@ append_classified :: proc(
 		idx_g := mapped_file_slice(&s.index)
 		tags_g := mapped_file_slice(&s.tags)
 		dtags_g := mapped_file_slice(&s.dtags)
+		data_g := mapped_file_slice(&s.data)
+		defer slice_release(data_g)
 		tombstoned := make([dynamic]Kind_Pubkey, context.temp_allocator)
 		{
 			sync.guard(&s.recipients_mu)
@@ -439,6 +445,7 @@ append_classified :: proc(
 				for i in 0 ..< total {
 					e := index_entry_at(idx_g.data, i)
 					if e.id in lookup {
+						mailbox_mark_slot(s, idx_g.data, tags_g.data, data_g.data, i, &e)
 						append(&tombstoned, Kind_Pubkey{e.kind, e.pubkey})
 						if len(tombstoned) == len(lookup) {
 							break
@@ -485,6 +492,9 @@ append_classified :: proc(
 				// Candidate pubkey matches: promote to confirmed tombstone.
 				tombstone_insert_confirmed(&s.tombstones, ev.id)
 				immediately_tombstoned = true
+				if ev.kind == nostr.KIND_GIFT_WRAP && .Protected not_in flags {
+					mailbox_mark_deleted(s, tag_buf[:])
+				}
 			} else {
 				// No candidate matches: discard the preemptive entry.
 				tombstone_remove(&s.tombstones, ev.id)
@@ -528,6 +538,16 @@ append_classified :: proc(
 				tag_buf[:],
 				&s.index.current.ptr[HEADER_SIZE],
 			)
+			if ev.kind == nostr.KIND_GIFT_WRAP {
+				mailbox_post(
+					&s.postings,
+					pos,
+					ev.tags,
+					tag_buf[:],
+					flags,
+					&s.index.current.ptr[HEADER_SIZE],
+				)
+			}
 			s.postings.entries += 1
 			s.postings.tag_bytes = int(w.tags.offset)
 		} else {
@@ -563,8 +583,11 @@ store_vanish :: proc(s: ^Store, ev: ^pack.Event) -> Error {
 	sync.guard(&s.writer_mu)
 
 	// 1. Add to in-memory set.
+	previous_pending: bool
 	{
 		sync.guard(&s.vanished_mu)
+		previous_pending = s.vanish_pending
+		s.vanish_pending = true
 		s.vanished[ev.pubkey] = {}
 	}
 	// 2. Persist to vanished.r.
@@ -579,6 +602,8 @@ store_vanish :: proc(s: ^Store, ev: ^pack.Event) -> Error {
 	defer slice_release(idx_g)
 	tags_g := mapped_file_slice(&s.tags)
 	defer slice_release(tags_g)
+	data_g := mapped_file_slice(&s.data)
+	defer slice_release(data_g)
 	pk := ev.pubkey
 	giftwrap_offsets := matching_offsets(tags_g.data, 'p', pk[:], context.temp_allocator)
 	defer delete(giftwrap_offsets)
@@ -595,15 +620,21 @@ store_vanish :: proc(s: ^Store, ev: ^pack.Event) -> Error {
 			// Skip kind-62 events - they must remain queryable per NIP-62.
 			if e.pubkey == ev.pubkey && e.kind != nostr.KIND_VANISH && !e.no_delete {
 				if tombstone_insert_confirmed(&s.tombstones, e.id) {
+					mailbox_mark_slot(s, idx_g.data, tags_g.data, data_g.data, i, &e)
 					append(&tombstoned, Kind_Pubkey{e.kind, e.pubkey})
 				}
 				continue
 			}
 			if e.kind == nostr.KIND_GIFT_WRAP && e.offset in giftwrap_offsets {
 				if tombstone_insert_confirmed(&s.tombstones, e.id) {
+					mailbox_mark_slot(s, idx_g.data, tags_g.data, data_g.data, i, &e)
 					append(&tombstoned, Kind_Pubkey{e.kind, e.pubkey})
 				}
 			}
+		}
+		{
+			sync.guard(&s.vanished_mu)
+			s.vanish_pending = previous_pending
 		}
 	}
 	for kp in tombstoned {

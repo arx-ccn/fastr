@@ -37,6 +37,7 @@ Store :: struct {
 	// preemptive = target not yet seen, candidates hold deletion pubkeys.
 	tombstones_mu:          sync.RW_Mutex,
 	tombstones:             Tombstone_Tracker,
+	mailbox_deleted:        Key_Set, // recipient keys with dead public slots, under tombstones_mu
 	// NIP-09 a-tag coordinate tombstones (issue #76): coordinate -> max
 	// created_at of any kind-5 that deleted it. Survives compaction pruning
 	// the target event.
@@ -51,6 +52,7 @@ Store :: struct {
 	// NIP-62: set of vanished pubkeys (banned from future events).
 	vanished_mu:            sync.RW_Mutex,
 	vanished:               Key_Set,
+	vanish_pending:         bool, // liveness checks cannot skip an incomplete sweep
 	// NIP-59/62 recipient-deleted event IDs, retained across request pruning.
 	recipients_mu:          sync.RW_Mutex,
 	recipients:             Key_Set,
@@ -376,6 +378,7 @@ store_open :: proc(dir: string, allocator := context.allocator) -> (s: ^Store, e
 	s.kinds_with_expiry = make(map[u16]struct{})
 	s.authors_with_expiry = make(Key_Set)
 	s.known_ids = make(map[[32]u8]Event_Slot)
+	s.mailbox_deleted = make(Key_Set)
 	s.scan_ceiling = make([dynamic]i64)
 	s.zones = make([dynamic]Time_Zone)
 
@@ -415,6 +418,7 @@ store_close :: proc(s: ^Store) {
 	mapped_file_destroy(&s.tags)
 	mapped_file_destroy(&s.dtags)
 	tombstone_tracker_destroy(&s.tombstones)
+	delete(s.mailbox_deleted)
 	delete(s.addressable_tombstones)
 	delete(s.replaceable_live)
 	delete(s.addressable_live)

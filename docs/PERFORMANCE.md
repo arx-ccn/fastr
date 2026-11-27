@@ -47,11 +47,14 @@ In recipient-only mode, broad authenticated scans still build a recipient
 offset set when the filter can match kind 1059. A `#p` filter must match
 regardless of mode.
 
-COUNT and NIP-77 can read recipient postings for a kind-1059 filter with
-one hex-encoded `#p` key. In recipient-only mode, the connection must be
-authenticated as that key to select the list directly. Both paths still
-check expiry, deletions, and protected events. They scan when a read-policy
-hook is active or the postings are rebuilding.
+For kind 1059 and one hex-encoded `#p` key, anonymous COUNT can use the
+list's stored public count. If expiry or deletion can change that answer,
+or the connection has authenticated, COUNT walks the postings instead.
+NIP-77 reads timestamps and IDs from the same index. Neither operation
+needs event payloads for covered entries;
+content search and read-policy hooks still need the records. Recipient-only
+mode requires authentication as the requested key. The relay rebuilds the
+covering metadata at startup and after compaction without changing disk format.
 
 A filter whose `authors` are all full 32-byte keys reads those authors'
 postings: in-memory runs of index slots, newest first, built at boot and

@@ -4,9 +4,11 @@
 package store
 
 import "core:encoding/endian"
+import "core:mem"
 import "core:sync"
 
 import "../nostr"
+import "../pack"
 
 // Rebuild all in-memory maps from the index. Called once at the end of
 // store_open and from store_compact. The caller must ensure the counter and
@@ -19,18 +21,25 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 	defer slice_release(idx_g)
 	tags_g := mapped_file_slice(&s.tags)
 	defer slice_release(tags_g)
+	data_g := mapped_file_slice(&s.data)
+	defer slice_release(data_g)
 	dtags_g := mapped_file_slice(&s.dtags)
 	defer slice_release(dtags_g)
 	idx := idx_g.data
 	dtags_buf := dtags_g.data
 	total := index_entry_count(idx)
 	now := nostr.unix_now()
+	scratch: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&scratch)
+	defer mem.dynamic_arena_destroy(&scratch)
 
 	// Collect ALL event IDs for O(1) dedup, including tombstoned/vanished/
 	// expired ones. Same pass rebuilds the query early-exit ceiling (the
 	// monotone prefix max of created_at; see Store.scan_ceiling).
 	{
 		sync.guard(&s.known_ids_mu)
+		sync.guard(&s.tombstones_mu)
+		sync.shared_guard(&s.vanished_mu)
 		sync.guard(&s.scan_ceiling_mu)
 		clear(&s.known_ids)
 		clear(&s.scan_ceiling)
@@ -69,13 +78,29 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 				for tag_pos < len(tags) && endian.unchecked_get_u64le(tags[tag_pos:]) == e.offset {
 					tag_pos += TAG_ENTRY_SIZE
 				}
-				postings_add(
-					&s.postings,
-					{u32(i), u32(tag_pos / TAG_ENTRY_SIZE)},
-					e.kind,
-					e.pubkey,
-					tags[start:tag_pos],
-				)
+				pos := Event_Slot{u32(i), u32(tag_pos / TAG_ENTRY_SIZE)}
+				indexed := tags[start:tag_pos]
+				postings_add(&s.postings, pos, e.kind, e.pubkey, indexed)
+				if e.kind == nostr.KIND_GIFT_WRAP && len(indexed) > 0 {
+					begin, end, ok := blob_bounds(idx, i, total, len(data_g.data), e.offset)
+					parsed: []pack.Tag
+					flags: Posting_Flags
+					if ok {
+						parsed, flags = read_mailbox_meta(
+							data_g.data[begin:end],
+							&e,
+							indexed,
+							mem.dynamic_arena_allocator(&scratch),
+						)
+					}
+					v := s.tombstones.map_[e.id]
+					if .Protected not_in flags &&
+					   (v.confirmed || (!e.no_delete && e.pubkey in s.vanished)) {
+						mailbox_mark_deleted(s, indexed)
+					}
+					mailbox_post(&s.postings, pos, parsed, indexed, flags, nil)
+					mem.dynamic_arena_reset(&scratch)
+				}
 			}
 			s.known_ids[e.id] = {
 				slot    = u32(i),
@@ -209,4 +234,44 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 	}
 
 	return .None
+}
+
+@(private)
+read_mailbox_meta :: proc(
+	dp: []u8,
+	entry: ^Index_Entry,
+	indexed: []u8,
+	scratch: mem.Allocator,
+) -> (
+	tags: []pack.Tag,
+	flags: Posting_Flags,
+) {
+	context.temp_allocator = scratch
+	defer if .Covered not_in flags && pack.dp_has_protected_tag(dp) {
+		flags += {.Protected}
+	}
+	view, verr := pack.view_packed(dp)
+	if verr != .None ||
+	   view.id != entry.id ||
+	   view.pubkey != entry.pubkey ||
+	   view.created_at != entry.created_at ||
+	   view.kind != entry.kind {
+		return
+	}
+	parsed, terr := pack.view_tags(&view)
+	content, cerr := pack.view_content(&view)
+	if terr != .None || cerr != .None {
+		return
+	}
+	// A partial append can leave an event without all its persisted tag rows.
+	// Deletion and visibility must use the same recipient membership.
+	ev := pack.Event {
+		tags = parsed,
+	}
+	encoded := make([dynamic]u8, 0, len(indexed), scratch)
+	index_tags(&ev, entry.offset, &encoded)
+	if string(encoded[:]) != string(indexed) {
+		return
+	}
+	return parsed, mailbox_flags(parsed, content, entry.has_expiry)
 }

@@ -1,5 +1,6 @@
 package store
 
+import "core:os"
 import "core:testing"
 
 import "../nostr"
@@ -197,6 +198,9 @@ test_mailbox_count_and_neg :: proc(t: ^testing.T) {
 			_, err := store_compact(s)
 			testing.expect_value(t, err, Error.None)
 		}
+		length := mapped_file_load_len(&s.data)
+		mapped_file_publish_len(&s.data, 0)
+		defer mapped_file_publish_len(&s.data, length)
 		testing.expect_value(t, count_filters_at(s, {mailbox}, nil, expires, access), u64(2))
 		c := collect_ctx_init()
 		err, _ := iter_negentropy(s, &mailbox, nil, 2, &c, policy_collect_id, access)
@@ -210,5 +214,93 @@ test_mailbox_count_and_neg :: proc(t: ^testing.T) {
 			testing.expect_value(t, c.ids[1], older.id)
 			testing.expect_value(t, c.ids[2], newer.id)
 		}
+	}
+}
+
+@(test)
+test_mailbox_literal_count :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+
+	raw := "12345678901234567890123456789012"
+	key := test_hex(transmute([]u8)raw)
+	literal := test_tag("p", key)
+	alias := test_tag("p", raw)
+	alias_only := test_make_event(1, nostr.KIND_GIFT_WRAP, 10, test_tags(alias))
+	both := test_make_event(1, nostr.KIND_GIFT_WRAP, 20, test_tags(alias, literal))
+	test_append_ok(t, s, &alias_only)
+	test_append_ok(t, s, &both)
+	mailbox := test_tag_filter('p', key)
+	mailbox.kinds = test_kind_filter(nostr.KIND_GIFT_WRAP).kinds
+	access := policy.Read_Access {
+		gift_wrap_read = .Public,
+	}
+
+	for phase in 0 ..< 2 {
+		if phase == 1 {
+			protected := test_make_event(
+				1,
+				nostr.KIND_GIFT_WRAP,
+				30,
+				test_tags(literal, test_tag("-")),
+			)
+			test_append_ok(t, s, &protected)
+		}
+		length := mapped_file_load_len(&s.data)
+		mapped_file_publish_len(&s.data, 0)
+		defer mapped_file_publish_len(&s.data, length)
+		want: u64 = 1 if phase == 0 else 2
+		author := test_pubkey(1)
+		testing.expect_value(t, count_filters(s, {mailbox}, nil, access), u64(1))
+		testing.expect_value(t, count_filters(s, {mailbox}, {author}, access), want)
+		c := collect_ctx_init()
+		err, _ := iter_negentropy(s, &mailbox, nil, 2, &c, policy_collect_id, access)
+		testing.expect_value(t, err, Error.None)
+		testing.expect_value(t, len(c.ids), 2)
+		testing.expect(t, ids_contain(c.ids[:], alias_only.id) && ids_contain(c.ids[:], both.id))
+	}
+}
+
+@(test)
+test_mailbox_partial_tags :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	keys := [2][32]u8{test_pubkey(2), test_pubkey(3)}
+	{
+		s := test_open(t, dir)
+		defer store_close(s)
+		wrap := test_make_event(
+			1,
+			nostr.KIND_GIFT_WRAP,
+			10,
+			test_tags(test_tag("p", test_hex(keys[0][:])), test_tag("p", test_hex(keys[1][:]))),
+		)
+		test_append_ok(t, s, &wrap)
+	}
+	f, oerr := os.open(path_join(dir, "tags.s"), {.Write}, os.Permissions_Default)
+	if !testing.expect(t, oerr == nil) {
+		return
+	}
+	err := os.truncate(f, HEADER_SIZE + TAG_ENTRY_SIZE)
+	os.close(f)
+	if !testing.expect(t, err == nil) {
+		return
+	}
+	s := test_open(t, dir)
+	defer store_close(s)
+	access := policy.Read_Access {
+		gift_wrap_read = .Public,
+	}
+	for &key, i in keys {
+		mailbox := test_tag_filter('p', test_hex(key[:]))
+		mailbox.kinds = test_kind_filter(nostr.KIND_GIFT_WRAP).kinds
+		want := 1 - i
+		testing.expect_value(t, count_filters(s, {mailbox}, nil, access), u64(want))
+		c := collect_ctx_init()
+		err, _ := iter_negentropy(s, &mailbox, nil, 2, &c, policy_collect_id, access)
+		testing.expect_value(t, err, Error.None)
+		testing.expect_value(t, len(c.ids), want)
 	}
 }

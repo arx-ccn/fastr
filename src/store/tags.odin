@@ -7,8 +7,10 @@ import "core:encoding/endian"
 import "core:hash"
 import "core:slice"
 import "core:sync"
+import "core:unicode/utf8"
 
 import "../nostr"
+import "../pack"
 
 // Sentinel value_len indicating that tag_value holds a SHA-256 hash of the
 // original (long) value, rather than the raw bytes.
@@ -58,7 +60,20 @@ Event_Slot :: struct {
 Posting :: struct {
 	using event: Event_Slot,
 	kind:        u16,
+	flags:       Posting_Flags,
 }
+
+@(private)
+Posting_Flag :: enum {
+	Recipient,
+	Covered,
+	Literal,
+	Protected,
+	Expires,
+}
+
+@(private)
+Posting_Flags :: bit_set[Posting_Flag;u8]
 
 @(private)
 Posting_Run :: struct {
@@ -69,9 +84,10 @@ Posting_Run :: struct {
 // Events under one key, newest first within each run.
 @(private)
 Posting_List :: struct {
-	runs:  [dynamic]^Posting_Run,
-	count: int, // postings across all runs
-	last:  u32,
+	runs:     [dynamic]^Posting_Run,
+	count:    int, // postings across all runs
+	last:     u32,
+	literals: u32, // max(u32) if a literal count needs to inspect the postings
 }
 
 // In-memory lookup from a key to the index slots of its events, so a
@@ -279,6 +295,16 @@ posting_add :: proc(lists: ^map[[32]u8]Posting_List, key: [32]u8, posting: Posti
 	}
 	list.last = posting.slot
 	list.count += 1
+	if .Recipient in posting.flags &&
+	   .Protected not_in posting.flags &&
+	   list.literals != max(u32) {
+		if .Covered not_in posting.flags ||
+		   (.Literal in posting.flags && .Expires in posting.flags) {
+			list.literals = max(u32)
+		} else if .Literal in posting.flags {
+			list.literals += 1
+		}
+	}
 	if idx == nil && len(list.runs) > 0 {
 		append(&list.runs[0].slots, posting)
 		return
@@ -321,9 +347,7 @@ posting_add :: proc(lists: ^map[[32]u8]Posting_List, key: [32]u8, posting: Posti
 	append(&list.runs, run)
 }
 
-// Index one event by its author and by each of its tags, and a gift wrap by
-// each recipient it names. `tags` holds the event's records from tags.s,
-// which end at `event.tag_end`.
+// Index the author and the tag records ending at `event.tag_end`.
 @(private)
 postings_add :: proc(
 	m: ^Postings,
@@ -333,17 +357,116 @@ postings_add :: proc(
 	tags: []u8,
 	idx: rawptr = nil,
 ) {
-	posting := Posting{event, kind}
+	posting := Posting {
+		event = event,
+		kind  = kind,
+	}
 	posting_add(&m.by_author, pubkey, posting, idx)
 	first := event.tag_end - u32(len(tags) / TAG_ENTRY_SIZE)
 	for pos := 0; pos < len(tags); pos += TAG_ENTRY_SIZE {
 		tag := tags[pos:pos + TAG_ENTRY_SIZE]
 		record := first + u32(pos / TAG_ENTRY_SIZE)
 		tag_chain_add(&m.by_tag, record, event.slot, tag[TAG_KEY_START:TAG_KEY_END])
-		if kind == nostr.KIND_GIFT_WRAP && tag[8] == 'p' && tag[41] == 32 {
-			posting_add(&m.by_recipient, (cast(^[32]u8)&tag[9])^, posting, idx)
+	}
+}
+
+@(private)
+mailbox_flags :: proc(tags: []pack.Tag, content: string, expires: bool) -> Posting_Flags {
+	if !utf8.valid_string(content) {
+		return {}
+	}
+	for tag in tags {
+		for field in tag.fields {
+			if !utf8.valid_string(field) {
+				return {}
+			}
 		}
 	}
+	flags: Posting_Flags = {.Covered}
+	if expires {
+		flags += {.Expires}
+	}
+	if nostr.has_protected_tag(tags) {
+		flags += {.Protected}
+	}
+	return flags
+}
+
+@(private)
+mailbox_post :: proc(
+	m: ^Postings,
+	event: Event_Slot,
+	parsed: []pack.Tag,
+	indexed: []u8,
+	flags: Posting_Flags,
+	idx: rawptr,
+) {
+	p := Posting {
+		event = event,
+		kind  = nostr.KIND_GIFT_WRAP,
+		flags = flags + {.Recipient},
+	}
+	if .Covered not_in flags {
+		for pos := 0; pos < len(indexed); pos += TAG_ENTRY_SIZE {
+			tag := indexed[pos:pos + TAG_ENTRY_SIZE]
+			if tag[8] == 'p' && tag[41] == 32 {
+				posting_add(&m.by_recipient, (cast(^[32]u8)&tag[9])^, p, idx)
+			}
+		}
+		return
+	}
+
+	// The literal spelling wins when both representations name one list.
+	raw := false
+	p.flags += {.Literal}
+	for &tag in parsed {
+		if len(tag.fields) < 2 || tag.fields[0] != "p" {
+			continue
+		}
+		value := transmute([]u8)tag.fields[1]
+		if len(value) == 32 {
+			raw = true
+		} else if len(value) == 64 {
+			key: [32]u8
+			if _, err := pack.hex_decode(value, key[:]); err == .None {
+				posting_add(&m.by_recipient, key, p, idx)
+			}
+		}
+	}
+	if raw {
+		p.flags = flags + {.Recipient}
+		for &tag in parsed {
+			if len(tag.fields) >= 2 && tag.fields[0] == "p" && len(tag.fields[1]) == 32 {
+				value := transmute([]u8)tag.fields[1]
+				posting_add(&m.by_recipient, (cast(^[32]u8)&value[0])^, p, idx)
+			}
+		}
+	}
+}
+
+// A dead public slot invalidates only the lists that could contain it. Keep these
+// keys across compaction: readers can still hold the older runs.
+@(private)
+mailbox_mark_deleted :: proc(s: ^Store, indexed: []u8) {
+	for pos := 0; pos < len(indexed); pos += TAG_ENTRY_SIZE {
+		tag := indexed[pos:pos + TAG_ENTRY_SIZE]
+		if tag[8] == 'p' && tag[41] == 32 {
+			s.mailbox_deleted[(cast(^[32]u8)&tag[9])^] = {}
+		}
+	}
+}
+
+@(private)
+mailbox_mark_slot :: proc(s: ^Store, idx, tags, data: []u8, slot: int, entry: ^Index_Entry) {
+	if entry.kind != nostr.KIND_GIFT_WRAP {
+		return
+	}
+	start, end, ok := blob_bounds(idx, slot, index_entry_count(idx), len(data), entry.offset)
+	if ok && pack.dp_has_protected_tag(data[start:end]) {
+		return
+	}
+	last := len(tags) / TAG_ENTRY_SIZE
+	mailbox_mark_deleted(s, candidate_tags(tags, &last, entry.offset, .Sparse))
 }
 
 // Order the single run that boot filled for each key and drop its spare
