@@ -56,8 +56,10 @@ content search and read-policy hooks still need the records. Recipient-only
 mode requires authentication as the requested key. The relay rebuilds the
 covering metadata at startup and after compaction without changing disk format.
 NIP-77 merges fully covered mailbox runs and visits timestamp groups oldest
-first without sorting the matched IDs again. If the filter can require a
-record read, it keeps the original traversal and sorts the result.
+first without sorting the matched IDs again. When every entry in a single
+run qualifies, NIP-77 checks the record cap up front and emits directly from
+`index.o`, without copying the run into a second inventory. If the filter
+can require a record read, it keeps the original traversal and sorts the result.
 
 A filter whose `authors` are all full 32-byte keys reads those authors'
 postings: in-memory runs of index slots, newest first, built at boot and

@@ -1625,6 +1625,24 @@ neg_item_less :: proc(a, b: Neg_Item) -> bool {
 	return id_less(a.id, b.id)
 }
 
+@(private = "file")
+neg_emit_run :: proc(idx: []u8, slots: []Posting, user: rawptr, cb: Neg_Item_Proc) {
+	entries := cast([^][INDEX_ENTRY_SIZE]u8)raw_data(idx)
+	// Walk timestamp groups oldest first, retaining ascending IDs inside each.
+	for end := len(slots); end > 0; {
+		start := end - 1
+		ts := endian.unchecked_get_u64le(entries[slots[start].slot][8:])
+		for start > 0 && endian.unchecked_get_u64le(entries[slots[start - 1].slot][8:]) == ts {
+			start -= 1
+		}
+		for &posting in slots[start:end] {
+			id := cast(^[32]u8)&entries[posting.slot][28]
+			cb(user, i64(ts), id^)
+		}
+		end = start
+	}
+}
+
 // Collect and iterate (created_at, event_id) pairs for events matching
 // `filter`, emitting them in ascending (created_at, id) order as required
 // for negentropy. Returns (.Rejected, "blocked: ...") when more than
@@ -1646,6 +1664,38 @@ iter_negentropy :: proc(
 	idx, data := walk.idx, walk.data
 
 	fsearch, has_search := filter.search.?
+	// Preserve slot order when opening a blob could fail. A covered mailbox
+	// can traverse the runs in timestamp order instead.
+	ordered := walk.mailbox && !walk.uncovered && !has_search
+	plain_mailbox :=
+		ordered &&
+		filter.ids == nil &&
+		filter.authors == nil &&
+		filter.since == nil &&
+		filter.until == nil
+	if plain_mailbox && len(walk.cursors) == 0 {
+		return .None, ""
+	}
+	if plain_mailbox && len(walk.cursors) == 1 {
+		slots := walk.cursors[0].run.slots[:]
+		// A finite literal count covering the whole run excludes protected
+		// entries and entries that can expire. Check deletion separately.
+		if walk.literals != max(u32) && walk.literals == u32(len(slots)) {
+			clean: bool
+			{
+				sync.shared_guard(&s.tombstones_mu)
+				sync.shared_guard(&s.vanished_mu)
+				clean = !s.vanish_pending && walk.key not_in s.mailbox_deleted
+			}
+			if clean {
+				if len(slots) > max_records {
+					return .Rejected, REASON_NEG_TOO_MANY_RECORDS
+				}
+				neg_emit_run(idx, slots, user, cb)
+				return .None, ""
+			}
+		}
+	}
 
 	require_recipient := !walk.mailbox && access.gift_wrap_read == .Recipient
 	nip17_set: Offset_Set
@@ -1669,15 +1719,6 @@ iter_negentropy :: proc(
 	}
 
 	now := nostr.unix_now()
-	// Preserve traversal/error precedence when any row can require opening
-	// a stored blob. A fully covered inventory can only hit the record cap.
-	ordered := walk.mailbox && !walk.uncovered && !has_search
-	plain_mailbox :=
-		ordered &&
-		filter.ids == nil &&
-		filter.authors == nil &&
-		filter.since == nil &&
-		filter.until == nil
 	if ordered && len(walk.cursors) > 1 {
 		walk.heads = cursors_heap(walk.cursors[:], nil, raw_data(idx))
 	}

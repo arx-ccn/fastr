@@ -1671,6 +1671,52 @@ test_iter_negentropy_ascending_order :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_neg_mailbox_order_and_cap :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	recipient := test_pubkey(9)
+	key := test_hex(recipient[:])
+	tag := test_tag("p", key)
+	want: [4]Neg_Item
+	for ts, i in ([4]i64{20, 10, 30, 10}) {
+		ev := test_make_event(u8(i + 1), nostr.KIND_GIFT_WRAP, ts, test_tags(tag))
+		test_append_ok(t, s, &ev)
+		want[i] = {ts, ev.id}
+	}
+	target := want[0].id
+	slice.sort_by(want[:], neg_item_less)
+	filter := test_tag_filter('p', key)
+	filter.kinds = test_kind_filter(nostr.KIND_GIFT_WRAP).kinds
+	access := policy.Read_Access {
+		gift_wrap_read = .Public,
+	}
+	c: Neg_Collect
+	c.items.allocator = context.temp_allocator
+	length := mapped_file_load_len(&s.data)
+	mapped_file_publish_len(&s.data, 0)
+	err, reason := iter_negentropy(s, &filter, nil, 3, &c, neg_collect_cb, access)
+	testing.expect_value(t, err, Error.Rejected)
+	testing.expect_value(t, reason, REASON_NEG_TOO_MANY_RECORDS)
+	testing.expect_value(t, len(c.items), 0)
+	err, _ = iter_negentropy(s, &filter, nil, 4, &c, neg_collect_cb, access)
+	mapped_file_publish_len(&s.data, length)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, slice.equal(c.items[:], want[:]))
+
+	del := test_kind5_event(1, target)
+	test_append_ok(t, s, &del)
+	clear(&c.items)
+	err, _ = iter_negentropy(s, &filter, nil, 3, &c, neg_collect_cb, access)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, len(c.items), 3)
+	for item in c.items {
+		testing.expect(t, item.id != target)
+	}
+}
+
+@(test)
 test_iter_negentropy_too_many_records :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
