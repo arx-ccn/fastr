@@ -244,13 +244,21 @@ pack_parse :: proc(
 		return nil, .Corrupt
 	}
 
-	entries = make([]Pack_Entry, count, context.temp_allocator)
+	parsed := make([]Pack_Entry, count, context.temp_allocator)
+	parsed_count := 0
+	defer if err != .None {
+		for &entry in parsed[:parsed_count] {
+			if entry.delta != nil {
+				delete(entry.delta, context.allocator)
+			}
+		}
+	}
 	by_offset := make(map[int]int, context.temp_allocator) // entry offset -> index
 
 	pos := 12
 	body_end := len(raw) - 20
-	for i in 0 ..< count {
-		entry := &entries[i]
+	for ; parsed_count < count; parsed_count += 1 {
+		entry := &parsed[parsed_count]
 		entry.offset = pos
 		kind, size, hpos, hok := parse_entry_header(raw, pos)
 		if !hok || size > max_obj || hpos > body_end {
@@ -297,7 +305,7 @@ pack_parse :: proc(
 			}
 			entry.resolved = true
 		}
-		by_offset[entry.offset] = i
+		by_offset[entry.offset] = parsed_count
 	}
 	if pos != body_end {
 		return nil, .Corrupt
@@ -306,14 +314,14 @@ pack_parse :: proc(
 	// Resolve deltas to fixpoint. Each pass materializes every delta whose
 	// base is available (earlier pack entry or an existing repo object).
 	remaining := 0
-	for entry in entries {
+	for entry in parsed {
 		if !entry.resolved {
 			remaining += 1
 		}
 	}
 	for remaining > 0 {
 		progressed := false
-		for &entry in entries {
+		for &entry in parsed {
 			if entry.resolved {
 				continue
 			}
@@ -326,7 +334,7 @@ pack_parse :: proc(
 				if !found {
 					return nil, .Corrupt
 				}
-				base := &entries[base_idx]
+				base := &parsed[base_idx]
 				if base.resolved {
 					bk, bd, berr := object_read(repo, base.oid, context.allocator)
 					if berr != .None {
@@ -368,5 +376,5 @@ pack_parse :: proc(
 			return nil, .Corrupt
 		}
 	}
-	return entries, .None
+	return parsed, .None
 }
