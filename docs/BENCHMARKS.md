@@ -700,3 +700,33 @@ the commit message of `3eeac2d56e` quotes. The scripts and fixtures are one
 directory up: `rows.sh` with `tag.rows` and `time.rows`, `mkt.sh`, `mk.sh`,
 `s.sh`, `boot.sh`, and `calib.sh` with `calib_tags_test.odin` and
 `calib_append_test.odin`.
+
+## Live fanout broadcasters
+
+Two loopback passes compared `5d6b296` with the first eight-broadcaster
+build. The relay ran on CPUs 8–15, publishers
+on 0–7, and 16 Bun subscriber processes on 16–31. Each socket subscribed
+to kind 1 with `limit: 0`. The 208-subscriber cases sent 20,000 events.
+The 1,008-subscriber case sent 4,000. `perf stat -e cycles:u` counts relay
+user-space cycles, not kernel work. Delivery counts are received EVENT
+frames, not publisher acknowledgements.
+
+| Subscribers | Publishers | Events/s before | Events/s after | User cycles/delivery before | User cycles/delivery after |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 208 | 1 | 2,836–2,868 | 11,138–11,580 | 4,788–4,818 | 1,301–1,305 |
+| 208 | 8 | 3,087–3,098 | 10,857–10,906 | 16,523–16,542 | 1,628–1,679 |
+| 1,008 | 1 | 270–287 | 2,495–2,520 | 13,238–14,140 | 813–820 |
+
+After the subscription cutoff and expiration fixes, the 208-subscriber,
+one-publisher check ran at 11,092 events/s and 1,289 user cycles per
+delivery (`fanout-reviewed.txt`).
+The frame counts matched the expected totals in these runs. With one
+publisher, no subscriber saw `created_at` go backwards. With concurrent
+publishers, timestamps arrived out of order in both builds. The runs do
+not establish lossless delivery: in an earlier trial with 200 sockets on
+one subscriber CPU, the broadcaster build delivered 75–79% of the frames.
+
+Without subscribers, fresh ingest ran at 177–181k events/s before and
+174–179k after. Duplicate ingest ran at 440–455k before and 450–452k
+after. Raw output: `fanout-explore.txt`, `fanout-ingest.txt`, and
+`fanout-suite.txt` under `~/.cache/fastr-bench/juice/raw/`.

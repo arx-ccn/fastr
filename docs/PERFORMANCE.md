@@ -12,6 +12,20 @@ so broadcasts do not need a separate deduplication set. Removing a subscription
 still scans its wildcard/kind bucket; whole subscription replacement is not
 claimed to be O(1).
 
+The server runs one broadcaster per shard, eight in all. If a shard has a
+wildcard or matching kind bucket, the publisher queues a reference to the
+event there. All eight shards share one encoding of the event JSON. A full
+shard queue (1,024 events) makes the publisher wait. At admission the
+publisher records the shard's next subscription key. A later REQ gets a
+key at or above that cutoff and does not receive the queued event.
+
+The broadcaster checks read access and tries a nonblocking write on an
+idle socket. If it writes part of a frame, the connection writer finishes
+that frame before sending another. On a busy socket the writer checks the
+subscription and read access before sending. Both paths check expiration
+before starting a live frame. A full connection outbox still
+drops live events for that client. See the [fanout measurements](BENCHMARKS.md#live-fanout-broadcasters).
+
 ## Store queries and REQ handling
 
 Exact-ID queries skip prefix rechecking only after every resolved slot has
