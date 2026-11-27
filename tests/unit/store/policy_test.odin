@@ -88,9 +88,10 @@ test_gift_wrap_read_modes :: proc(t: ^testing.T) {
 		name: string,
 		auth: [][32]u8,
 		access: policy.Read_Access,
+		filter: nostr.Filter,
 		want: [][32]u8,
 	) {
-		f := test_kind_filter(nostr.KIND_GIFT_WRAP)
+		f := filter
 		c := collect_ctx_init()
 		err := query_authed(s, &f, auth, &c, collect_cb, access)
 		testing.expectf(
@@ -134,14 +135,80 @@ test_gift_wrap_read_modes :: proc(t: ^testing.T) {
 	public := policy.Read_Access {
 		gift_wrap_read = .Public,
 	}
-	check_reads(t, s, "public anonymous", nil, public, {ordinary.id})
-	check_reads(t, s, "strict anonymous", nil, {}, nil)
-	check_reads(t, s, "strict author", {author}, {}, nil)
-	check_reads(t, s, "strict recipient", {recipient}, {}, {ordinary.id})
-	check_reads(t, s, "public author", {author}, public, {ordinary.id, protected.id})
+	broad := test_kind_filter(nostr.KIND_GIFT_WRAP)
+	mailbox := test_tag_filter('p', test_hex(recipient[:]))
+	mailbox.kinds = broad.kinds
+	for f in ([2]nostr.Filter{broad, mailbox}) {
+		check_reads(t, s, "public anonymous", nil, public, f, {ordinary.id})
+		check_reads(t, s, "strict anonymous", nil, {}, f, nil)
+		check_reads(t, s, "strict author", {author}, {}, f, nil)
+		check_reads(t, s, "strict recipient", {recipient}, {}, f, {ordinary.id})
+		check_reads(t, s, "public author", {author}, public, f, {ordinary.id, protected.id})
+	}
 
 	newer := test_make_event(1, nostr.KIND_GIFT_WRAP, 30, test_tags(p))
 	test_append_ok(t, s, &newer)
 	public.check = older_visible
-	check_reads(t, s, "public with hook", nil, public, {ordinary.id})
+	check_reads(t, s, "public with hook", nil, public, broad, {ordinary.id})
+	check_reads(t, s, "public with hook", nil, public, mailbox, {ordinary.id})
+}
+
+@(test)
+test_mailbox_count_and_neg :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+
+	recipient := test_pubkey(2)
+	key := test_hex(recipient[:])
+	p := test_tag("p", key)
+	other := test_pubkey(3)
+	newer := test_make_event(1, nostr.KIND_GIFT_WRAP, 40, test_tags(p, p))
+	target := test_make_event(
+		1,
+		nostr.KIND_GIFT_WRAP,
+		30,
+		test_tags(p, test_tag("p", test_hex(other[:]))),
+	)
+	older := test_make_event(1, nostr.KIND_GIFT_WRAP, 20, test_tags(p))
+	expires := nostr.unix_now() + 3600
+	expiring := test_make_event(
+		1,
+		nostr.KIND_GIFT_WRAP,
+		10,
+		test_tags(p, test_expiry_tag(expires)),
+	)
+	wrong := test_make_event(1, nostr.KIND_GIFT_WRAP, 15, test_tags(test_tag("p", "unrelated")))
+	events := [5]pack.Event{newer, target, older, expiring, wrong}
+	for &ev in events {
+		test_append_ok(t, s, &ev)
+	}
+	del := test_kind5_event(3, target.id)
+	test_append_ok(t, s, &del)
+
+	mailbox := test_tag_filter('p', key)
+	mailbox.kinds = test_kind_filter(nostr.KIND_GIFT_WRAP).kinds
+	access := policy.Read_Access {
+		gift_wrap_read = .Public,
+	}
+	for phase in 0 ..< 2 {
+		if phase == 1 {
+			_, err := store_compact(s)
+			testing.expect_value(t, err, Error.None)
+		}
+		testing.expect_value(t, count_filters_at(s, {mailbox}, nil, expires, access), u64(2))
+		c := collect_ctx_init()
+		err, _ := iter_negentropy(s, &mailbox, nil, 2, &c, policy_collect_id, access)
+		testing.expect_value(t, err, Error.Rejected)
+		testing.expect_value(t, len(c.ids), 0)
+		err, _ = iter_negentropy(s, &mailbox, nil, 3, &c, policy_collect_id, access)
+		testing.expect_value(t, err, Error.None)
+		testing.expect_value(t, len(c.ids), 3)
+		if len(c.ids) == 3 {
+			testing.expect_value(t, c.ids[0], expiring.id)
+			testing.expect_value(t, c.ids[1], older.id)
+			testing.expect_value(t, c.ids[2], newer.id)
+		}
+	}
 }

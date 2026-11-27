@@ -7,6 +7,7 @@ import "core:encoding/endian"
 import "core:slice"
 import "core:strings"
 import "core:sync"
+import "core:unicode/utf8"
 
 import "../nostr"
 import "../pack"
@@ -160,10 +161,34 @@ filter_may_match_giftwrap :: proc(filter: ^nostr.Filter) -> bool {
 	return slice.contains(kinds[:], nostr.KIND_GIFT_WRAP)
 }
 
-// Store-local port of nostr single_filter_matches: full filter check against
-// a deserialized event (used by the COUNT slow path).
+// A sole p value on kind 1059 names one recipient posting list.
 @(private)
-event_matches_filter :: proc(f: ^nostr.Filter, ev: ^pack.Event) -> bool {
+mailbox_key :: proc(filter: ^nostr.Filter) -> (key: [32]u8, ok: bool) {
+	kinds := filter.kinds.? or_else nil
+	if len(kinds) != 1 || kinds[0] != nostr.KIND_GIFT_WRAP || len(filter.tags) != 1 {
+		return
+	}
+	values := filter.tags['p']
+	if len(values) != 1 {
+		return
+	}
+	for value in values {
+		if len(value) == 64 {
+			_, err := pack.hex_decode(transmute([]u8)value, key[:])
+			ok = err == .None
+		}
+	}
+	return
+}
+
+// COUNT checks literal tags, even when their indexed encodings coincide.
+@(private)
+count_matches :: proc(
+	f: ^nostr.Filter,
+	ev: ^pack.Event_View,
+	tags: []pack.Tag,
+	content: string,
+) -> bool {
 	if ids, ok := f.ids.?; ok {
 		if len(ids) == 0 {
 			return false
@@ -210,14 +235,14 @@ event_matches_filter :: proc(f: ^nostr.Filter, ev: ^pack.Event) -> bool {
 	}
 	if search, ok := f.search.?; ok {
 		for needle in search {
-			if !strings.contains(ev.content, needle) {
+			if !strings.contains(content, needle) {
 				return false
 			}
 		}
 	}
 	for ch, values in f.tags {
 		matched := false
-		for tag in ev.tags {
+		for tag in tags {
 			if len(tag.fields) >= 2 && len(tag.fields[0]) == 1 && tag.fields[0][0] == ch {
 				if tag.fields[1] in values {
 					matched = true
@@ -1204,6 +1229,75 @@ count_authors :: proc(
 }
 
 @(private)
+Inventory_Walk :: struct {
+	maps:            ^Query_Maps,
+	idx, data, tags: []u8,
+	slots:           int,
+	mailbox:         bool,
+	cursors:         [dynamic]Posting_Cursor,
+	runs_left:       int,
+	next:            int,
+}
+
+// Pin the postings and their matching files under the same publication lock.
+@(private)
+inventory_open :: proc(
+	s: ^Store,
+	filters: []nostr.Filter,
+	auth: [][32]u8,
+	access: policy.Read_Access,
+) -> (
+	w: Inventory_Walk,
+) {
+	sync.shared_guard(&s.known_ids_mu)
+	w.maps = s.query_maps
+	sync.atomic_add(&w.maps.refs, 1)
+	w.idx = query_map_slice(w.maps.index, &s.index)
+	w.data = query_map_slice(w.maps.data, &s.data)
+	w.tags = query_map_slice(w.maps.tags, &s.tags)
+	w.slots = index_entry_count(w.idx)
+	if len(filters) != 1 ||
+	   access.check != nil ||
+	   w.slots != s.postings.entries ||
+	   len(w.tags) != s.postings.tag_bytes {
+		return
+	}
+	key, named := mailbox_key(&filters[0])
+	if named && (access.gift_wrap_read == .Public || pk_in(auth, key)) {
+		w.mailbox = true
+		w.cursors = make([dynamic]Posting_Cursor, context.temp_allocator)
+		cursors_pin(&w.cursors, s.postings.by_recipient[key])
+		w.runs_left = len(w.cursors)
+	}
+	return
+}
+
+@(private)
+inventory_close :: proc(s: ^Store, w: ^Inventory_Walk) {
+	for c in w.cursors {
+		posting_release(c.run)
+	}
+	query_maps_release(s, w.maps)
+}
+
+@(private)
+inventory_next :: proc(w: ^Inventory_Walk) -> int {
+	if !w.mailbox && w.next < w.slots {
+		w.next += 1
+		return w.next - 1
+	}
+	for w.runs_left > 0 {
+		c := &w.cursors[w.runs_left - 1]
+		if c.next < len(c.run.slots) {
+			c.next += 1
+			return int(c.run.slots[c.next - 1].slot)
+		}
+		w.runs_left -= 1
+	}
+	return -1
+}
+
+@(private)
 scan_count_at :: proc(
 	s: ^Store,
 	filters: []nostr.Filter,
@@ -1211,26 +1305,21 @@ scan_count_at :: proc(
 	now: i64,
 	access: policy.Read_Access,
 ) -> u64 {
-	idx_g := mapped_file_slice(&s.index)
-	defer slice_release(idx_g)
-	data_g := mapped_file_slice(&s.data)
-	defer slice_release(data_g)
-	tags_g := mapped_file_slice(&s.tags)
-	defer slice_release(tags_g)
-	idx := idx_g.data
-	data := data_g.data
-	total_entries := index_entry_count(idx)
+	walk := inventory_open(s, filters, auth_pks, access)
+	defer inventory_close(s, &walk)
+	idx, data := walk.idx, walk.data
+	total_entries := walk.slots
 
 	sync.shared_guard(&s.tombstones_mu)
 	sync.shared_guard(&s.vanished_mu)
 
-	require_recipient := access.gift_wrap_read == .Recipient
+	require_recipient := !walk.mailbox && access.gift_wrap_read == .Recipient
 	nip17_set: Offset_Set
 	defer delete(nip17_set)
 	if require_recipient && len(auth_pks) > 0 {
 		for &f in filters {
 			if filter_may_match_giftwrap(&f) {
-				nip17_set = p_tag_offsets_union(tags_g.data, auth_pks)
+				nip17_set = p_tag_offsets_union(walk.tags, auth_pks)
 				break
 			}
 		}
@@ -1238,15 +1327,18 @@ scan_count_at :: proc(
 
 	// Pre-compute per-filter tag offset sets so the per-entry loop can
 	// reject tag mismatches without deserializing the blob.
-	per_filter_sets := make([][]Offset_Set, len(filters), context.temp_allocator)
-	for &f, fi in filters {
-		specs := build_tag_specs(&f)
-		if len(specs) > 0 {
-			per_filter_sets[fi] = multi_matching_offsets(
-				tags_g.data,
-				specs,
-				context.temp_allocator,
-			)
+	per_filter_sets: [][]Offset_Set
+	if !walk.mailbox {
+		per_filter_sets = make([][]Offset_Set, len(filters), context.temp_allocator)
+		for &f, fi in filters {
+			specs := build_tag_specs(&f)
+			if len(specs) > 0 {
+				per_filter_sets[fi] = multi_matching_offsets(
+					walk.tags,
+					specs,
+					context.temp_allocator,
+				)
+			}
 		}
 	}
 	defer {
@@ -1259,7 +1351,7 @@ scan_count_at :: proc(
 	}
 
 	total: u64
-	for i in 0 ..< total_entries {
+	entry_loop: for i := inventory_next(&walk); i >= 0; i = inventory_next(&walk) {
 		entry := index_entry_at(idx, i)
 		// NIP-40: skip events whose expiration has passed (#118).
 		if index_entry_is_expired(&entry, now) {
@@ -1283,9 +1375,12 @@ scan_count_at :: proc(
 			if !index_entry_matches(&entry, &f) {
 				continue
 			}
-			sets := per_filter_sets[fi]
+			if walk.mailbox {
+				any_filter_passes = true
+				break
+			}
 			miss := false
-			for set in sets {
+			for set in per_filter_sets[fi] {
 				if entry.offset not_in set {
 					miss = true
 					break
@@ -1316,12 +1411,27 @@ scan_count_at :: proc(
 			continue
 		}
 
-		ev, derr := pack.deserialize_trusted(ev_bytes, context.temp_allocator)
+		ev, derr := pack.view_packed(ev_bytes)
 		if derr != .None {
 			continue
 		}
+		tags, terr := pack.view_tags(&ev)
+		if terr != .None {
+			continue
+		}
+		for tag in tags {
+			for field in tag.fields {
+				if !utf8.valid_string(field) {
+					continue entry_loop
+				}
+			}
+		}
+		content, cerr := pack.view_content(&ev)
+		if cerr != .None || !utf8.valid_string(content) {
+			continue
+		}
 		for &f in filters {
-			if event_matches_filter(&f, &ev) {
+			if count_matches(&f, &ev, tags, content) {
 				total += 1
 				break
 			}
@@ -1360,28 +1470,25 @@ iter_negentropy :: proc(
 	err: Error,
 	reason: string,
 ) {
-	idx_g := mapped_file_slice(&s.index)
-	defer slice_release(idx_g)
-	tags_g := mapped_file_slice(&s.tags)
-	defer slice_release(tags_g)
-	data_g := mapped_file_slice(&s.data)
-	defer slice_release(data_g)
-	idx := idx_g.data
-	data := data_g.data
+	walk := inventory_open(s, {filter^}, auth_pks, access)
+	defer inventory_close(s, &walk)
+	idx, data := walk.idx, walk.data
 
 	fsearch, has_search := filter.search.?
 
-	require_recipient := access.gift_wrap_read == .Recipient
+	require_recipient := !walk.mailbox && access.gift_wrap_read == .Recipient
 	nip17_set: Offset_Set
 	defer delete(nip17_set)
 	if require_recipient && len(auth_pks) > 0 && filter_may_match_giftwrap(filter) {
-		nip17_set = p_tag_offsets_union(tags_g.data, auth_pks)
+		nip17_set = p_tag_offsets_union(walk.tags, auth_pks)
 	}
 
-	specs := build_tag_specs(filter)
 	tag_sets: []Offset_Set
-	if len(specs) > 0 {
-		tag_sets = multi_matching_offsets(tags_g.data, specs, context.temp_allocator)
+	if !walk.mailbox {
+		specs := build_tag_specs(filter)
+		if len(specs) > 0 {
+			tag_sets = multi_matching_offsets(walk.tags, specs, context.temp_allocator)
+		}
 	}
 	defer {
 		for set in tag_sets {
@@ -1396,8 +1503,7 @@ iter_negentropy :: proc(
 	{
 		sync.shared_guard(&s.tombstones_mu)
 		sync.shared_guard(&s.vanished_mu)
-		total := index_entry_count(idx)
-		for i in 0 ..< total {
+		for i := inventory_next(&walk); i >= 0; i = inventory_next(&walk) {
 			entry := index_entry_at(idx, i)
 			// NIP-40: skip expired events (#118).
 			if index_entry_is_expired(&entry, now) {
@@ -1434,7 +1540,7 @@ iter_negentropy :: proc(
 			// Match REQ visibility before exposing even an event ID.
 			authed := pk_in(auth_pks, entry.pubkey)
 			if has_search || !authed || access.check != nil {
-				start, end, bok := blob_bounds(idx, i, total, len(data), entry.offset)
+				start, end, bok := blob_bounds(idx, i, walk.slots, len(data), entry.offset)
 				if !bok {
 					return .Io, ""
 				}

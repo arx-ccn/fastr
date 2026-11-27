@@ -46,7 +46,12 @@ a set of every event addressed to the signed-in keys before reading one DM.
 In recipient-only mode, broad authenticated scans still build a recipient
 offset set when the filter can match kind 1059. A `#p` filter must match
 regardless of mode.
-COUNT and negentropy keep their own scans.
+
+COUNT and NIP-77 can read recipient postings for a kind-1059 filter with
+one hex-encoded `#p` key. In recipient-only mode, the connection must be
+authenticated as that key to select the list directly. Both paths still
+check expiry, deletions, and protected events. They scan when a read-policy
+hook is active or the postings are rebuilding.
 
 A filter whose `authors` are all full 32-byte keys reads those authors'
 postings: in-memory runs of index slots, newest first, built at boot and
