@@ -173,6 +173,7 @@ test_mailbox_count_and_neg :: proc(t: ^testing.T) {
 		test_tags(p, test_tag("p", test_hex(other[:]))),
 	)
 	older := test_make_event(1, nostr.KIND_GIFT_WRAP, 20, test_tags(p))
+	tied := test_make_event(2, nostr.KIND_GIFT_WRAP, 20, test_tags(p))
 	expires := nostr.unix_now() + 3600
 	expiring := test_make_event(
 		1,
@@ -181,7 +182,7 @@ test_mailbox_count_and_neg :: proc(t: ^testing.T) {
 		test_tags(p, test_expiry_tag(expires)),
 	)
 	wrong := test_make_event(1, nostr.KIND_GIFT_WRAP, 15, test_tags(test_tag("p", "unrelated")))
-	events := [5]pack.Event{newer, target, older, expiring, wrong}
+	events := [6]pack.Event{newer, target, older, expiring, wrong, tied}
 	for &ev in events {
 		test_append_ok(t, s, &ev)
 	}
@@ -201,18 +202,23 @@ test_mailbox_count_and_neg :: proc(t: ^testing.T) {
 		length := mapped_file_load_len(&s.data)
 		mapped_file_publish_len(&s.data, 0)
 		defer mapped_file_publish_len(&s.data, length)
-		testing.expect_value(t, count_filters_at(s, {mailbox}, nil, expires, access), u64(2))
+		testing.expect_value(t, count_filters_at(s, {mailbox}, nil, expires, access), u64(3))
 		c := collect_ctx_init()
-		err, _ := iter_negentropy(s, &mailbox, nil, 2, &c, policy_collect_id, access)
+		err, _ := iter_negentropy(s, &mailbox, nil, 3, &c, policy_collect_id, access)
 		testing.expect_value(t, err, Error.Rejected)
 		testing.expect_value(t, len(c.ids), 0)
-		err, _ = iter_negentropy(s, &mailbox, nil, 3, &c, policy_collect_id, access)
+		err, _ = iter_negentropy(s, &mailbox, nil, 4, &c, policy_collect_id, access)
 		testing.expect_value(t, err, Error.None)
-		testing.expect_value(t, len(c.ids), 3)
-		if len(c.ids) == 3 {
+		testing.expect_value(t, len(c.ids), 4)
+		if len(c.ids) == 4 {
+			first, second := older.id, tied.id
+			if id_less(second, first) {
+				first, second = second, first
+			}
 			testing.expect_value(t, c.ids[0], expiring.id)
-			testing.expect_value(t, c.ids[1], older.id)
-			testing.expect_value(t, c.ids[2], newer.id)
+			testing.expect_value(t, c.ids[1], first)
+			testing.expect_value(t, c.ids[2], second)
+			testing.expect_value(t, c.ids[3], newer.id)
 		}
 	}
 }

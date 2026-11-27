@@ -84,10 +84,11 @@ Posting_Run :: struct {
 // Events under one key, newest first within each run.
 @(private)
 Posting_List :: struct {
-	runs:     [dynamic]^Posting_Run,
-	count:    int, // postings across all runs
-	last:     u32,
-	literals: u32, // max(u32) if a literal count needs to inspect the postings
+	runs:      [dynamic]^Posting_Run,
+	count:     u32, // at most one posting per index slot
+	last:      u32,
+	literals:  u32, // max(u32) if a literal count needs to inspect the postings
+	uncovered: bool,
 }
 
 // In-memory lookup from a key to the index slots of its events, so a
@@ -295,14 +296,17 @@ posting_add :: proc(lists: ^map[[32]u8]Posting_List, key: [32]u8, posting: Posti
 	}
 	list.last = posting.slot
 	list.count += 1
-	if .Recipient in posting.flags &&
-	   .Protected not_in posting.flags &&
-	   list.literals != max(u32) {
-		if .Covered not_in posting.flags ||
-		   (.Literal in posting.flags && .Expires in posting.flags) {
-			list.literals = max(u32)
-		} else if .Literal in posting.flags {
-			list.literals += 1
+	if .Recipient in posting.flags {
+		if .Covered not_in posting.flags {
+			list.uncovered = true
+		}
+		if .Protected not_in posting.flags && list.literals != max(u32) {
+			if .Covered not_in posting.flags ||
+			   (.Literal in posting.flags && .Expires in posting.flags) {
+				list.literals = max(u32)
+			} else if .Literal in posting.flags {
+				list.literals += 1
+			}
 		}
 	}
 	if idx == nil && len(list.runs) > 0 {

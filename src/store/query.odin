@@ -617,7 +617,7 @@ query_authed :: proc(
 			use_mailbox = true
 			for &pk in auth_pks {
 				list := s.postings.by_recipient[pk]
-				posting_steps += list.count
+				posting_steps += int(list.count)
 				cursors_pin(&cursors, list)
 			}
 		} else if !use_ids && indexed_tags {
@@ -632,7 +632,7 @@ query_authed :: proc(
 						continue
 					}
 					named[author.bytes] = {}
-					posting_steps += list.count
+					posting_steps += int(list.count)
 					append(&lists, list)
 				}
 				use_authors = posting_steps * POSTINGS_INDEX_SHARE <= total
@@ -1234,8 +1234,11 @@ Inventory_Walk :: struct {
 	idx, data, tags: []u8,
 	slots:           int,
 	mailbox:         bool,
+	uncovered:       bool,
+	literals:        u32,
 	key:             [32]u8,
 	cursors:         [dynamic]Posting_Cursor,
+	heads:           []Posting_Cursor,
 	runs_left:       int,
 	next:            int,
 }
@@ -1265,10 +1268,13 @@ inventory_open :: proc(
 	}
 	key, named := mailbox_key(&filters[0])
 	if named && (access.gift_wrap_read == .Public || pk_in(auth, key)) {
+		list := s.postings.by_recipient[key]
 		w.mailbox = true
+		w.uncovered = list.uncovered
+		w.literals = list.literals
 		w.key = key
-		w.cursors = make([dynamic]Posting_Cursor, context.temp_allocator)
-		cursors_pin(&w.cursors, s.postings.by_recipient[key])
+		w.cursors = make([dynamic]Posting_Cursor, 0, len(list.runs), context.temp_allocator)
+		cursors_pin(&w.cursors, list)
 		w.runs_left = len(w.cursors)
 	}
 	return
@@ -1284,6 +1290,13 @@ inventory_close :: proc(s: ^Store, w: ^Inventory_Walk) {
 
 @(private)
 inventory_next :: proc(w: ^Inventory_Walk) -> (int, Posting_Flags) {
+	if w.heads != nil {
+		if len(w.heads) == 0 {
+			return -1, {}
+		}
+		p := posting_next(&w.heads, nil, raw_data(w.idx))
+		return int(p.slot), p.flags
+	}
 	if !w.mailbox && w.next < w.slots {
 		w.next += 1
 		return w.next - 1, {}
@@ -1556,12 +1569,28 @@ iter_negentropy :: proc(
 	}
 
 	now := nostr.unix_now()
+	// Preserve traversal/error precedence when any row can require opening
+	// a stored blob. A fully covered inventory can only hit the record cap.
+	ordered := walk.mailbox && !walk.uncovered && !has_search
+	plain_mailbox :=
+		ordered &&
+		filter.ids == nil &&
+		filter.authors == nil &&
+		filter.since == nil &&
+		filter.until == nil
+	if ordered && len(walk.cursors) > 1 {
+		walk.heads = cursors_heap(walk.cursors[:], nil, raw_data(idx))
+	}
 	items := make([dynamic]Neg_Item, context.temp_allocator)
 
 	{
 		sync.shared_guard(&s.tombstones_mu)
 		sync.shared_guard(&s.vanished_mu)
 		check_dead := !walk.mailbox || s.vanish_pending || walk.key in s.mailbox_deleted
+		if plain_mailbox && !check_dead && walk.literals != max(u32) {
+			// Public literal rows cannot expire or be hidden on this path.
+			reserve(&items, min(int(walk.literals), max(max_records, 0)))
+		}
 		for i, flags := inventory_next(&walk); i >= 0; i, flags = inventory_next(&walk) {
 			entry := index_entry_at(idx, i)
 			// NIP-40: skip expired events (#118).
@@ -1585,7 +1614,7 @@ iter_negentropy :: proc(
 			   entry.offset not_in nip17_set {
 				continue
 			}
-			if !index_entry_matches(&entry, filter) {
+			if !plain_mailbox && !index_entry_matches(&entry, filter) {
 				continue
 			}
 			if len(tag_sets) > 0 {
@@ -1635,6 +1664,21 @@ iter_negentropy :: proc(
 		}
 	}
 
+	if ordered {
+		// Runs merge newest first, with IDs ascending within each second.
+		// Visit timestamp groups backwards without reversing their IDs.
+		for end := len(items); end > 0; {
+			start := end - 1
+			for start > 0 && items[start - 1].ts == items[end - 1].ts {
+				start -= 1
+			}
+			for &item in items[start:end] {
+				cb(user, item.ts, item.id)
+			}
+			end = start
+		}
+		return .None, ""
+	}
 	slice.sort_by(items[:], neg_item_less)
 	for &item in items {
 		cb(user, item.ts, item.id)

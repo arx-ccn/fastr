@@ -111,13 +111,22 @@ seal :: proc(s: ^Storage_Vector) -> Error {
 		return .Already_Sealed
 	}
 	s.sealed = true
-	slice.sort_by(s.items[:], item_less)
+	duplicate := false
 	for i in 1 ..< len(s.items) {
+		if item_less(s.items[i], s.items[i - 1]) {
+			slice.sort_by(s.items[:], item_less)
+			for j in 1 ..< len(s.items) {
+				if s.items[j] == s.items[j - 1] {
+					return .Duplicate_Item
+				}
+			}
+			return .None
+		}
 		if s.items[i] == s.items[i - 1] {
-			return .Duplicate_Item
+			duplicate = true
 		}
 	}
-	return .None
+	return .Duplicate_Item if duplicate else .None
 }
 
 storage_size :: proc(s: ^Storage_Vector) -> (int, Error) {
@@ -148,7 +157,13 @@ find_lower_bound :: proc(s: ^Storage_Vector, first, last: int, value: Bound) -> 
 
 // Fingerprint of items[begin:end]: first 16 bytes of SHA-256 over the sum of
 // the ids mod 2^256 (encoded little-endian) concatenated with varint(count).
-fingerprint :: proc(s: ^Storage_Vector, begin, end: int) -> (fp: [FINGERPRINT_SIZE]u8, err: Error) {
+fingerprint :: proc(
+	s: ^Storage_Vector,
+	begin, end: int,
+) -> (
+	fp: [FINGERPRINT_SIZE]u8,
+	err: Error,
+) {
 	if !s.sealed {
 		return {}, .Not_Sealed
 	}
@@ -396,7 +411,12 @@ reconcile :: proc(
 
 // Emits ranges covering items[lower:upper] up to `upper_bound`: a single
 // IdList for small ranges, otherwise 16 fingerprinted buckets.
-split_range :: proc(n: ^Negentropy, lower, upper: int, upper_bound: Bound, o: ^[dynamic]u8) -> Error {
+split_range :: proc(
+	n: ^Negentropy,
+	lower, upper: int,
+	upper_bound: Bound,
+	o: ^[dynamic]u8,
+) -> Error {
 	num_elems := upper - lower
 
 	if num_elems < DOUBLE_BUCKETS {
