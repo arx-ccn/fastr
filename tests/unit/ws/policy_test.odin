@@ -137,6 +137,36 @@ test_write_policy :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, store.Error.None)
 }
 
+// A signature read back from disk proves nothing: older data may hold events
+// nobody verified. Only one this process checked may skip verification.
+@(test)
+test_reopened_signature_checked :: proc(t: ^testing.T) {
+	dir, derr := os.make_directory_temp("", "fastr_reopened_*", context.allocator)
+	assert(derr == nil)
+	defer {os.remove_all(dir); delete(dir)}
+	unverified := fixtures.signed_event(1, 1, 1000)
+	unverified.sig[0] ~= 1
+	{
+		earlier, serr := store.store_open(dir)
+		assert(serr == .None)
+		aerr, _ := store.store_append(earlier, &unverified)
+		assert(aerr == .None)
+		store.store_close(earlier)
+	}
+	st, serr := store.store_open(dir)
+	assert(serr == .None)
+	defer store.store_close(st)
+	r := Relay {
+		store = st,
+		cfg = {max_event_tags = 100, max_content_length = 1000, relay_url = "wss://relay.test"},
+	}
+	fanout_init(&r.fanout)
+	defer fanout_destroy(&r.fanout)
+	err, reason := ingest_event(&r, {}, &unverified)
+	testing.expect_value(t, err, store.Error.Invalid_Event)
+	testing.expect_value(t, reason, "invalid: bad signature")
+}
+
 @(test)
 test_request_and_live_policy :: proc(t: ^testing.T) {
 	spy := Policy_Spy {

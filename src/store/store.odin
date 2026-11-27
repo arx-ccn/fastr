@@ -79,6 +79,10 @@ Store :: struct {
 	known_ids:              map[[32]u8]Event_Slot,
 	// known_ids_mu also protects the postings and REQ snapshot publication.
 	postings:               Postings,
+	// First index slot appended since the store was opened or last compacted;
+	// under known_ids_mu. Earlier slots came from disk, where nothing vouches
+	// for their signatures.
+	session_slot:           int,
 	query_maps:             ^Query_Maps,
 	// Query early-exit: scan_ceiling[i] is the maximum created_at over index
 	// entries [0..=i] (monotone in i). Scanning newest-slot-first, once the

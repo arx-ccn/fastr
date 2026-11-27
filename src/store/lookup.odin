@@ -9,17 +9,18 @@ import "core:sync"
 
 import "../pack"
 
-// Whether the store holds this id under this exact signature, which it
-// verified when the event arrived. Tombstoned and expired events count until
-// compaction removes them.
-store_has_signed :: proc(s: ^Store, id: ^[32]u8, sig: ^[64]u8) -> bool {
+// Whether an event with this id and this exact signature was appended since
+// the store was opened or last compacted. A caller that verifies everything
+// it appends can take that as proof the signature was checked. Events read
+// from disk never qualify: older data may carry signatures nobody checked.
+store_appended_signed :: proc(s: ^Store, id: ^[32]u8, sig: ^[64]u8) -> bool {
 	maps: ^Query_Maps
 	idx, data: []u8
 	slot: int
 	{
 		sync.shared_guard(&s.known_ids_mu)
 		known, found := s.known_ids[id^]
-		if !found {
+		if !found || int(known.slot) < s.session_slot {
 			return false
 		}
 		slot = int(known.slot)
@@ -31,8 +32,10 @@ store_has_signed :: proc(s: ^Store, id: ^[32]u8, sig: ^[64]u8) -> bool {
 	defer query_maps_release(s, maps)
 
 	// The slot can be stale between a compaction swap and the known_ids
-	// rebuild. The blob's own id decides; a miss only costs the caller a
-	// signature check.
+	// rebuild. Compaction only moves events to lower slots, so whatever sits
+	// at this slot was still appended this session, and the blob's own id
+	// decides whether it is the event asked about. A miss only costs the
+	// caller a signature check.
 	total := index_entry_count(idx)
 	if slot >= total {
 		return false

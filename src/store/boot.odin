@@ -35,6 +35,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 		clear(&s.known_ids)
 		clear(&s.scan_ceiling)
 		reserve(&s.scan_ceiling, total)
+		s.session_slot = total
 		postings_destroy(&s.postings)
 		tags := tags_g.data
 		s.postings = {

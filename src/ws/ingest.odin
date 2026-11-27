@@ -52,10 +52,10 @@ ingest_event :: proc(
 			return .Rejected, pow_reject_reason(pow, cfg.min_pow_difficulty)
 		}
 	}
-	// A resubmission with the id and signature of a stored event pays for a
-	// hash, not a signature check: the hash ties its content to that id, and
-	// the store verified that signature over it.
-	verified := store.store_has_signed(relay.store, &ev.id, &ev.sig)
+	// Every event this process appends passed the check below. A resubmission
+	// with the id and signature of one of them pays for a hash, not a
+	// signature check: the hash ties its content to that id.
+	verified := store.store_appended_signed(relay.store, &ev.id, &ev.sig)
 	if reason, valid := nostr.validate_event(ev, .Skip if verified else .Verify); !valid {
 		return .Invalid_Event, reason
 	}
