@@ -109,6 +109,7 @@ Outbox :: struct {
 	// The connection, for the threads that write to its socket while no
 	// writer owns it. Nil in an outbox that only queues.
 	state:   ^Conn_State,
+	wake:    Maybe(linux.Fd),
 	send_mu: sync.Mutex,
 	pending: int, // queued plus currently being written
 	failed:  bool,
@@ -143,6 +144,28 @@ outbox_send :: proc(o: ^Outbox, msg: Out_Msg, spare: ^[dynamic]u8 = nil) -> bool
 	}
 	// With pending == 0 the channel is empty. A partial batch's suffix is
 	// therefore admitted before any later producer can acquire send_mu.
+	return outbox_enqueue(o, msg)
+}
+
+// Caller holds send_mu. The TLS owner cannot check the queue between the
+// wake and publication, even if it has already read the eventfd counter.
+@(private)
+outbox_enqueue :: #force_inline proc(o: ^Outbox, msg: Out_Msg) -> bool {
+	when tls.ENABLED {
+		if fd, ok := o.wake.?; ok && o.pending == 0 {
+			one: u64 = 1
+			for {
+				_, err := linux.write(fd, ((^[8]u8)(&one))[:])
+				if err == .EINTR {
+					continue
+				}
+				if err != .NONE && err != .EAGAIN {
+					return false
+				}
+				break
+			}
+		}
+	}
 	if !chan.try_send(o.ch, msg) {
 		return false
 	}
@@ -218,12 +241,11 @@ outbox_send_live :: proc(
 	}
 	// The writer may release the event as soon as it is in the channel.
 	shared_event_acquire(shared)
-	if !chan.try_send(o.ch, Out_Msg(Out_Live{live = live})) {
+	if !outbox_enqueue(o, Out_Msg(Out_Live{live = live})) {
 		delete(live.sub_id)
 		shared_event_release(shared)
 		return false
 	}
-	o.pending += 1
 	return true
 }
 

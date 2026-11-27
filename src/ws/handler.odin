@@ -19,6 +19,7 @@ import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
+import "core:sys/linux"
 import "core:thread"
 
 import "../negentropy"
@@ -229,10 +230,31 @@ live_visible :: proc(cs: ^Conn_State, shared: ^Shared_Event) -> bool {
 // ---------------------------------------------------------------------------
 // Connection lifecycle
 
-// Run the full lifecycle for one upgraded WebSocket client. `preload` holds
-// any frame bytes that arrived together with the HTTP upgrade request.
-// Closes everything except the socket itself (caller owns it).
-handle_connection :: proc(relay: ^Relay, stream: ^tls.Server_Stream, preload: []u8, conn_id: u64) {
+// Upgrade and run the client until either side closes it.
+handle_connection :: proc(
+	relay: ^Relay,
+	stream: ^tls.Server_Stream,
+	key: string,
+	preload: []u8,
+	conn_id: u64,
+) {
+	wake: Maybe(linux.Fd)
+	when tls.ENABLED {
+		if stream.ssl != nil {
+			fd, err := linux.eventfd(0, {.NONBLOCK, .CLOEXEC})
+			if err != .NONE {
+				return
+			}
+			wake = fd
+		}
+	}
+	defer if fd, ok := wake.?; ok {
+		linux.close(fd)
+	}
+	if accept_upgrade(stream, key) != .None {
+		return
+	}
+
 	cs := new(Conn_State)
 	defer free(cs)
 	cs.relay = relay
@@ -244,69 +266,94 @@ handle_connection :: proc(relay: ^Relay, stream: ^tls.Server_Stream, preload: []
 	assert(ch_err == nil)
 	cs.outbox.ch = ch
 	cs.outbox.state = cs
+	cs.outbox.wake = wake
 	cs.outbox.conn_id = conn_id
+	defer {
+		chan.destroy(cs.outbox.ch)
+		delete(cs.replay_spare)
+		free(cs.outbox)
+	}
 
 	auth_state_init(&cs.auth)
 	cs.neg_subs = make(map[string]^Neg_Session)
-
-	writer := thread.create_and_start_with_poly_data(cs, writer_loop)
-
-	// NIP-42: send the AUTH challenge immediately on connect.
-	{
-		buf := make([dynamic]u8, REPLY_HEADER_LEN, 96)
-		append(&buf, "[\"AUTH\",\"")
-		append(&buf, cs.auth.challenge)
-		append(&buf, "\"]")
-		send_reply(cs, &buf)
+	defer {
+		for sub_id, session in cs.neg_subs {
+			neg_session_destroy(session)
+			delete(sub_id)
+		}
+		delete(cs.neg_subs)
+		auth_state_destroy(&cs.auth)
+		free_all(context.temp_allocator)
 	}
 
-	// Read loop.
-	read: for {
+	when tls.ENABLED {
+		if stream.ssl != nil {
+			begin_auth(cs)
+			tls_ws_loop(cs)
+			return
+		}
+	}
+	plain_ws_loop(cs)
+}
+
+@(private)
+plain_ws_loop :: proc(cs: ^Conn_State) {
+	writer := thread.create_and_start_with_poly_data(cs, writer_loop)
+	if writer == nil {
+		return
+	}
+	begin_auth(cs)
+	for {
 		incoming, err := conn_next(&cs.conn)
 		if err != .None {
 			if code := close_code_for_error(err); code != 0 {
 				_ = outbox_send(cs.outbox, Out_Msg(Out_Close{code = code}))
 			}
-			break read
+			break
 		}
-		switch incoming.event {
-		case .Message:
-			if incoming.msg_type == .Text {
-				dispatch_text(cs, string(incoming.data))
-			}
-			free_all(context.temp_allocator)
-		case .Ping:
-			payload := make([]u8, len(incoming.data))
-			copy(payload, incoming.data)
-			if !outbox_send(cs.outbox, Out_Msg(Out_Pong{payload = payload})) {
-				delete(payload)
-			}
-		case .Close:
-			// CLOSE_NO_STATUS echoes as an empty close frame (see encode_close).
+		if incoming.event == .Close {
 			_ = outbox_send(cs.outbox, Out_Msg(Out_Close{code = incoming.close_code}))
-			break read
-		case .Pong, .None:
+			break
 		}
+		consume_incoming(cs, incoming)
 	}
-
-	// Cleanup. Unsubscribe first (blocks until in-flight broadcasts that can
-	// see this outbox finish), then close the channel so the writer drains
-	// and exits, then it is safe to destroy the channel.
-	fanout_unsubscribe_all(&relay.fanout, cs.outbox)
-	chan.close(cs.outbox.ch)
+	close_outbox(cs)
 	thread.join(writer)
 	thread.destroy(writer)
-	chan.destroy(cs.outbox.ch)
-	delete(cs.replay_spare)
-	free(cs.outbox)
+}
 
-	for sub_id, session in cs.neg_subs {
-		neg_session_destroy(session)
-		delete(sub_id)
+@(private)
+begin_auth :: proc(cs: ^Conn_State) {
+	buf := make([dynamic]u8, REPLY_HEADER_LEN, 96)
+	append(&buf, "[\"AUTH\",\"")
+	append(&buf, cs.auth.challenge)
+	append(&buf, "\"]")
+	send_reply(cs, &buf)
+}
+
+@(private)
+consume_incoming :: proc(cs: ^Conn_State, incoming: Incoming) {
+	switch incoming.event {
+	case .Message:
+		if incoming.msg_type == .Text {
+			dispatch_text(cs, string(incoming.data))
+		}
+		free_all(context.temp_allocator)
+	case .Ping:
+		payload := make([]u8, len(incoming.data))
+		copy(payload, incoming.data)
+		if !outbox_send(cs.outbox, Out_Msg(Out_Pong{payload = payload})) {
+			delete(payload)
+		}
+	case .Close, .Pong, .None:
 	}
-	delete(cs.neg_subs)
-	auth_state_destroy(&cs.auth)
-	free_all(context.temp_allocator)
+}
+
+@(private)
+close_outbox :: proc(cs: ^Conn_State) {
+	// The shard lock waits out any broadcaster that can still see the outbox.
+	fanout_unsubscribe_all(&cs.relay.fanout, cs.outbox)
+	chan.close(cs.outbox.ch)
 }
 
 @(private)

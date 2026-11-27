@@ -76,6 +76,7 @@ read_request :: proc(
 
 // accept_upgrade sends the 101 Switching Protocols response for the
 // client's Sec-WebSocket-Key (from websocket_upgrade_key).
+@(private)
 accept_upgrade :: proc(stream: ^tls.Server_Stream, key: string) -> Error {
 	buf: [HANDSHAKE_RESPONSE_LEN]u8
 	return send_all(stream, write_handshake_response(buf[:], key))
@@ -111,35 +112,11 @@ conn_destroy :: proc(c: ^Conn) {
 // Incoming.data is valid until the next conn_next call.
 conn_next :: proc(c: ^Conn) -> (msg: Incoming, err: Error) {
 	for {
-		if c.rstart < c.rend {
-			data: []u8
-			event, n, ferr := reader_feed(&c.reader, c.rbuf[c.rstart:c.rend], &data)
-			c.rstart += n
-			if ferr != .None {
-				return {}, ferr
-			}
-			switch event {
-			case .Message:
-				return {.Message, c.reader.msg_type, data, 0}, .None
-			case .Ping:
-				return {.Ping, .Binary, reader_control(&c.reader), 0}, .None
-			case .Close:
-				return {.Close, .Binary, reader_control(&c.reader), c.reader.close_code}, .None
-			case .Pong:
-				continue
-			case .None:
-			// Fall through to recv for more bytes.
-			}
+		incoming, parse_err := conn_parse(c)
+		if parse_err != .None || incoming.event != .None {
+			return incoming, parse_err
 		}
-		if c.rstart == c.rend {
-			c.rstart = 0
-			c.rend = 0
-		} else if c.rend == READ_BUF_LEN {
-			// Partial frame header stranded at the end; compact.
-			c.rend = copy(c.rbuf[:], c.rbuf[c.rstart:c.rend])
-			c.rstart = 0
-		}
-		n, rerr := tls.stream_recv(c.stream, c.rbuf[c.rend:])
+		n, rerr := tls.stream_recv(c.stream, conn_read_buf(c))
 		if rerr != .None {
 			return {}, .Socket
 		}
@@ -148,6 +125,44 @@ conn_next :: proc(c: ^Conn) -> (msg: Incoming, err: Error) {
 		}
 		c.rend += n
 	}
+}
+
+@(private)
+conn_parse :: proc(c: ^Conn) -> (msg: Incoming, err: Error) {
+	for c.rstart < c.rend {
+		data: []u8
+		event, n, ferr := reader_feed(&c.reader, c.rbuf[c.rstart:c.rend], &data)
+		c.rstart += n
+		if ferr != .None {
+			return {}, ferr
+		}
+		switch event {
+		case .Message:
+			return {.Message, c.reader.msg_type, data, 0}, .None
+		case .Ping:
+			return {.Ping, .Binary, reader_control(&c.reader), 0}, .None
+		case .Close:
+			return {.Close, .Binary, reader_control(&c.reader), c.reader.close_code}, .None
+		case .Pong:
+			continue
+		case .None:
+			return {}, .None
+		}
+	}
+	return {}, .None
+}
+
+@(private)
+conn_read_buf :: proc(c: ^Conn) -> []u8 {
+	if c.rstart == c.rend {
+		c.rstart = 0
+		c.rend = 0
+	} else if c.rend == READ_BUF_LEN {
+		// Move an incomplete header only when the buffer has no room left.
+		c.rend = copy(c.rbuf[:], c.rbuf[c.rstart:c.rend])
+		c.rstart = 0
+	}
+	return c.rbuf[c.rend:]
 }
 
 conn_write_text :: proc(c: ^Conn, payload: []u8) -> Error {

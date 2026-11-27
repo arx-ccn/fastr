@@ -43,6 +43,7 @@ main :: proc() {
 Conn_Ctx :: struct {
 	relay:   ^ws.Relay,
 	stream:  tls.Server_Stream,
+	slot:    ^tls.Cert_Slot,
 	active:  ^int, // atomic connection counter
 	conn_id: u64,
 	nip11:   string, // pre-rendered NIP-11 HTTP response
@@ -56,6 +57,19 @@ Conn_Ctx :: struct {
 @(private = "file")
 serve :: proc() {
 	cfg := load_config()
+	slot: ^tls.Cert_Slot
+	if files, configured := cfg.tls_files.?; configured {
+		when !tls.ENABLED {
+			fmt.eprintln("fastr: inbound TLS is disabled in this build")
+			os.exit(1)
+		} else {
+			if files.cert == "" || files.key == "" {
+				fmt.eprintln("fastr: set both FASTR_TLS_CERT_FILE and FASTR_TLS_KEY_FILE")
+				os.exit(1)
+			}
+			slot = start_manual_tls(files.cert, files.key)
+		}
+	}
 	grasp_check_tools(&cfg)
 
 	// Bind first — the port becomes reachable (kernel backlog) while heavier
@@ -170,11 +184,8 @@ serve :: proc() {
 	next_conn_id: u64 = 0
 
 	for {
-		client, _, accept_err := net.accept_tcp(listener)
-		if accept_err != nil {
-			// Transient accept errors must not crash the relay; back off
-			// briefly (covers FD exhaustion without errno introspection).
-			fmt.eprintfln("accept failed: %v; backing off", accept_err)
+		client, accepted := accept_client(listener, slot)
+		if !accepted {
 			time.sleep(100 * time.Millisecond)
 			continue
 		}
@@ -192,6 +203,7 @@ serve :: proc() {
 		ctx := new(Conn_Ctx)
 		ctx.relay = relay
 		ctx.stream.sock = client
+		ctx.slot = slot
 		ctx.active = active
 		ctx.conn_id = next_conn_id
 		ctx.nip11 = nip11_resp
@@ -200,7 +212,11 @@ serve :: proc() {
 		ctx.banner = banner_resp
 		ctx.tos = tos_resp
 		ctx.grasp = grasp_http
-		thread.create_and_start_with_poly_data(ctx, conn_entry, self_cleanup = true)
+		if thread.create_and_start_with_poly_data(ctx, conn_entry, self_cleanup = true) == nil {
+			net.close(client)
+			sync.atomic_sub(active, 1)
+			free(ctx)
+		}
 	}
 }
 
@@ -308,15 +324,33 @@ stats_loop :: proc(ctx: ^Stats_Ctx) {
 @(private = "file")
 conn_entry :: proc(ctx: ^Conn_Ctx) {
 	defer {
+		when tls.ENABLED {
+			tls.server_close(&ctx.stream)
+		}
 		net.close(ctx.stream.sock)
 		sync.atomic_sub(ctx.active, 1)
 		free(ctx)
 		free_all(context.temp_allocator)
 	}
 
+	when tls.ENABLED {
+		if ctx.slot != nil {
+			ssl := tls.server_ssl_new(ctx.slot)
+			if ssl == nil ||
+			   tls.server_attach(&ctx.stream, ssl) != .None ||
+			   tls.server_handshake(&ctx.stream) != .None {
+				return
+			}
+			ctx.stream.read_start = time.tick_now()
+			ctx.stream.read_limit = tls.SERVER_HEAD_LIMIT
+		}
+	}
 	buf: [ws.MAX_HEADER_BYTES]u8
 	req: ws.Request
 	extra, err := ws.read_request(&ctx.stream, buf[:], &req)
+	when tls.ENABLED {
+		ctx.stream.read_limit = 0
+	}
 	if err != .None {
 		return
 	}
@@ -332,10 +366,7 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 	}
 
 	if key, ok := ws.websocket_upgrade_key(&req); ok {
-		if ws.accept_upgrade(&ctx.stream, key) != .None {
-			return
-		}
-		ws.handle_connection(ctx.relay, &ctx.stream, extra, ctx.conn_id)
+		ws.handle_connection(ctx.relay, &ctx.stream, key, extra, ctx.conn_id)
 		return
 	}
 

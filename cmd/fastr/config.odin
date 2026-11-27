@@ -14,10 +14,16 @@ import "../../src/ws"
 
 VERSION :: "0.1.0"
 
+@(private)
+Tls_Files :: struct {
+	cert, key: string,
+}
+
 Config :: struct {
 	// Address/port to bind the TCP listener. Default: 0.0.0.0:8080
 	listen_host:                 string,
 	listen_port:                 u16,
+	tls_files:                   Maybe(Tls_Files),
 	// Maximum concurrent WebSocket connections. Default: 1024
 	max_connections:             int,
 	// Maximum active subscriptions per connection. Default: 20
@@ -148,9 +154,16 @@ load_config :: proc(allocator := context.allocator) -> Config {
 		host = "0.0.0.0"
 	}
 
+	cert, cert_set := os.lookup_env("FASTR_TLS_CERT_FILE", allocator)
+	key, key_set := os.lookup_env("FASTR_TLS_KEY_FILE", allocator)
+	tls_files: Maybe(Tls_Files)
+	if cert_set || key_set {
+		tls_files = Tls_Files{cert, key}
+	}
 	relay_url, url_found := os.lookup_env("FASTR_URL", allocator)
 	if !url_found {
-		relay_url = fmt.aprintf("ws://%s:%d", host, port, allocator = allocator)
+		scheme := "wss" if cert != "" && key != "" else "ws"
+		relay_url = fmt.aprintf("%s://%s:%d", scheme, host, port, allocator = allocator)
 	}
 
 	data_dir, dir_found := os.lookup_env("FASTR_DATA_DIR", allocator)
@@ -268,6 +281,7 @@ load_config :: proc(allocator := context.allocator) -> Config {
 	return Config {
 		listen_host = host,
 		listen_port = u16(port),
+		tls_files = tls_files,
 		max_connections = env_int("FASTR_MAX_CONNECTIONS", 1024),
 		max_subscriptions_per_conn = env_int("FASTR_MAX_SUBSCRIPTIONS", 20),
 		max_filters_per_req = env_int("FASTR_MAX_FILTERS", 32),
