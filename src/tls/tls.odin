@@ -1,11 +1,5 @@
-// Minimal OpenSSL client bindings for outbound wss:// connections.
-// fastr does TLS only at the edge for inbound traffic; this exists so the
-// relay-sync loop can reach wss:// peers. Blocking, one connection at a
-// time — nothing else is bound.
-//
-// Build with -define:FASTR_TLS=false to stub the bindings out: the binary
-// then links no libssl (used by the static distroless Docker image) and
-// wss:// peers fail with .Disabled.
+// OpenSSL bindings and the blocking client for outbound WSS.
+// FASTR_TLS=false omits both OpenSSL libraries.
 package tls
 
 import cc "core:c"
@@ -27,6 +21,10 @@ Error :: enum {
 	Connect,
 	Verify,
 	Handshake,
+	Certificate,
+	Private_Key,
+	Key_Mismatch,
+	Timeout,
 	Closed,
 	Io,
 	// TLS support was compiled out (-define:FASTR_TLS=false).
@@ -89,7 +87,7 @@ when ENABLED {
 			return {}, .Init
 		}
 		// Hostname must outlive the handshake; clone to a NUL-terminated string.
-		hbuf := make([]u8, len(hostname)+1, context.temp_allocator)
+		hbuf := make([]u8, len(hostname) + 1, context.temp_allocator)
 		copy(hbuf, hostname)
 		host := cstring(raw_data(hbuf))
 		SSL_ctrl(c.ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, rawptr(host))
