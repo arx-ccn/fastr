@@ -402,29 +402,33 @@ tag_chain_heads :: proc(chains: ^Tag_Chains, specs: []Tag_Spec) -> (heads: []u32
 	return
 }
 
-// Take the newest record any chain has left at or below slot `top` and step
+// A query's place in the tag chains it reads. Kept in one place in memory
+// so the scan's slot loop, which never touches it, keeps its registers.
+@(private)
+Chain_Walk :: struct {
+	records: pq.Priority_Queue(u32), // newest record each chain has left, largest on top
+	links:   []Tag_Link,
+	top:     int, // the highest slot `until` allows
+	checked: int, // the slot at which the walk last consulted the ceiling
+}
+
+// Take the newest record any chain has left at or below `walk.top` and step
 // its chain back. Returns the record's event, or false when the chains are
 // spent. `tag_end` is the end of that one record: the event may have more
 // after it, which only a candidate that gets as far as its tags looks up.
 @(private)
-tag_chain_next :: proc(
-	chain: ^pq.Priority_Queue(u32),
-	links: []Tag_Link,
-	top: int,
-) -> (
-	event: Event_Slot,
-	found: bool,
-) {
+tag_chain_next :: proc(walk: ^Chain_Walk) -> (event: Event_Slot, found: bool) {
+	chain := &walk.records
 	for pq.len(chain^) > 0 {
 		record := pq.peek(chain^)
-		link := links[record]
+		link := walk.links[record]
 		if link.prev == TAG_NONE {
 			pq.pop(chain)
 		} else {
 			chain.queue[0] = link.prev
 			pq.fix(chain, 0)
 		}
-		if int(link.slot) > top {
+		if int(link.slot) > walk.top {
 			continue
 		}
 		return {slot = link.slot, tag_end = record + 1}, true
@@ -656,10 +660,9 @@ query_authed :: proc(
 	defer delete(recipient_offsets)
 	heads: []Posting_Cursor
 	posting_kinds := fkinds[:] if has_kinds else nil
-	// The newest record each tag chain has left, largest on top: records are
-	// in slot order, so the chains merge newest slot first.
-	chain: pq.Priority_Queue(u32)
-	defer pq.destroy(&chain)
+	// Records are in slot order, so the chains merge newest slot first.
+	chain: Chain_Walk
+	defer pq.destroy(&chain.records)
 	if use_slots {
 		steps = len(cand)
 		if use_postings {
@@ -676,15 +679,16 @@ query_authed :: proc(
 		}
 		if use_tags {
 			pq.init(
-				&chain,
+				&chain.records,
 				proc(a, b: u32) -> bool {return a > b},
 				pq.default_swap_proc(u32),
 				len(tag_heads),
 				context.temp_allocator,
 			)
 			for head in tag_heads {
-				pq.push(&chain, head)
+				pq.push(&chain.records, head)
 			}
+			chain.links = links.links
 		}
 		if use_ids && steps > 1 {
 			if ordered {
@@ -753,22 +757,37 @@ query_authed :: proc(
 	timed := !use_slots && (has_since || has_until)
 
 	// Tag chains run from the newest slot down. They start at the highest
-	// slot `until` allows, and stop where nothing below can reach `since`.
-	chain_top := total - 1
+	// slot `until` allows.
+	chain.top = total - 1
+	chain.checked = total + ZONE_SLOTS
 	if use_tags && has_until {
-		entry, found := zone_entry(s, chain_top, layout, nil, filter.until)
+		entry, found := zone_entry(s, chain.top, layout, nil, filter.until)
 		if !found {
 			return .None
 		}
-		chain_top = entry
+		chain.top = entry
 	}
-	since_checked := total + ZONE_SLOTS
+
+	// A scan bounded by since or until starts at the highest slot whose
+	// block may hold a match, and judges each block below on entering it.
+	// When it passes blocks, the tag cursor is left far above the slot. It
+	// finds its place by search, not by walking the records in between.
+	si := 0
+	if timed {
+		entry, found := zone_entry(s, total - 1, layout, filter.since, filter.until)
+		if !found {
+			return .None
+		}
+		if entry < total - 1 {
+			walk = .Sparse
+		}
+		si = total - 1 - entry
+	}
 
 	// Hold the tombstone snapshot for the scan and emission.
 	sync.shared_guard(&s.tombstones_mu)
 	prev_slot := -1
-	ceiling_checked := total
-	for si := 0; si < steps; si += 1 {
+	for ; si < steps; si += 1 {
 		i: int
 		if use_slots {
 			candidate: Event_Slot
@@ -779,14 +798,20 @@ query_authed :: proc(
 				candidate = posting_next(&heads, posting_kinds, raw_data(idx)).event
 			} else if use_tags {
 				found: bool
-				candidate, found = tag_chain_next(&chain, links.links, chain_top)
+				candidate, found = tag_chain_next(&chain)
 				if !found {
 					break
 				}
-				if has_since && int(candidate.slot) + ZONE_SLOTS <= since_checked {
-					since_checked = int(candidate.slot)
-					if _, reachable := zone_entry(s, since_checked, layout, filter.since, nil);
-					   !reachable {
+				// Chains jump between slots, so they consult the ceiling once
+				// they have moved a block down: nothing below may be new
+				// enough for `since`, or for a full heap.
+				if int(candidate.slot) + ZONE_SLOTS <= chain.checked {
+					chain.checked = int(candidate.slot)
+					if has_since && ceiling_below(s, chain.checked, layout, fsince) {
+						break
+					}
+					if pq.len(heap) == limit &&
+					   ceiling_below(s, chain.checked, layout, pq.peek(heap).created_at) {
 						break
 					}
 				}
@@ -803,34 +828,28 @@ query_authed :: proc(
 			}
 		} else {
 			i = total - 1 - si
-			// A time bound is judged once per block, on entering it, and may
-			// pass this block and others below it.
-			if timed && (si == 0 || i % ZONE_SLOTS == ZONE_SLOTS - 1) {
+		}
+		// 0. On entering a block of ZONE_SLOTS slots. A time bound may pass
+		//    this block and others below it. And scan_ceiling[i] bounds the
+		//    created_at of every entry at slot <= i: once the heap is full
+		//    and the ceiling is strictly below the worst survivor, nothing
+		//    further down can enter the top-N. The heap is also tested when
+		//    it first fills; for mostly chronological ingest this makes the
+		//    scan O(limit), not O(n). A ceiling that ends above slot i, or
+		//    describes another layout, never stops the scan.
+		if i & (ZONE_SLOTS - 1) == ZONE_SLOTS - 1 {
+			if timed {
 				entry, found := zone_entry(s, i, layout, filter.since, filter.until)
 				if !found {
 					break
 				}
 				if entry < i {
-					// The tag cursor is now far above this slot. It finds its
-					// place by search, not by walking the records in between.
 					walk = .Sparse
 				}
 				si += i - entry
 				i = entry
 			}
-		}
-		// 0. Early exit: scan_ceiling[i] bounds the created_at of every entry
-		//    at slot <= i. Once the heap is full and the ceiling is strictly
-		//    below the worst survivor, nothing further down can enter the
-		//    top-N. Test when the heap first fills, then every 1024 slots; for mostly
-		//    chronological ingest this makes the scan O(limit), not O(n).
-		//    Slots past len(scan_ceiling) (snapshot newer than the ceiling)
-		//    are treated as unbounded and never stop the scan.
-		//    Tag chains jump between slots, so they test once they have moved
-		//    1024 slots down.
-		if pq.len(heap) == limit && (i & 1023 == 1023 || use_tags && i + 1024 <= ceiling_checked) {
-			ceiling_checked = i
-			if ceiling_below(s, i, layout, pq.peek(heap).created_at) {
+			if pq.len(heap) == limit && ceiling_below(s, i, layout, pq.peek(heap).created_at) {
 				break
 			}
 		}
