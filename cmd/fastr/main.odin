@@ -79,6 +79,9 @@ serve :: proc() {
 		fmt.eprintfln("fastr: cannot open store at %s: %v", cfg.data_dir, store_err)
 		os.exit(1)
 	}
+	// The boot loaders build their lookup tables in this thread's temp arena,
+	// about 390 bytes per stored event. Nothing else on this thread resets it.
+	free_all(context.temp_allocator)
 
 	relay := new(ws.Relay)
 	plugins := new(Plugin_State)
