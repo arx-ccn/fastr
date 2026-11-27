@@ -1,8 +1,8 @@
 // fastr — a Nostr relay that goes brrrrrrrr. Odin rewrite.
 //
 // Entry point: `fastr` serves; `fastr import <dir> <events.jsonl>` bulk-loads.
-// Thread-per-connection: the accept loop spawns one reader thread per client
-// (the ws package adds a writer thread internally).
+// The acceptors share one listener and start one reader thread per client
+// (the ws package adds a writer thread when needed).
 package main
 
 import "core:fmt"
@@ -187,8 +187,6 @@ serve :: proc() {
 		fmt.eprintfln("grasp enabled; serving repos from %s", grasp_http.dir)
 	}
 
-	active := new(int)
-	next_conn_id: u64 = 0
 	when tls.ENABLED {
 		if managed != nil &&
 		   thread.create_and_start_with_poly_data(managed, acme_scheduler, self_cleanup = true) ==
@@ -197,38 +195,89 @@ serve :: proc() {
 		}
 	}
 
+	state := new(Accept_Ctx)
+	state^ = {
+		listener        = listener,
+		max_connections = cfg.max_connections,
+		relay           = relay,
+		slot            = slot,
+		nip11           = nip11_resp,
+		index           = index_resp,
+		icon            = icon_resp,
+		banner          = banner_resp,
+		tos             = tos_resp,
+		grasp           = grasp_http,
+	}
+	// Main accepts too, even if a helper cannot start.
+	for _ in 0 ..< 3 {
+		if thread.create_and_start_with_poly_data(state, accept_loop, self_cleanup = true) == nil {
+			fmt.eprintln("fastr: cannot start another acceptor")
+			break
+		}
+	}
+	accept_loop(state)
+}
+
+@(private = "file")
+Accept_Ctx :: struct {
+	listener:        net.TCP_Socket,
+	max_connections: int,
+	active:          int,
+	next_conn_id:    u64,
+	relay:           ^ws.Relay,
+	slot:            ^tls.Cert_Slot,
+	nip11:           string,
+	index:           string,
+	icon:            string,
+	banner:          string,
+	tos:             string,
+	grasp:           ^Grasp_Http,
+}
+
+@(private = "file")
+reserve_connection :: proc(state: ^Accept_Ctx) -> bool {
+	active := sync.atomic_load(&state.active)
+	for active < state.max_connections {
+		previous, reserved := sync.atomic_compare_exchange_weak(&state.active, active, active + 1)
+		if reserved {
+			return true
+		}
+		active = previous
+	}
+	return false
+}
+
+@(private = "file")
+accept_loop :: proc(state: ^Accept_Ctx) {
 	for {
-		client, accepted := accept_client(listener, slot)
+		client, accepted := accept_client(state.listener, state.slot)
 		if !accepted {
 			time.sleep(100 * time.Millisecond)
+			continue
+		}
+		if !reserve_connection(state) {
+			net.close(client)
 			continue
 		}
 		// Disable Nagle — prevents the 40ms delayed-ACK interaction that
 		// otherwise dominates REQ->EOSE latency.
 		_ = net.set_option(client, .TCP_Nodelay, true)
 
-		if sync.atomic_load(active) >= cfg.max_connections {
-			net.close(client)
-			continue
-		}
-		sync.atomic_add(active, 1)
-		next_conn_id += 1
-
 		ctx := new(Conn_Ctx)
-		ctx.relay = relay
+		ctx.relay = state.relay
 		ctx.stream.sock = client
-		ctx.slot = slot
-		ctx.active = active
-		ctx.conn_id = next_conn_id
-		ctx.nip11 = nip11_resp
-		ctx.index = index_resp
-		ctx.icon = icon_resp
-		ctx.banner = banner_resp
-		ctx.tos = tos_resp
-		ctx.grasp = grasp_http
+		ctx.slot = state.slot
+		ctx.active = &state.active
+		ctx.conn_id = sync.atomic_add(&state.next_conn_id, 1) + 1
+		ctx.nip11 = state.nip11
+		ctx.index = state.index
+		ctx.icon = state.icon
+		ctx.banner = state.banner
+		ctx.tos = state.tos
+		ctx.grasp = state.grasp
 		if thread.create_and_start_with_poly_data(ctx, conn_entry, self_cleanup = true) == nil {
 			net.close(client)
-			sync.atomic_sub(active, 1)
+			sync.atomic_sub(&state.active, 1)
 			free(ctx)
 		}
 	}

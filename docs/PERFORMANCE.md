@@ -5,6 +5,10 @@ This page describes the production paths exercised by those workloads.
 
 ## Subscription lookup and fanout
 
+The main thread and up to three helpers accept on one TCP listener. They
+share the connection cap and assign unique IDs before starting reader
+threads. TLS negotiation and WebSocket handling stay on each reader thread.
+
 Subscription lookup is indexed by `(outbox pointer, subscription ID)`. Keys
 borrow the subscription-owned string; removal deletes the key before freeing
 that string. Wildcard and kind buckets are disjoint and internally unique,
