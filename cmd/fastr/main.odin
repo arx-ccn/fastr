@@ -19,6 +19,7 @@ import "../../src/pack"
 import "../../src/peersync"
 import secp "../../src/secp256k1"
 import "../../src/store"
+import "../../src/tls"
 import "../../src/ws"
 
 main :: proc() {
@@ -41,7 +42,7 @@ main :: proc() {
 @(private = "file")
 Conn_Ctx :: struct {
 	relay:   ^ws.Relay,
-	sock:    net.TCP_Socket,
+	stream:  tls.Server_Stream,
 	active:  ^int, // atomic connection counter
 	conn_id: u64,
 	nip11:   string, // pre-rendered NIP-11 HTTP response
@@ -190,7 +191,7 @@ serve :: proc() {
 
 		ctx := new(Conn_Ctx)
 		ctx.relay = relay
-		ctx.sock = client
+		ctx.stream.sock = client
 		ctx.active = active
 		ctx.conn_id = next_conn_id
 		ctx.nip11 = nip11_resp
@@ -307,7 +308,7 @@ stats_loop :: proc(ctx: ^Stats_Ctx) {
 @(private = "file")
 conn_entry :: proc(ctx: ^Conn_Ctx) {
 	defer {
-		net.close(ctx.sock)
+		net.close(ctx.stream.sock)
 		sync.atomic_sub(ctx.active, 1)
 		free(ctx)
 		free_all(context.temp_allocator)
@@ -315,7 +316,7 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 
 	buf: [ws.MAX_HEADER_BYTES]u8
 	req: ws.Request
-	extra, err := ws.read_request(ctx.sock, buf[:], &req)
+	extra, err := ws.read_request(&ctx.stream, buf[:], &req)
 	if err != .None {
 		return
 	}
@@ -323,43 +324,43 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 	// GRASP-01: OPTIONS preflight requests get 204 with permissive CORS,
 	// regardless of path.
 	if req.method == "OPTIONS" {
-		_, _ = net.send_tcp(ctx.sock, transmute([]u8)string(OPTIONS_RESPONSE))
+		_ = tls.stream_send(&ctx.stream, transmute([]u8)string(OPTIONS_RESPONSE))
 		return
 	}
-	if grasp_try_handle(ctx.grasp, ctx.sock, &req, extra) {
+	if grasp_try_handle(ctx.grasp, &ctx.stream, &req, extra) {
 		return
 	}
 
 	if key, ok := ws.websocket_upgrade_key(&req); ok {
-		if ws.accept_upgrade(ctx.sock, key) != .None {
+		if ws.accept_upgrade(&ctx.stream, key) != .None {
 			return
 		}
-		ws.handle_connection(ctx.relay, ctx.sock, extra, ctx.conn_id)
+		ws.handle_connection(ctx.relay, &ctx.stream, extra, ctx.conn_id)
 		return
 	}
 
 	if accept, has_accept := ws.header_get(&req, "accept"); has_accept {
 		if strings.contains(accept, "application/nostr+json") {
-			_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.nip11)
+			_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.nip11)
 			return
 		}
 	}
 
 	if req.path == "/icon.png" {
-		_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.icon)
+		_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.icon)
 		return
 	}
 	if req.path == "/banner.png" {
-		_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.banner)
+		_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.banner)
 		return
 	}
 	if req.path == "/tos.txt" {
-		_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.tos)
+		_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.tos)
 		return
 	}
 
 	// Plain browser visit / probe.
-	_, _ = net.send_tcp(ctx.sock, transmute([]u8)ctx.index)
+	_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.index)
 }
 
 // Import events from a JSONL file into the store at `dir`.

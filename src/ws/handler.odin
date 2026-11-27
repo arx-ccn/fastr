@@ -15,7 +15,6 @@
 package ws
 
 import "core:encoding/endian"
-import "core:net"
 import "core:slice"
 import "core:strings"
 import "core:sync"
@@ -27,6 +26,7 @@ import "../nostr"
 import "../pack"
 import "../policy"
 import "../store"
+import "../tls"
 
 OUTBOX_CAPACITY :: 512
 
@@ -141,7 +141,7 @@ writer_loop :: proc(cs: ^Conn_State) {
 		}
 		switch m in msg {
 		case Out_Batch:
-			dead = send_all(cs.conn.sock, m.wire[m.sent:]) != .None
+			dead = send_all(cs.conn.stream, m.wire[m.sent:]) != .None
 			delete(m.wire)
 		case Out_Live:
 			if live_allowed(cs, m.live) {
@@ -232,11 +232,11 @@ live_visible :: proc(cs: ^Conn_State, shared: ^Shared_Event) -> bool {
 // Run the full lifecycle for one upgraded WebSocket client. `preload` holds
 // any frame bytes that arrived together with the HTTP upgrade request.
 // Closes everything except the socket itself (caller owns it).
-handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, conn_id: u64) {
+handle_connection :: proc(relay: ^Relay, stream: ^tls.Server_Stream, preload: []u8, conn_id: u64) {
 	cs := new(Conn_State)
 	defer free(cs)
 	cs.relay = relay
-	conn_init(&cs.conn, sock, relay.cfg.max_message_bytes, preload)
+	conn_init(&cs.conn, stream, relay.cfg.max_message_bytes, preload)
 	defer conn_destroy(&cs.conn)
 
 	cs.outbox = new(Outbox)

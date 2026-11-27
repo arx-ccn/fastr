@@ -457,7 +457,7 @@ test_pong_then_messages :: proc(t: ^testing.T) {
 	c: Conn
 	conn_init(
 		&c,
-		{},
+		nil,
 		preload = {
 			0x8a,
 			0x80,

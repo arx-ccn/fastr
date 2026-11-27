@@ -19,6 +19,7 @@ import "core:time"
 import "../nostr"
 import "../pack"
 import "../policy"
+import "../tls"
 
 @(private = "file")
 make_shared :: proc(kind: u16) -> ^Shared_Event {
@@ -528,7 +529,10 @@ test_partial_replay_order :: proc(t: ^testing.T) {
 	cs := Conn_State {
 		outbox = o,
 	}
-	cs.conn.sock = net.TCP_Socket(pair[0])
+	stream := tls.Server_Stream {
+		sock = net.TCP_Socket(pair[0]),
+	}
+	cs.conn.stream = &stream
 	o.state = &cs
 
 	PAYLOAD :: 128 * 1024
@@ -546,7 +550,7 @@ test_partial_replay_order :: proc(t: ^testing.T) {
 	chan.close(o.ch)
 	w := thread.create_and_start_with_poly_data(&cs, proc(cs: ^Conn_State) {
 		writer_loop(cs)
-		linux.shutdown(linux.Fd(cs.conn.sock), .WR)
+		linux.shutdown(linux.Fd(cs.conn.stream.sock), .WR)
 	})
 	defer thread.destroy(w)
 	for count < len(got) {
@@ -603,8 +607,9 @@ test_perf_subscribe :: proc(t: ^testing.T) {
 // one end of a socket pair. It must not move once opened.
 @(private = "file")
 Live_Conn :: struct {
-	cs:   Conn_State,
-	peer: linux.Fd,
+	cs:     Conn_State,
+	stream: tls.Server_Stream,
+	peer:   linux.Fd,
 }
 
 @(private = "file")
@@ -617,7 +622,8 @@ live_conn_open :: proc(c: ^Live_Conn, r: ^Relay, id: u64, capacity: int, sndbuf:
 	}
 	c.peer = pair[1]
 	c.cs.relay = r
-	c.cs.conn.sock = net.TCP_Socket(pair[0])
+	c.stream.sock = net.TCP_Socket(pair[0])
+	c.cs.conn.stream = &c.stream
 	c.cs.outbox = make_outbox(id, capacity)
 	c.cs.outbox.state = &c.cs
 }
@@ -626,7 +632,7 @@ live_conn_open :: proc(c: ^Live_Conn, r: ^Relay, id: u64, capacity: int, sndbuf:
 live_conn_close :: proc(c: ^Live_Conn) {
 	fanout_unsubscribe_all(&c.cs.relay.fanout, c.cs.outbox)
 	outbox_destroy(c.cs.outbox)
-	linux.close(linux.Fd(c.cs.conn.sock))
+	linux.close(linux.Fd(c.cs.conn.stream.sock))
 	linux.close(c.peer)
 }
 
@@ -760,7 +766,7 @@ test_live_frames_keep_order :: proc(t: ^testing.T) {
 	chan.close(o.ch)
 	w := thread.create_and_start_with_poly_data(&c.cs, proc(cs: ^Conn_State) {
 		writer_loop(cs)
-		linux.shutdown(linux.Fd(cs.conn.sock), .WR)
+		linux.shutdown(linux.Fd(cs.conn.stream.sock), .WR)
 	})
 	defer thread.destroy(w)
 	append(&got, ..peer_read_exact(&c, len(first) + len(second) - len(got)))
@@ -890,7 +896,7 @@ test_broadcasters_keep_order :: proc(t: ^testing.T) {
 
 	for &c in conns {
 		outbox_destroy(c.cs.outbox)
-		linux.close(linux.Fd(c.cs.conn.sock))
+		linux.close(linux.Fd(c.cs.conn.stream.sock))
 		linux.close(c.peer)
 	}
 	outbox_destroy(queued)

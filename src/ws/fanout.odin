@@ -31,6 +31,7 @@ import "core:thread"
 
 import "../nostr"
 import "../pack"
+import "../tls"
 
 // Refcounted event shared across subscriber channels.
 Shared_Event :: struct {
@@ -122,9 +123,10 @@ outbox_send :: proc(o: ^Outbox, msg: Out_Msg, spare: ^[dynamic]u8 = nil) -> bool
 		return false
 	}
 	msg := msg
-	if batch, ok := &msg.(Out_Batch); ok && o.pending == 0 && o.state != nil {
+	if batch, ok := &msg.(Out_Batch);
+	   ok && o.pending == 0 && o.state != nil && (!tls.ENABLED || o.state.conn.stream.ssl == nil) {
 		// No writer owns the socket. Don't block the reader on a slow client.
-		fd := linux.Fd(o.state.conn.sock)
+		fd := linux.Fd(o.state.conn.stream.sock)
 		n, err := linux.send(fd, batch.wire[:], {.DONTWAIT, .NOSIGNAL})
 		if err == .NONE {
 			if int(n) == len(batch.wire) {
@@ -181,12 +183,12 @@ outbox_send_live :: proc(
 	if o.failed {
 		return false
 	}
-	if o.pending == 0 && o.state != nil {
+	if o.pending == 0 && o.state != nil && (!tls.ENABLED || o.state.conn.stream.ssl == nil) {
 		if !live_visible(o.state, shared) {
 			return true
 		}
 		start := live_frame(scratch, sub_id, shared.json)
-		fd := linux.Fd(o.state.conn.sock)
+		fd := linux.Fd(o.state.conn.stream.sock)
 		n, err := linux.send(fd, scratch[start:], {.DONTWAIT, .NOSIGNAL})
 		if err == .NONE && start + int(n) == len(scratch) {
 			return true

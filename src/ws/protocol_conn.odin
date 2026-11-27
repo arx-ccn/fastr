@@ -15,7 +15,7 @@
 //     payloads send a stack header then the caller's payload (two sends).
 package ws
 
-import "core:net"
+import "../tls"
 
 READ_BUF_LEN :: 16 * 1024
 
@@ -24,7 +24,7 @@ READ_BUF_LEN :: 16 * 1024
 WRITE_STACK_LIMIT :: 4 * 1024
 
 Conn :: struct {
-	sock:   net.TCP_Socket,
+	stream: ^tls.Server_Stream,
 	reader: Reader,
 	rbuf:   [READ_BUF_LEN]u8,
 	rstart: int,
@@ -43,7 +43,14 @@ Incoming :: struct {
 // buf is caller-owned (MAX_HEADER_BYTES recommended); req's strings slice
 // into it. extra is any bytes received past the head (the start of frame
 // data) — pass it to conn_init as preload.
-read_request :: proc(sock: net.TCP_Socket, buf: []u8, req: ^Request) -> (extra: []u8, err: Error) {
+read_request :: proc(
+	stream: ^tls.Server_Stream,
+	buf: []u8,
+	req: ^Request,
+) -> (
+	extra: []u8,
+	err: Error,
+) {
 	total := 0
 	for {
 		consumed, perr := parse_request(buf[:total], req)
@@ -56,8 +63,8 @@ read_request :: proc(sock: net.TCP_Socket, buf: []u8, req: ^Request) -> (extra: 
 		if total == len(buf) {
 			return nil, .Http_Headers_Too_Large
 		}
-		n, rerr := net.recv_tcp(sock, buf[total:])
-		if rerr != nil {
+		n, rerr := tls.stream_recv(stream, buf[total:])
+		if rerr != .None {
 			return nil, .Socket
 		}
 		if n == 0 {
@@ -69,9 +76,9 @@ read_request :: proc(sock: net.TCP_Socket, buf: []u8, req: ^Request) -> (extra: 
 
 // accept_upgrade sends the 101 Switching Protocols response for the
 // client's Sec-WebSocket-Key (from websocket_upgrade_key).
-accept_upgrade :: proc(sock: net.TCP_Socket, key: string) -> Error {
+accept_upgrade :: proc(stream: ^tls.Server_Stream, key: string) -> Error {
 	buf: [HANDSHAKE_RESPONSE_LEN]u8
-	return send_all(sock, write_handshake_response(buf[:], key))
+	return send_all(stream, write_handshake_response(buf[:], key))
 }
 
 // conn_init readies c over an upgraded socket. preload is any frame bytes
@@ -79,13 +86,13 @@ accept_upgrade :: proc(sock: net.TCP_Socket, key: string) -> Error {
 // backs the Reader's message buffer (bounded by max_message_bytes).
 conn_init :: proc(
 	c: ^Conn,
-	sock: net.TCP_Socket,
+	stream: ^tls.Server_Stream,
 	max_message_bytes := DEFAULT_MAX_MESSAGE_BYTES,
 	preload: []u8 = nil,
 	allocator := context.allocator,
 ) {
 	assert(len(preload) <= READ_BUF_LEN)
-	c.sock = sock
+	c.stream = stream
 	c.rstart = 0
 	c.rend = copy(c.rbuf[:], preload)
 	reader_init(&c.reader, max_message_bytes, allocator)
@@ -132,8 +139,8 @@ conn_next :: proc(c: ^Conn) -> (msg: Incoming, err: Error) {
 			c.rend = copy(c.rbuf[:], c.rbuf[c.rstart:c.rend])
 			c.rstart = 0
 		}
-		n, rerr := net.recv_tcp(c.sock, c.rbuf[c.rend:])
-		if rerr != nil {
+		n, rerr := tls.stream_recv(c.stream, c.rbuf[c.rend:])
+		if rerr != .None {
 			return {}, .Socket
 		}
 		if n == 0 {
@@ -158,7 +165,7 @@ conn_write_pong :: proc(c: ^Conn, payload: []u8) -> Error {
 
 conn_write_close :: proc(c: ^Conn, code: u16, reason := "") -> Error {
 	buf: [MAX_FRAME_HEADER_LEN + 2 + MAX_CONTROL_PAYLOAD]u8
-	return send_all(c.sock, encode_close(buf[:], code, reason))
+	return send_all(c.stream, encode_close(buf[:], code, reason))
 }
 
 // conn_write frames payload as a single unmasked fin frame and sends it.
@@ -166,19 +173,17 @@ conn_write_close :: proc(c: ^Conn, code: u16, reason := "") -> Error {
 conn_write :: proc(c: ^Conn, opcode: Opcode, payload: []u8) -> Error {
 	if len(payload) <= WRITE_STACK_LIMIT {
 		buf: [WRITE_STACK_LIMIT + MAX_FRAME_HEADER_LEN]u8
-		return send_all(c.sock, encode_frame(buf[:], opcode, payload))
+		return send_all(c.stream, encode_frame(buf[:], opcode, payload))
 	}
 	hdr: [MAX_FRAME_HEADER_LEN]u8
 	n := encode_frame_header(hdr[:], opcode, len(payload))
-	send_all(c.sock, hdr[:n]) or_return
-	return send_all(c.sock, payload)
+	send_all(c.stream, hdr[:n]) or_return
+	return send_all(c.stream, payload)
 }
 
 @(private)
-send_all :: proc(sock: net.TCP_Socket, data: []u8) -> Error {
-	// net.send_tcp already loops until the whole buffer is sent.
-	n, serr := net.send_tcp(sock, data)
-	if serr != nil || n != len(data) {
+send_all :: proc(stream: ^tls.Server_Stream, data: []u8) -> Error {
+	if tls.stream_send(stream, data) != .None {
 		return .Socket
 	}
 	return .None

@@ -1,5 +1,5 @@
-// HTTP request-body reading and chunked response writing over a raw TCP
-// socket, covering what real git clients send: Content-Length bodies,
+// HTTP request-body reading and chunked response writing for
+// Content-Length bodies,
 // Transfer-Encoding: chunked (libcurl switches to it for pushes above
 // http.postBuffer), Content-Encoding: gzip (negotiation POSTs), and
 // Expect: 100-continue.
@@ -7,7 +7,8 @@ package githttp
 
 import "core:compress"
 import "core:compress/deflate"
-import "core:net"
+
+import "../tls"
 
 Body_Error :: enum {
 	None,
@@ -27,7 +28,7 @@ Body_Info :: struct {
 // Read the full request body into memory. `extra` holds bytes that arrived
 // with the request head. Applies gzip decoding when declared.
 read_body :: proc(
-	sock: net.TCP_Socket,
+	stream: ^tls.Server_Stream,
 	extra: []u8,
 	info: Body_Info,
 	max_bytes: int,
@@ -38,7 +39,7 @@ read_body :: proc(
 ) {
 	if info.expect_continue {
 		CONTINUE :: "HTTP/1.1 100 Continue\r\n\r\n"
-		if _, serr := net.send_tcp(sock, transmute([]u8)string(CONTINUE)); serr != nil {
+		if tls.stream_send(stream, transmute([]u8)string(CONTINUE)) != .None {
 			return nil, .Io
 		}
 	}
@@ -47,12 +48,12 @@ read_body :: proc(
 	// hundreds of MB; no second copy, no temp-arena accumulation).
 	raw: []u8
 	if info.chunked {
-		raw = read_chunked(sock, extra, max_bytes, allocator) or_return
+		raw = read_chunked(stream, extra, max_bytes, allocator) or_return
 	} else {
 		if info.content_length < 0 || info.content_length > max_bytes {
 			return nil, .Too_Large if info.content_length > max_bytes else .Malformed
 		}
-		raw = read_exact(sock, extra, info.content_length, allocator) or_return
+		raw = read_exact(stream, extra, info.content_length, allocator) or_return
 	}
 
 	if info.gzip {
@@ -80,7 +81,7 @@ read_body :: proc(
 // Read exactly `total` body bytes, starting with `extra`.
 @(private)
 read_exact :: proc(
-	sock: net.TCP_Socket,
+	stream: ^tls.Server_Stream,
 	extra: []u8,
 	total: int,
 	allocator := context.allocator,
@@ -100,8 +101,8 @@ read_exact :: proc(
 		return nil, .Malformed
 	}
 	for n < total {
-		got, rerr := net.recv_tcp(sock, out[n:])
-		if rerr != nil || got <= 0 {
+		got, rerr := tls.stream_recv(stream, out[n:])
+		if rerr != .None || got <= 0 {
 			return nil, .Io
 		}
 		n += got
@@ -113,16 +114,16 @@ read_exact :: proc(
 // Incremental socket reader with an initial pre-read buffer.
 @(private = "file")
 Conn_Reader :: struct {
-	sock: net.TCP_Socket,
-	buf:  [dynamic]u8, // unconsumed bytes
-	pos:  int,
+	stream: ^tls.Server_Stream,
+	buf:    [dynamic]u8, // unconsumed bytes
+	pos:    int,
 }
 
 @(private = "file")
 reader_fill :: proc(r: ^Conn_Reader) -> bool {
 	tmp: [16 * 1024]u8
-	got, rerr := net.recv_tcp(r.sock, tmp[:])
-	if rerr != nil || got <= 0 {
+	got, rerr := tls.stream_recv(r.stream, tmp[:])
+	if rerr != .None || got <= 0 {
 		return false
 	}
 	append(&r.buf, ..tmp[:got])
@@ -139,7 +140,7 @@ reader_line :: proc(r: ^Conn_Reader) -> (line: string, ok: bool) {
 				return line, true
 			}
 		}
-		if len(r.buf) - r.pos > 1024 { // chunk-size lines are tiny
+		if len(r.buf) - r.pos > 1024 { 	// chunk-size lines are tiny
 			return "", false
 		}
 		if !reader_fill(r) {
@@ -170,7 +171,7 @@ reader_take :: proc(r: ^Conn_Reader, n: int, out: ^[dynamic]u8) -> bool {
 // RFC 9112 chunked transfer decoding.
 @(private)
 read_chunked :: proc(
-	sock: net.TCP_Socket,
+	stream: ^tls.Server_Stream,
 	extra: []u8,
 	max_bytes: int,
 	allocator := context.allocator,
@@ -179,7 +180,7 @@ read_chunked :: proc(
 	err: Body_Error,
 ) {
 	r: Conn_Reader
-	r.sock = sock
+	r.stream = stream
 	r.buf = make([dynamic]u8, 0, max(len(extra), 4096), context.allocator)
 	defer delete(r.buf)
 	append(&r.buf, ..extra)
@@ -251,7 +252,7 @@ read_chunked :: proc(
 
 // Streaming chunked response writer.
 Chunked_Writer :: struct {
-	sock:   net.TCP_Socket,
+	stream: ^tls.Server_Stream,
 	failed: bool,
 }
 
@@ -311,14 +312,6 @@ chunked_send_raw :: proc(w: ^Chunked_Writer, data: []u8) -> bool {
 	if w.failed {
 		return false
 	}
-	sent := 0
-	for sent < len(data) {
-		n, err := net.send_tcp(w.sock, data[sent:])
-		if err != nil || n <= 0 {
-			w.failed = true
-			return false
-		}
-		sent += n
-	}
-	return true
+	w.failed = tls.stream_send(w.stream, data) != .None
+	return !w.failed
 }

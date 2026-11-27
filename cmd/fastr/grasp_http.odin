@@ -14,6 +14,7 @@ import "../../src/githttp"
 import "../../src/grasp"
 import "../../src/nostr"
 import "../../src/pack"
+import "../../src/tls"
 import "../../src/ws"
 
 // Ceiling on a git-upload-pack negotiation body (wants/haves are small).
@@ -47,7 +48,7 @@ Repo_Route :: struct {
 // Returns true when the request was consumed (response sent).
 grasp_try_handle :: proc(
 	g: ^Grasp_Http,
-	sock: net.TCP_Socket,
+	stream: ^tls.Server_Stream,
 	req: ^ws.Request,
 	extra: []u8,
 ) -> bool {
@@ -58,9 +59,10 @@ grasp_try_handle :: proc(
 	if !matched {
 		return false
 	}
-	if g.profiles != nil && g.profiles.cfg.grasp_private &&
+	if g.profiles != nil &&
+	   g.profiles.cfg.grasp_private &&
 	   !grasp_http_auth(g.profiles, route.url_path, req) {
-		_, _ = net.send_tcp(sock, transmute([]u8)string(GRASP_AUTH_RESPONSE))
+		_ = tls.stream_send(stream, transmute([]u8)string(GRASP_AUTH_RESPONSE))
 		return true
 	}
 
@@ -76,22 +78,22 @@ grasp_try_handle :: proc(
 		}
 	}
 	if oerr != .None {
-		_, _ = net.send_tcp(sock, transmute([]u8)string(NOT_FOUND_RESPONSE))
+		_ = tls.stream_send(stream, transmute([]u8)string(NOT_FOUND_RESPONSE))
 		return true
 	}
 	defer git.repo_close(&repo, context.temp_allocator)
 
 	switch {
 	case req.method == "GET" && route.suffix == "/info/refs":
-		grasp_info_refs(sock, &repo, route.query)
+		grasp_info_refs(stream, &repo, route.query)
 	case req.method == "POST" && route.suffix == "/git-upload-pack":
-		grasp_upload_pack(sock, &repo, req, extra)
+		grasp_upload_pack(stream, &repo, req, extra)
 	case req.method == "POST" && route.suffix == "/git-receive-pack":
-		grasp_receive_pack(g, sock, &repo, &route, req, extra)
+		grasp_receive_pack(g, stream, &repo, &route, req, extra)
 	case req.method == "GET" && route.suffix == "":
-		grasp_repo_page(sock, &repo, route.repo_path)
+		grasp_repo_page(stream, &repo, route.repo_path)
 	case:
-		_, _ = net.send_tcp(sock, transmute([]u8)string(NOT_FOUND_RESPONSE))
+		_ = tls.stream_send(stream, transmute([]u8)string(NOT_FOUND_RESPONSE))
 	}
 	return true
 }
@@ -155,7 +157,11 @@ grasp_parse_path :: proc(g: ^Grasp_Http, raw_path: string) -> (route: Repo_Route
 	if route.pr_only {
 		base = strings.concatenate({base, "/prs"}, context.temp_allocator)
 	}
-	route.url_path = fmt.tprintf("/%s/%s.git", nostr.npub_encode(pubkey, context.temp_allocator), net.percent_encode(ident, context.temp_allocator))
+	route.url_path = fmt.tprintf(
+		"/%s/%s.git",
+		nostr.npub_encode(pubkey, context.temp_allocator),
+		net.percent_encode(ident, context.temp_allocator),
+	)
 	if route.pr_only {
 		route.url_path = strings.concatenate({"/prs", route.url_path}, context.temp_allocator)
 	}
@@ -171,7 +177,7 @@ grasp_parse_path :: proc(g: ^Grasp_Http, raw_path: string) -> (route: Repo_Route
 
 // GET /<repo>.git/info/refs?service=git-upload-pack
 @(private = "file")
-grasp_info_refs :: proc(sock: net.TCP_Socket, repo: ^git.Repo, query: string) {
+grasp_info_refs :: proc(stream: ^tls.Server_Stream, repo: ^git.Repo, query: string) {
 	service := ""
 	for param in strings.split(query, "&", context.temp_allocator) {
 		if strings.has_prefix(param, "service=") {
@@ -186,7 +192,7 @@ grasp_info_refs :: proc(sock: net.TCP_Socket, repo: ^git.Repo, query: string) {
 		caps = githttp.RECEIVE_PACK_CAPS
 	case:
 		// Dumb-protocol requests (no service param) are not served.
-		_, _ = net.send_tcp(sock, transmute([]u8)string(NOT_FOUND_RESPONSE))
+		_ = tls.stream_send(stream, transmute([]u8)string(NOT_FOUND_RESPONSE))
 		return
 	}
 
@@ -209,17 +215,17 @@ grasp_info_refs :: proc(sock: net.TCP_Socket, repo: ^git.Repo, query: string) {
 		len(body),
 		allocator = context.temp_allocator,
 	)
-	if _, err := net.send_tcp(sock, transmute([]u8)resp); err != nil {
+	if tls.stream_send(stream, transmute([]u8)resp) != .None {
 		return
 	}
-	_, _ = net.send_tcp(sock, body)
+	_ = tls.stream_send(stream, body)
 }
 
 // POST /<repo>.git/git-receive-pack
 @(private = "file")
 grasp_receive_pack :: proc(
 	g: ^Grasp_Http,
-	sock: net.TCP_Socket,
+	stream: ^tls.Server_Stream,
 	repo: ^git.Repo,
 	route: ^Repo_Route,
 	req: ^ws.Request,
@@ -228,17 +234,17 @@ grasp_receive_pack :: proc(
 	info := grasp_body_info(req)
 	// Push bodies can be huge: heap-allocate and free at request end (the
 	// per-connection temp arena only resets when the connection closes).
-	body, berr := githttp.read_body(sock, extra, info, g.max_pack_bytes, context.allocator)
+	body, berr := githttp.read_body(stream, extra, info, g.max_pack_bytes, context.allocator)
 	if berr != .None {
 		if berr == .Too_Large {
-			_, _ = net.send_tcp(sock, transmute([]u8)string(PAYLOAD_TOO_LARGE_RESPONSE))
+			_ = tls.stream_send(stream, transmute([]u8)string(PAYLOAD_TOO_LARGE_RESPONSE))
 		}
 		return
 	}
 	defer delete(body, context.allocator)
 
 	w := githttp.Chunked_Writer {
-		sock = sock,
+		stream = stream,
 	}
 	if !githttp.chunked_start(&w, "application/x-git-receive-pack-result") {
 		return
@@ -292,23 +298,23 @@ grasp_pr_authorize :: proc(user: rawptr, cmds: []githttp.Ref_Cmd) -> []string {
 // POST /<repo>.git/git-upload-pack
 @(private = "file")
 grasp_upload_pack :: proc(
-	sock: net.TCP_Socket,
+	stream: ^tls.Server_Stream,
 	repo: ^git.Repo,
 	req: ^ws.Request,
 	extra: []u8,
 ) {
 	info := grasp_body_info(req)
-	body, berr := githttp.read_body(sock, extra, info, MAX_UPLOAD_PACK_BODY, context.allocator)
+	body, berr := githttp.read_body(stream, extra, info, MAX_UPLOAD_PACK_BODY, context.allocator)
 	if berr != .None {
 		if berr == .Too_Large {
-			_, _ = net.send_tcp(sock, transmute([]u8)string(PAYLOAD_TOO_LARGE_RESPONSE))
+			_ = tls.stream_send(stream, transmute([]u8)string(PAYLOAD_TOO_LARGE_RESPONSE))
 		}
 		return
 	}
 	defer delete(body, context.allocator)
 
 	w := githttp.Chunked_Writer {
-		sock = sock,
+		stream = stream,
 	}
 	if !githttp.chunked_start(&w, "application/x-git-upload-pack-result") {
 		return
@@ -401,7 +407,7 @@ write_date :: proc(b: ^strings.Builder, unix: i64) {
 // and tags, plus each branch's commit log (first-parent, newest first) with
 // authors and dates.
 @(private = "file")
-grasp_repo_page :: proc(sock: net.TCP_Socket, repo: ^git.Repo, repo_path: string) {
+grasp_repo_page :: proc(stream: ^tls.Server_Stream, repo: ^git.Repo, repo_path: string) {
 	name := repo_path
 	if i := strings.last_index_byte(name, '/'); i >= 0 {
 		name = name[i + 1:]
@@ -525,5 +531,5 @@ grasp_repo_page :: proc(sock: net.TCP_Socket, repo: ^git.Repo, repo_path: string
 		page,
 		allocator = context.temp_allocator,
 	)
-	_, _ = net.send_tcp(sock, transmute([]u8)resp)
+	_ = tls.stream_send(stream, transmute([]u8)resp)
 }
