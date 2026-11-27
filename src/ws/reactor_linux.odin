@@ -178,9 +178,8 @@ plain_loop :: proc(w: ^Plain_Worker) {
 @(private = "file")
 plain_accept :: proc(w: ^Plain_Worker) {
 	s := w.server
-	for _ in 0 ..< 32 {
-		addr: linux.Sock_Addr_Any = ---
-		fd, err := linux.accept(linux.Fd(s.listener), &addr, {.CLOEXEC})
+	for _ in 0 ..< 8 {
+		fd, err := linux.accept(linux.Fd(s.listener), (^linux.Sock_Addr_Any)(nil), {.CLOEXEC})
 		if err == .EINTR || err == .ECONNABORTED {
 			continue
 		}

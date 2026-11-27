@@ -6,9 +6,10 @@ This page describes the production paths exercised by those workloads.
 ## Subscription lookup and fanout
 
 Up to four `epoll` workers share the plaintext listener and connection cap.
-Each worker reads its assigned sockets and limits how many buffered frames it
-handles per turn. Blocking HTTP handlers and WebSocket writes that cannot
-finish immediately run off the reader. TLS keeps one reader per connection.
+Each worker tries at most eight accepts per listener wakeup and limits how
+many buffered frames it handles per turn. Blocking HTTP handlers and
+WebSocket writes that cannot finish immediately run off the reader. TLS
+keeps one reader per connection.
 
 Subscription lookup is indexed by `(outbox pointer, subscription ID)`. Keys
 borrow the subscription-owned string; removal deletes the key before freeing
