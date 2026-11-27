@@ -152,9 +152,11 @@ binaries there. See [benchmark results](docs/BENCHMARKS.md) and
 [performance notes](docs/PERFORMANCE.md).
 
 Install [Odin dev-2026-11a](https://github.com/odin-lang/Odin/releases/tag/dev-2026-11a) and put `odin` on your `PATH`.
+Building the native dependencies also requires CMake, Clang with C++26 support,
+`curl`, `openssl`, and `unzip`.
 
 ```sh
-just vendor   # one-time: clone + build static libsecp256k1
+just vendor   # one-time: build libsecp256k1 and simdjson
 just build    # -> ./fastr
 just test     # run all package test suites
 ```

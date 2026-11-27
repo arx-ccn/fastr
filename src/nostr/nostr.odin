@@ -355,8 +355,8 @@ parse_client_msg :: proc(
 				return Msg_Auth{ev}, "", true
 			}
 			return Msg_Event{ev}, "", true
-		case "REQ", "CLOSE":
-			if fast, parsed := plain_subscription(s, verb, max_filter_values, allocator); parsed {
+		case "REQ", "CLOSE", "COUNT", "NEG-OPEN", "NEG-MSG", "NEG-CLOSE":
+			if fast, parsed := simd_subscription(raw, verb, max_filter_values, allocator); parsed {
 				return fast, "", true
 			}
 		}

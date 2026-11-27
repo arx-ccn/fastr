@@ -6,7 +6,7 @@ trees/
 /fastr-acme
 /fastr-debug
 fastr-smoke
-# vendored libsecp256k1 (cloned + built by `just vendor`)
+# Native dependencies built by `just vendor`
 vendor/
 fastr-graspsmoke
 fastr-wsq

@@ -1,12 +1,12 @@
 # Build the relay binary (release)
-build:
+build: vendor-simdjson
     odin build cmd/fastr -out:fastr -o:speed
 
 build-acme:
     cd cmd/fastr-acme && CGO_ENABLED=0 go build -mod=readonly -trimpath -o ../../fastr-acme .
 
 # Build with debug info
-build-debug:
+build-debug: vendor-simdjson
     odin build cmd/fastr -out:fastr-debug -debug
 
 # Run all package test suites
@@ -36,8 +36,10 @@ check:
     odin check tests/bench/query
     odin check tests/bench/relay
 
-# Clone + build vendored libsecp256k1 (one-time)
-vendor:
+# Build vendored native dependencies (one-time)
+vendor: vendor-secp vendor-simdjson
+
+vendor-secp:
     test -d vendor/secp256k1 || git clone --depth 1 --branch v0.7.0 \
         https://github.com/bitcoin-core/secp256k1 vendor/secp256k1
     cmake -S vendor/secp256k1 -B vendor/secp256k1/build \
@@ -46,6 +48,9 @@ vendor:
         -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_CTIME_TESTS=OFF \
         -DCMAKE_BUILD_TYPE=Release
     cmake --build vendor/secp256k1/build -j
+
+vendor-simdjson:
+    bash src/nostr/build-simdjson.sh
 
 # Run public and whitelisted relay smoke tests on $FASTR_SMOKE_PORT (default 18080).
 smoke: build

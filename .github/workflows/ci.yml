@@ -28,7 +28,7 @@ jobs:
           odin version
 
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang llvm just
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang g++ llvm just openssl unzip
 
       - name: Cache vendored libsecp256k1
         id: secp-cache
@@ -39,7 +39,10 @@ jobs:
 
       - name: Build vendored libsecp256k1
         if: steps.secp-cache.outputs.cache-hit != 'true'
-        run: just vendor
+        run: just vendor-secp
+
+      - name: Build vendored simdjson
+        run: just vendor-simdjson
 
       - name: Check (vet + strict-style)
         run: just check

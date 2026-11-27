@@ -13,7 +13,7 @@ FROM docker.io/library/debian:trixie AS odin-builder
 ARG ODIN_RELEASE=dev-2026-11a
 
 RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  curl ca-certificates git \
+  curl ca-certificates git openssl unzip \
   cmake clang llvm build-essential libssl-dev \
   && rm -rf /var/lib/apt/lists/*
 
@@ -44,7 +44,8 @@ COPY cmd/fastr/ cmd/fastr/
 COPY tests/bench/relay/ tests/bench/relay/
 COPY tests/wsclient/ tests/wsclient/
 
-RUN odin build cmd/fastr -out:fastr -o:speed && strip fastr && \
+RUN bash src/nostr/build-simdjson.sh && \
+    odin build cmd/fastr -out:fastr -o:speed && strip fastr && \
     odin build tests/bench/relay -out:fastr-bench -o:speed && strip fastr-bench && \
     odin version > /odin-version
 
@@ -160,7 +161,7 @@ FROM docker.io/library/debian:trixie-slim AS runner
 
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
   ca-certificates \
-  liblmdb0 libzstd1 libssl3 libsecp256k1-2 \
+  liblmdb0 libzstd1 libssl3 libsecp256k1-2 libstdc++6 \
   procps util-linux \
   && rm -rf /var/lib/apt/lists/*
 

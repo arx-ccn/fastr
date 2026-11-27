@@ -11,6 +11,7 @@ if [[ "$suite" != all && ( ! "$suite" =~ ^[a-z0-9]+$ || ! -d "$root/tests/unit/$
     exit 2
 fi
 
+bash "$root/src/nostr/build-simdjson.sh"
 work=$(mktemp -d "${TMPDIR:-/tmp}/fastr-tests.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 

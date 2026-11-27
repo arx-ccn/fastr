@@ -1,6 +1,55 @@
 package nostr
 
+import "core:c"
+import "core:mem"
 import "core:strings"
+
+import "../pack"
+
+when ODIN_OS == .Darwin || ODIN_OS == .FreeBSD {
+	foreign import simdjson {"../../vendor/simdjson/libfastr_simdjson.a", "system:c++"}
+} else {
+	foreign import simdjson {"../../vendor/simdjson/libfastr_simdjson.a", "system:stdc++"}
+}
+
+@(private = "file")
+Simd_Field_Kind :: enum u8 {
+	End,
+	Ids,
+	Authors,
+	Kinds,
+	Since,
+	Until,
+	Limit,
+	Tag,
+}
+
+@(private = "file")
+Simd_Value :: struct #raw_union {
+	text:   string,
+	number: i64,
+}
+
+@(private = "file")
+Simd_Field :: struct {
+	number:       i64,
+	start, count: int,
+	kind:         Simd_Field_Kind,
+	tag:          u8,
+}
+
+@(private = "file")
+Simd_Subscription :: struct {
+	sid, hex: string,
+	fields:   []Simd_Field,
+	values:   []Simd_Value,
+	filters:  int,
+}
+
+@(default_calling_convention = "c", private = "file")
+foreign simdjson {
+	fastr_read_subscription :: proc(raw: [^]u8, size: c.size_t, max_values: int, out: ^Simd_Subscription) -> c.int ---
+}
 
 @(private)
 wire_skip_space :: #force_inline proc(s: ^string) {
@@ -17,170 +66,123 @@ wire_skip_space :: #force_inline proc(s: ^string) {
 @(private)
 wire_take :: #force_inline proc(s: ^string, c: u8) -> bool {
 	wire_skip_space(s)
-	if len(s^) == 0 || s^[0] != c {return false}
+	if len(s^) == 0 || s^[0] != c {
+		return false
+	}
 	s^ = s^[1:]
 	return true
 }
 
-@(private)
-wire_plain_string :: proc(s: ^string) -> (string, bool) {
-	if !wire_take(s, '"') {return "", false}
-	text := s^
-	for i in 0 ..< len(text) {
-		c := text[i]
-		if c == '"' {
-			s^ = text[i + 1:]
-			return text[:i], true
+@(private = "file")
+own_simd_fields :: proc(
+	frame: ^Simd_Subscription,
+	filters: []Filter,
+	allocator: mem.Allocator,
+) -> bool {
+	index := 0
+	for field in frame.fields {
+		if field.kind == .End {
+			index += 1
+			continue
 		}
-		if c < ' ' || c == '\\' || c >= 0x80 {break}
-	}
-	return "", false
-}
-
-@(private)
-wire_decimal :: proc(s: ^string) -> (i64, bool) {
-	wire_skip_space(s)
-	text := s^
-	neg := len(text) > 0 && text[0] == '-'
-	if neg {text = text[1:]}
-	if len(text) == 0 || text[0] < '0' || text[0] > '9' {return 0, false}
-	if text[0] == '0' {
-		s^ = text[1:]
-		return 0, true
-	}
-	n: i64
-	i := 0
-	for i < len(text) && text[i] >= '0' && text[i] <= '9' {
-		digit := i64(text[i] - '0')
-		if n > (max(i64) - digit) / 10 {return 0, false}
-		n = n * 10 + digit
-		i += 1
-	}
-	s^ = text[i:]
-	return -n if neg else n, true
-}
-
-@(private)
-wire_filter_list :: proc(
-	$T: typeid,
-	s: ^string,
-	max_values: int,
-	allocator := context.allocator,
-) -> (
-	values: [dynamic]T,
-	ok: bool,
-) {
-	if !wire_take(s, '[') || max_values < 0 {return}
-	values.allocator = allocator
-	if wire_take(s, ']') {return values, true}
-	defer if !ok {delete(values)}
-	reserve(&values, 1)
-	for {
-		if len(values) == max_values {return}
-		when T == Hex_Prefix {
-			if !wire_take(s, '"') {return}
-			// Decoding validates every byte, including escapes and control bytes.
-			end := min(len(s^), 64)
-			if end == len(s^) || s^[end] != '"' {
-				end = strings.index_byte(s^[:end], '"')
-				if end < 0 {return}
-			}
-			text := s^[:end]
-			s^ = s^[end + 1:]
-			prefix, _, valid := decode_hex_prefix(text, "hex prefix")
-			if !valid {return}
-			append(&values, prefix)
-		} else {
-			#assert(T == u16)
-			n := wire_decimal(s) or_return
-			if n < 0 || n > i64(max(u16)) {return}
-			append(&values, u16(n))
-		}
-		if wire_take(s, ']') {return values, true}
-		if !wire_take(s, ',') {return}
-	}
-}
-
-@(private)
-wire_index_filter :: proc(
-	s: ^string,
-	max_values: int,
-	allocator := context.allocator,
-) -> (
-	f: Filter,
-	ok: bool,
-) {
-	if !wire_take(s, '{') {return}
-	if wire_take(s, '}') {return f, true}
-	defer if !ok {filter_destroy(&f, allocator)}
-	for {
-		key := wire_plain_string(s) or_return
-		if !wire_take(s, ':') {return}
-		switch key {
-		case "ids", "authors":
-			dst := &f.ids if key == "ids" else &f.authors
-			if dst^ != nil {return}
-			list := wire_filter_list(Hex_Prefix, s, max_values, allocator) or_return
+		f := &filters[index]
+		values := frame.values[field.start:][:field.count]
+		switch field.kind {
+		case .Ids, .Authors:
+			dst := &f.ids if field.kind == .Ids else &f.authors
+			list := make([dynamic]Hex_Prefix, field.count, allocator)
 			dst^ = list
-		case "kinds":
-			if f.kinds != nil {return}
-			list := wire_filter_list(u16, s, max_values, allocator) or_return
-			f.kinds = list
-		case "since", "until", "limit":
-			n := wire_decimal(s) or_return
-			switch key {
-			case "since":
-				if f.since != nil {return}
-				f.since = n
-			case "until":
-				if f.until != nil {return}
-				f.until = n
-			case "limit":
-				if f.limit != nil || n < 0 {return}
-				f.limit = int(n)
+			for &entry, i in list {
+				value := values[i].text
+				prefix, _, valid := decode_hex_prefix(value, "hex prefix")
+				if !valid {
+					return false
+				}
+				entry = prefix
 			}
-		case:
-			return
+		case .Kinds:
+			kinds := make([dynamic]u16, field.count, allocator)
+			for &kind, i in kinds {
+				kind = u16(values[i].number)
+			}
+			f.kinds = kinds
+		case .Since:
+			f.since = field.number
+		case .Until:
+			f.until = field.number
+		case .Limit:
+			f.limit = int(field.number)
+		case .Tag:
+			if f.tags == nil {
+				f.tags = make(map[u8]Tag_Value_Set, allocator)
+			}
+			tags := make(Tag_Value_Set, allocator)
+			for entry in values {
+				value := entry.text
+				if value not_in tags {
+					tags[strings.clone(value, allocator)] = {}
+				}
+			}
+			f.tags[field.tag] = tags
+		case .End:
 		}
-		if wire_take(s, '}') {return f, true}
-		if !wire_take(s, ',') {return}
 	}
+	return true
 }
 
-// A miss leaves validation and its wire-visible reason to core:encoding/json
-// and parse_filter. No view of the input frame escapes a successful parse.
+// On a miss, the JSON parser supplies the legacy wire result or error.
 @(private)
-plain_subscription :: proc(
-	rest, verb: string,
+simd_subscription :: proc(
+	raw, verb: string,
 	max_values: int,
 	allocator := context.allocator,
 ) -> (
 	msg: Client_Msg,
 	ok: bool,
 ) {
-	s := rest
-	if !wire_take(&s, ',') {return}
-	sid := wire_plain_string(&s) or_return
-	if verb == "CLOSE" {
-		if !wire_take(&s, ']') {return}
-		wire_skip_space(&s)
-		if len(s) != 0 {return}
-		return Msg_Close{sub_id = strings.clone(sid, allocator)}, true
+	frame: Simd_Subscription = ---
+	if fastr_read_subscription(raw_data(raw), c.size_t(len(raw)), max_values, &frame) == 0 {
+		return
 	}
-	if !wire_take(&s, ',') {return}
-	first := wire_index_filter(&s, max_values, allocator) or_return
-	filters := make([dynamic]Filter, 1, 1, allocator)
-	filters[0] = first
-	defer if !ok {
-		for &f in filters {filter_destroy(&f, allocator)}
+
+	payload: []u8
+	defer if !ok {delete(payload, allocator)}
+	if verb == "NEG-OPEN" || verb == "NEG-MSG" {
+		if len(frame.hex) % 2 != 0 {
+			return
+		}
+		payload = make([]u8, len(frame.hex) / 2, allocator)
+		if _, err := pack.hex_decode(transmute([]u8)frame.hex, payload); err != .None {
+			return
+		}
+	}
+
+	switch verb {
+	case "CLOSE":
+		return Msg_Close{strings.clone(frame.sid, allocator)}, true
+	case "NEG-CLOSE":
+		return Msg_Neg_Close{strings.clone(frame.sid, allocator)}, true
+	case "NEG-MSG":
+		return Msg_Neg_Msg{strings.clone(frame.sid, allocator), payload}, true
+	case "NEG-OPEN":
+		filter: [1]Filter
+		if !own_simd_fields(&frame, filter[:], allocator) {
+			filter_destroy(&filter[0], allocator)
+			return
+		}
+		return Msg_Neg_Open{strings.clone(frame.sid, allocator), filter[0], payload}, true
+	}
+	filters := make([dynamic]Filter, frame.filters, allocator)
+	if !own_simd_fields(&frame, filters[:], allocator) {
+		for &f in filters {
+			filter_destroy(&f, allocator)
+		}
 		delete(filters)
+		return
 	}
-	for wire_take(&s, ',') {
-		f := wire_index_filter(&s, max_values, allocator) or_return
-		append(&filters, f)
+	sid := strings.clone(frame.sid, allocator)
+	if verb == "COUNT" {
+		return Msg_Count{sid, filters}, true
 	}
-	if !wire_take(&s, ']') {return}
-	wire_skip_space(&s)
-	if len(s) != 0 {return}
-	return Msg_Req{sub_id = strings.clone(sid, allocator), filters = filters}, true
+	return Msg_Req{sid, filters}, true
 }

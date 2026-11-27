@@ -2,8 +2,8 @@
 # =============================================================================
 # Dockerfile - fastr production image (minimal)
 #
-# Builds the Odin relay with a statically linked vendored libsecp256k1 and
-# includes Git and curl for GRASP synchronization and private-peer discovery.
+# Builds the relay with static libsecp256k1 and simdjson. The runtime includes
+# Git and curl for GRASP synchronization and private-peer discovery.
 #
 # Build (--network=host may be needed to fetch the Odin toolchain + secp256k1):
 #   podman build --network=host -f deploy/Dockerfile -t fastr .
@@ -28,7 +28,7 @@ RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -o ../../fastr-acme .
 FROM ubuntu:24.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git cmake make clang llvm curl xz-utils libssl-dev \
+    ca-certificates git cmake make clang g++ llvm curl openssl unzip xz-utils libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Odin toolchain (pinned monthly release).
@@ -53,7 +53,8 @@ COPY src/ src/
 COPY cmd/fastr/ cmd/fastr/
 
 # Keep the TLS client enabled for wss:// repository relays.
-RUN odin build cmd/fastr -out:fastr-bin -o:speed \
+RUN bash src/nostr/build-simdjson.sh \
+    && odin build cmd/fastr -out:fastr-bin -o:speed \
     && strip fastr-bin \
     && mkdir -p /data && chown 65532:65532 /data
 
@@ -65,7 +66,7 @@ RUN odin build cmd/fastr -out:fastr-bin -o:speed \
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git curl libssl3t64 \
+    ca-certificates git curl libssl3t64 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/fastr-bin /fastr

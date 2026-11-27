@@ -101,7 +101,7 @@ test_parse_close_and_unknown :: proc(t: ^testing.T) {
 }
 
 @(private = "file")
-try_plain_subscription :: proc(
+try_simd_subscription :: proc(
 	raw: string,
 	limit: int,
 	allocator := context.allocator,
@@ -111,27 +111,73 @@ try_plain_subscription :: proc(
 ) {
 	s := raw
 	verb := message_verb(&s) or_return
-	if verb != "REQ" && verb != "CLOSE" {
-		return
-	}
-	return plain_subscription(s, verb, limit, allocator)
+	return simd_subscription(raw, verb, limit, allocator)
 }
 
 @(test)
-test_plain_req_decodes_and_owns_fields :: proc(t: ^testing.T) {
+test_simd_count_and_neg :: proc(t: ^testing.T) {
+	count, ok := try_simd_subscription(
+		` ["COUNT","c",{"#p":["abc","abc"],"kinds":[1059]},{}] `,
+		2,
+		context.temp_allocator,
+	)
+	if testing.expect(t, ok) {
+		msg := count.(Msg_Count)
+		testing.expect_value(t, msg.sub_id, "c")
+		testing.expect_value(t, len(msg.filters), 2)
+		testing.expect_value(t, msg.filters[0].kinds.?[0], u16(1059))
+		testing.expect_value(t, len(msg.filters[0].tags['p']), 1)
+		testing.expect(t, "abc" in msg.filters[0].tags['p'])
+	}
+	open, open_ok := try_simd_subscription(
+		`["NEG-OPEN", "n", {"#p":["key"],"since":12}, "610000"]`,
+		1,
+		context.temp_allocator,
+	)
+	if testing.expect(t, open_ok) {
+		msg := open.(Msg_Neg_Open)
+		testing.expect_value(t, msg.filter.since.?, i64(12))
+		testing.expect(t, "key" in msg.filter.tags['p'])
+		testing.expect_value(t, string(msg.msg), "\x61\x00\x00")
+	}
+	for raw in ([?]string{`["COUNT","c",{"#p":["abc","abc"]}]`, `["NEG-MSG","n","610"]`, `["NEG-MSG","n","zz"]`}) {
+		_, _, ok := parse_client_msg(raw, 1, context.temp_allocator)
+		testing.expectf(t, !ok, "decoder accepted %s", raw)
+	}
+	msg, why, extended_ok := parse_client_msg(
+		`["NEG-MSG","n\t","\u0036\u0031",null]`,
+		1,
+		context.temp_allocator,
+	)
+	if testing.expect(t, extended_ok, why) {
+		m := msg.(Msg_Neg_Msg)
+		testing.expect_value(t, m.sub_id, "n\t")
+		testing.expect_value(t, string(m.msg), "a")
+	}
+}
+
+@(test)
+test_simd_req_owns_fields :: proc(t: ^testing.T) {
 	sid := strings.repeat("x/[0]", 32, context.temp_allocator)
 	hex := strings.repeat("ab", 32, context.temp_allocator)
 	frame := fmt.tprintf(
-		" \r\n[ \"REQ\",\t\"%s\", {{\"until\":9223372036854775807,\"ids\":[\"%s\",\"bb\"],\"limit\":0,\"since\":-42,\"kinds\":[0,65535],\"authors\":[]}}, {{\"authors\":[\"ccdd\"]}}, {{}} ] \n",
+		" \r\n[ \"REQ\",\t\"%s\", {{\"until\":9223372036854775807,\"ids\":[\"%s\",\"bb\"],\"limit\":0,\"since\":-42,\"kinds\":[0,65535],\"authors\":[]}}, {{\"authors\":[\"ccdd\"],\"#t\":[\"café\\t\"]}}, {{}} ] \n",
 		sid,
 		hex,
 	)
 	raw := make([]u8, len(frame), context.temp_allocator)
 	copy(raw, frame)
-	msg, ok := try_plain_subscription(string(raw), 2, context.temp_allocator)
+	msg, ok := try_simd_subscription(string(raw), 2, context.temp_allocator)
 	testing.expect(t, ok)
 	if !ok {return}
 	for &b in raw {b = 0}
+	// The next parse overwrites the same thread's simdjson scratch.
+	_, next_ok := try_simd_subscription(
+		` ["COUNT","next",{"#p":["different"],"kinds":[1]}] `,
+		2,
+		context.temp_allocator,
+	)
+	testing.expect(t, next_ok)
 	req := msg.(Msg_Req)
 	testing.expect_value(t, req.sub_id, sid)
 	testing.expect_value(t, len(req.filters), 3)
@@ -146,16 +192,17 @@ test_plain_req_decodes_and_owns_fields :: proc(t: ^testing.T) {
 	testing.expect_value(t, f.kinds.?[1], max(u16))
 	testing.expect_value(t, len(f.authors.?), 0)
 	testing.expect_value(t, req.filters[1].authors.?[0].bytes[1], u8(0xdd))
+	testing.expect(t, "café\t" in req.filters[1].tags['t'])
 	testing.expect(t, req.filters[2].authors == nil)
 }
 
 @(test)
-test_plain_close_owns_id :: proc(t: ^testing.T) {
+test_simd_close_owns_id :: proc(t: ^testing.T) {
 	sid := strings.repeat("._]", 39, context.temp_allocator)
 	frame := fmt.tprintf(`[ "CLOSE", "%s" ]`, sid)
 	raw := make([]u8, len(frame), context.temp_allocator)
 	copy(raw, frame)
-	msg, ok := try_plain_subscription(string(raw), 0, context.temp_allocator)
+	msg, ok := try_simd_subscription(string(raw), 0, context.temp_allocator)
 	testing.expect(t, ok)
 	if !ok {return}
 	for &b in raw {b = 0}
@@ -194,12 +241,13 @@ test_subscription_fallback_preserves_reasons :: proc(t: ^testing.T) {
 		{`["REQ","s",{"since":1e1}]`, "invalid: since not an integer"},
 		{`["REQ","s",{"limit":-1}]`, "invalid: limit not a non-negative integer"},
 		{`["REQ","s",{"ids":["aa"],"ids":["bb"]}]`, "invalid: not valid JSON"},
+		{`["COUNT","s",{"#p":[],"\u0023p":["other"]}]`, "invalid: not valid JSON"},
 		{`["REQ","s",{"ids":["aa"] "limit":1}]`, "invalid: not valid JSON"},
 		{`["REQ","s",{"ids":["aa"]},{"kinds":[1]}`, "invalid: not valid JSON"},
 		{`["CLOSE",7]`, "invalid: CLOSE sub_id not a string"},
 	}
 	for c in cases {
-		_, fast := try_plain_subscription(c.raw, 1, context.allocator)
+		_, fast := try_simd_subscription(c.raw, 1, context.allocator)
 		testing.expectf(t, !fast, "fast decoder accepted %s", c.raw)
 		_, reason, ok := parse_client_msg(c.raw, 1, context.temp_allocator)
 		testing.expectf(t, !ok, "decoder accepted %s", c.raw)
@@ -208,9 +256,9 @@ test_subscription_fallback_preserves_reasons :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_plain_subscription_requires_complete_frame :: proc(t: ^testing.T) {
+test_simd_requires_full_frame :: proc(t: ^testing.T) {
 	for raw in ([?]string{`["REQ","s",{}] false`, `["REQ","s",{"kinds":[1,]}]`, `["REQ","s",{"limit":01}]`, `["CLOSE","s"] []`, `["CLOSE","s",]`, "[\"CLOSE\",\"a\x01b\"]"}) {
-		_, fast := try_plain_subscription(raw, 4, context.allocator)
+		_, fast := try_simd_subscription(raw, 4, context.allocator)
 		testing.expectf(t, !fast, "fast decoder accepted %s", raw)
 	}
 }
