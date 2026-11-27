@@ -46,7 +46,13 @@ Peer :: struct {
 // loop runs the sync schedule forever: an immediate pass at startup, then
 // one pass per interval. Due peers are synced serially; a failed peer backs
 // off without blocking the others. Runs on its own thread.
-loop :: proc(peers: []Peer, relay: ^ws.Relay, interval: u64, max_neg_records: int, max_message_bytes: int) {
+loop :: proc(
+	peers: []Peer,
+	relay: ^ws.Relay,
+	interval: u64,
+	max_neg_records: int,
+	max_message_bytes: int,
+) {
 	for {
 		now := time.time_to_unix(time.now())
 		for &p in peers {
@@ -98,7 +104,11 @@ sync_once :: proc(
 	relay: ^ws.Relay,
 	max_neg_records: int,
 	max_message_bytes: int,
-) -> (ingested: int, ok: bool, why: string) {
+) -> (
+	ingested: int,
+	ok: bool,
+	why: string,
+) {
 	c: ws.Client
 	cerr := ws.client_connect(&c, p.host, p.port, p.path, p.secure, max_message_bytes)
 	if cerr != .None {
@@ -114,10 +124,20 @@ sync_once :: proc(
 	storage := negentropy.storage_make()
 	defer negentropy.storage_destroy(&storage)
 
-	fill := Neg_Fill_Ctx{storage = &storage}
-	principal := policy.Principal{source = .Peer, peer = p.url}
+	fill := Neg_Fill_Ctx {
+		storage = &storage,
+	}
+	principal := policy.Principal {
+		source = .Peer,
+		peer   = p.url,
+	}
 	if relay.hooks.check_request != nil {
-		d := relay.hooks.check_request(relay.hooks.user, &principal, .Neg_Open, []nostr.Filter{filter})
+		d := relay.hooks.check_request(
+			relay.hooks.user,
+			&principal,
+			.Neg_Open,
+			[]nostr.Filter{filter},
+		)
 		if d.reason != .Allow {
 			return 0, false, policy.decision_reason(d)
 		}
@@ -128,7 +148,15 @@ sync_once :: proc(
 		check          = relay.hooks.check_read,
 		gift_wrap_read = relay.cfg.gift_wrap_read,
 	}
-	if serr, _ := store.iter_negentropy(relay.store, &filter, nil, max_neg_records, &fill, neg_fill, access); serr != .None {
+	if serr, _ := store.iter_negentropy(
+		relay.store,
+		&filter,
+		nil,
+		max_neg_records,
+		&fill,
+		neg_fill,
+		access,
+	); serr != .None {
 		return 0, false, "local store scan failed"
 	}
 	if fill.insert_err != .None {
@@ -189,7 +217,12 @@ sync_once :: proc(
 		}
 	}
 
-	fmt.eprintfln("fastr sync: %s: reconcile done: need=%d have=%d", p.url, len(need_ids), len(have_ids))
+	fmt.eprintfln(
+		"fastr sync: %s: reconcile done: need=%d have=%d",
+		p.url,
+		len(need_ids),
+		len(have_ids),
+	)
 	// Pull-only: have_ids (what the peer lacks) is ignored by design.
 	// Fetch and ingest everything the peer has that we don't.
 	for start := 0; start < len(need_ids); start += FETCH_BATCH {
@@ -294,7 +327,16 @@ server_neg_msg :: proc(data: []u8) -> (hex: string, ok: bool) {
 
 // fetch_batch REQs a batch of ids and ingests every EVENT until EOSE.
 @(private)
-fetch_batch :: proc(c: ^ws.Client, relay: ^ws.Relay, principal: policy.Principal, ids: [][32]u8) -> (int, bool, string) {
+fetch_batch :: proc(
+	c: ^ws.Client,
+	relay: ^ws.Relay,
+	principal: policy.Principal,
+	ids: [][32]u8,
+) -> (
+	int,
+	bool,
+	string,
+) {
 	buf := make([dynamic]u8, 0, 32 + len(ids) * 66, context.temp_allocator)
 	defer delete(buf)
 	append(&buf, `["REQ","fetch",{"ids":[`)
@@ -372,7 +414,7 @@ nth_element_span :: proc(data: []u8, n: int) -> string {
 			i^ += 1
 		}
 	}
-	for elem := 0; ; elem += 1 {
+	for elem := 0;; elem += 1 {
 		skip_ws(s, &i)
 		if i >= len(s) {
 			return ""

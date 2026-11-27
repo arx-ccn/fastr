@@ -6,9 +6,9 @@ import "core:strings"
 import "../../src/grasp"
 import "../../src/pack"
 import "../../src/policy"
+import secp "../../src/secp256k1"
 import "../../src/store"
 import "../../src/ws"
-import secp "../../src/secp256k1"
 
 @(private)
 Plugin_State :: struct {
@@ -41,10 +41,17 @@ init_relay :: proc(relay: ^ws.Relay, st: ^store.Store, cfg: ^Config, plugins: ^P
 
 	plugins.grasp_enabled = cfg.grasp_enabled
 	if plugins.grasp_enabled {
-		grasp.state_init(&plugins.grasp, st, cfg.grasp_dir, cfg.grasp_urls, cfg.grasp_acceptance, cfg.grasp_nostr_ref_ttl)
+		grasp.state_init(
+			&plugins.grasp,
+			st,
+			cfg.grasp_dir,
+			cfg.grasp_urls,
+			cfg.grasp_acceptance,
+			cfg.grasp_nostr_ref_ttl,
+		)
 		p := &plugins.profiles
 		p.cfg, p.relay, p.state = cfg, relay, &plugins.grasp
-		p.allowed = make(map[[32]u8]struct {})
+		p.allowed = make(map[[32]u8]struct{})
 		for key in cfg.grasp_whitelist {
 			p.allowed[key] = {}
 		}
@@ -55,13 +62,22 @@ init_relay :: proc(relay: ^ws.Relay, st: ^store.Store, cfg: ^Config, plugins: ^P
 			p.owner = owner
 			p.allowed[owner] = {}
 		}
-		relay.hooks = {user = plugins, check_write = plugin_check_write, after_store = plugin_after_store,
-			check_request = plugin_check_request, check_read = plugin_check_read}
+		relay.hooks = {
+			user          = plugins,
+			check_write   = plugin_check_write,
+			after_store   = plugin_after_store,
+			check_request = plugin_check_request,
+			check_read    = plugin_check_read,
+		}
 	}
 }
 
 @(private)
-plugin_check_write :: proc(user: rawptr, principal: ^policy.Principal, ev: ^pack.Event) -> policy.Decision {
+plugin_check_write :: proc(
+	user: rawptr,
+	principal: ^policy.Principal,
+	ev: ^pack.Event,
+) -> policy.Decision {
 	plugins := (^Plugin_State)(user)
 	if plugins.grasp_enabled {
 		if d := grasp_access(&plugins.profiles, principal.auth_pks); d.reason != .Allow {
@@ -98,7 +114,8 @@ plugin_after_store :: proc(user: rawptr, principal: ^policy.Principal, ev: ^pack
 				return
 			}
 			for &ann in grasp_events(plugins.grasp.store, {grasp.KIND_REPO_ANNOUNCEMENT}) {
-				if grasp_tag(&ann, "d") == ident && ev.pubkey in grasp.maintainer_set(&plugins.grasp, ann.pubkey, ident) {
+				if grasp_tag(&ann, "d") == ident &&
+				   ev.pubkey in grasp.maintainer_set(&plugins.grasp, ann.pubkey, ident) {
 					grasp.after_push(&plugins.grasp, ann.pubkey, ident)
 				}
 			}

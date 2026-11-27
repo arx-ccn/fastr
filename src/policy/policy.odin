@@ -7,10 +7,29 @@ import "core:strings"
 import "../nostr"
 import "../pack"
 
-Source :: enum {Client, Peer, Import}
-Operation :: enum {Req, Count, Neg_Open}
-Visibility :: enum {Hide, Show}
-Reason :: enum {Allow, Blocked, Restricted, Auth_Required, Rate_Limited, Invalid, Error}
+Source :: enum {
+	Client,
+	Peer,
+	Import,
+}
+Operation :: enum {
+	Req,
+	Count,
+	Neg_Open,
+}
+Visibility :: enum {
+	Hide,
+	Show,
+}
+Reason :: enum {
+	Allow,
+	Blocked,
+	Restricted,
+	Auth_Required,
+	Rate_Limited,
+	Invalid,
+	Error,
+}
 
 Principal :: struct {
 	source:   Source,
@@ -35,7 +54,12 @@ Read_Hook :: #type proc(user: rawptr, principal: ^Principal, ev: ^pack.Event_Vie
 Hooks :: struct {
 	user:          rawptr,
 	check_write:   proc(user: rawptr, principal: ^Principal, ev: ^pack.Event) -> Decision,
-	check_request: proc(user: rawptr, principal: ^Principal, op: Operation, filters: []nostr.Filter) -> Decision,
+	check_request: proc(
+		user: rawptr,
+		principal: ^Principal,
+		op: Operation,
+		filters: []nostr.Filter,
+	) -> Decision,
 	check_read:    Read_Hook,
 	after_store:   proc(user: rawptr, principal: ^Principal, ev: ^pack.Event),
 }
@@ -61,13 +85,20 @@ read_packed :: proc(access: Read_Access, dp: []u8) -> (visible: bool, err: pack.
 decision_reason :: proc(d: Decision) -> string {
 	prefix: string
 	switch d.reason {
-	case .Allow: return ""
-	case .Blocked: prefix = "blocked: "
-	case .Restricted: prefix = "restricted: "
-	case .Auth_Required: prefix = "auth-required: "
-	case .Rate_Limited: prefix = "rate-limited: "
-	case .Invalid: prefix = "invalid: "
-	case .Error: prefix = "error: "
+	case .Allow:
+		return ""
+	case .Blocked:
+		prefix = "blocked: "
+	case .Restricted:
+		prefix = "restricted: "
+	case .Auth_Required:
+		prefix = "auth-required: "
+	case .Rate_Limited:
+		prefix = "rate-limited: "
+	case .Invalid:
+		prefix = "invalid: "
+	case .Error:
+		prefix = "error: "
 	}
 	message := d.message
 	if message == "" {

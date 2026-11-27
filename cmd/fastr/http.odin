@@ -117,20 +117,21 @@ relay_info_from_config :: proc(cfg: ^Config, allocator := context.allocator) -> 
 		software = GITWORKSHOP_REPO_URL,
 		version = VERSION,
 		limitation = Limitation {
-			max_message_length = cfg.max_message_bytes,
-			max_subscriptions = cfg.max_subscriptions_per_conn,
-			max_filters = cfg.max_filters_per_req,
-			max_limit = cfg.max_limit,
-			max_subid_length = cfg.max_subid_length,
-			max_event_tags = cfg.max_event_tags,
-			max_content_length = content_limit_for_kind(cfg, 1),
+			max_message_length     = cfg.max_message_bytes,
+			max_subscriptions      = cfg.max_subscriptions_per_conn,
+			max_filters            = cfg.max_filters_per_req,
+			max_limit              = cfg.max_limit,
+			max_subid_length       = cfg.max_subid_length,
+			max_event_tags         = cfg.max_event_tags,
+			max_content_length     = content_limit_for_kind(cfg, 1),
 			// The relay defaults missing `limit` fields in REQ filters to
 			// max_limit (see ws handler clamp_filter), so default_limit == max_limit.
-			default_limit = cfg.max_limit,
+			default_limit          = cfg.max_limit,
 			created_at_upper_limit = nostr.CREATED_AT_WINDOW,
 			created_at_lower_limit = 0,
-			min_pow_difficulty = cfg.min_pow_difficulty,
-			auth_required = cfg.whitelist != nil || (cfg.grasp_enabled && cfg.grasp_private),
+			min_pow_difficulty     = cfg.min_pow_difficulty,
+			auth_required          = cfg.whitelist !=
+				nil || (cfg.grasp_enabled && cfg.grasp_private),
 		},
 	}
 }
@@ -272,7 +273,8 @@ is_relay_info_request :: proc(headers: [][2]string) -> bool {
 }
 
 // Returns the HTML for the relay's index page shown to plain browser visitors.
-INDEX_PAGE_HTML :: `<!DOCTYPE html>
+INDEX_PAGE_HTML ::
+	`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -318,11 +320,7 @@ CORS_HEADERS ::
 	"Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
 
 // Pre-rendered 204 reply for OPTIONS preflight requests (GRASP-01).
-OPTIONS_RESPONSE ::
-	"HTTP/1.1 204 No Content\r\n" +
-	CORS_HEADERS +
-	"Connection: close\r\n" +
-	"\r\n"
+OPTIONS_RESPONSE :: "HTTP/1.1 204 No Content\r\n" + CORS_HEADERS + "Connection: close\r\n" + "\r\n"
 
 // Pre-rendered 413 reply for request bodies over the configured limit
 // (FASTR_GRASP_MAX_PACK_BYTES for pushes).

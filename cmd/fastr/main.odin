@@ -130,7 +130,11 @@ serve :: proc() {
 			sync_ctx.max_neg_records = cfg.max_neg_records
 			sync_ctx.max_message_bytes = cfg.max_message_bytes
 			thread.create_and_start_with_poly_data(sync_ctx, sync_loop_entry, self_cleanup = true)
-			fmt.eprintfln("fastr sync: %d peer(s), interval %ds", len(sync_ctx.peers), cfg.sync_interval)
+			fmt.eprintfln(
+				"fastr sync: %d peer(s), interval %ds",
+				len(sync_ctx.peers),
+				cfg.sync_interval,
+			)
 		}
 	}
 
@@ -149,7 +153,11 @@ serve :: proc() {
 		gc_ctx.interval = u64(max(cfg.grasp_nostr_ref_ttl / 4, 30))
 		thread.create_and_start_with_poly_data(gc_ctx, grasp_gc_loop, self_cleanup = true)
 		if cfg.grasp_sync || cfg.grasp_private {
-			thread.create_and_start_with_poly_data(&plugins.profiles, grasp_sync_loop, self_cleanup = true)
+			thread.create_and_start_with_poly_data(
+				&plugins.profiles,
+				grasp_sync_loop,
+				self_cleanup = true,
+			)
 		}
 
 		fmt.eprintfln("grasp enabled; serving repos from %s", grasp_http.dir)
@@ -206,7 +214,11 @@ grasp_gc_loop :: proc(ctx: ^Grasp_Gc_Ctx) {
 		if n := grasp.gc_nostr_refs(ctx.state); n > 0 {
 			fmt.eprintfln("grasp: deleted %d unclaimed refs/nostr refs", n)
 		}
-		pr_state := grasp.State{store = ctx.state.store, dir = strings.concatenate({ctx.state.dir, "/prs"}, context.temp_allocator), nostr_ref_ttl = ctx.state.nostr_ref_ttl}
+		pr_state := grasp.State {
+			store         = ctx.state.store,
+			dir           = strings.concatenate({ctx.state.dir, "/prs"}, context.temp_allocator),
+			nostr_ref_ttl = ctx.state.nostr_ref_ttl,
+		}
 		_ = grasp.gc_nostr_refs(&pr_state)
 		free_all(context.temp_allocator)
 	}
@@ -351,7 +363,13 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 // Import events from a JSONL file into the store at `dir`.
 // Accepts bare event objects or ["EVENT", {...}] envelopes.
 @(private = "file")
-import_jsonl :: proc(dir: string, jsonl: string) -> (imported, duplicates, failures: u64, ok: bool) {
+import_jsonl :: proc(
+	dir: string,
+	jsonl: string,
+) -> (
+	imported, duplicates, failures: u64,
+	ok: bool,
+) {
 	secp.init()
 	st, store_err := store.store_open(dir)
 	if store_err != .None {
@@ -378,7 +396,13 @@ import_jsonl :: proc(dir: string, jsonl: string) -> (imported, duplicates, failu
 }
 
 @(private)
-import_events :: proc(relay: ^ws.Relay, jsonl: string) -> (imported, duplicates, failures: u64, ok: bool) {
+import_events :: proc(
+	relay: ^ws.Relay,
+	jsonl: string,
+) -> (
+	imported, duplicates, failures: u64,
+	ok: bool,
+) {
 	data, read_err := os.read_entire_file_from_path(jsonl, context.allocator)
 	if read_err != nil {
 		fmt.eprintfln("fastr import: cannot read %s: %v", jsonl, read_err)

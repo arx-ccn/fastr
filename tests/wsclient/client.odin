@@ -5,7 +5,13 @@ import "core:fmt"
 import "core:net"
 import "core:strings"
 
-Error :: enum {None, Socket, Closed, Handshake, Frame}
+Error :: enum {
+	None,
+	Socket,
+	Closed,
+	Handshake,
+	Frame,
+}
 
 // Frames can arrive in the same read as the upgrade response.
 Conn :: struct {

@@ -7,7 +7,11 @@ import "../pack"
 import "../policy"
 
 @(private)
-older_visible :: proc(user: rawptr, principal: ^policy.Principal, ev: ^pack.Event_View) -> policy.Visibility {
+older_visible :: proc(
+	user: rawptr,
+	principal: ^policy.Principal,
+	ev: ^pack.Event_View,
+) -> policy.Visibility {
 	if ev.created_at < 30 {
 		return .Show
 	}
@@ -32,7 +36,9 @@ test_policy_read_paths :: proc(t: ^testing.T) {
 	}
 	f := test_kind_filter(1)
 	f.limit = 2
-	access := policy.Read_Access{check = older_visible}
+	access := policy.Read_Access {
+		check = older_visible,
+	}
 	c := collect_ctx_init()
 	err := query_authed(s, &f, nil, &c, collect_cb, access)
 	testing.expect_value(t, err, Error.None)
