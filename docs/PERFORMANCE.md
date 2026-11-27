@@ -33,12 +33,58 @@ Broad inbox reads still build a recipient offset set before scanning. For
 both paths, a `#p` filter must match independently of the recipient check.
 COUNT and negentropy keep their own scans.
 
+A filter whose `authors` are all full 32-byte keys reads those authors'
+postings: in-memory runs of index slots, newest first, built at boot and
+extended on every append. Each posting carries the event's kind, so a `kinds`
+filter passes over other kinds without reading `index.o`, and `until` starts
+each run with a binary search. The query merges the runs through a heap and
+stops at `limit` or `since`. Tombstone, expiry, tag, protected-event, and
+read-policy checks run on each candidate as they do in the scan. A gift wrap
+found through its author still needs a `p` tag for an authenticated key.
+
+When the named authors hold more than one eighth of the index, the query
+scans as before. `POSTINGS_INDEX_SHARE` in `src/store/query.odin` records the
+measurement behind that cutoff. Exact-ID lookups and authenticated gift-wrap
+inbox reads keep their own paths and take precedence. A query also scans
+while the postings do not match its snapshot of the index, which lasts from a
+compaction swap until the rebuild that follows it. Author prefixes, tag
+filters, and `kinds` filters other than that inbox read still scan.
+
+A posting is 12 bytes. Every event has one under its author, and a gift wrap
+has one more under each recipient. The maps, lists, and runs that hold them
+come on top; the benchmark notes record the measured growth.
+
 The in-process performance fixtures exercise fanout, exact-ID and broad store
-queries, REQ handling, subscription replacement, and recipient lookup. They
-check ordered IDs, complete JSON frames, exactly-once delivery, overlapping
-filters with empty leading or middle filters, and full-outbox cleanup.
+queries, REQ handling, subscription replacement, recipient lookup, and author
+postings. They check ordered IDs, complete JSON frames, exactly-once
+delivery, overlapping filters with empty leading or middle filters, and
+full-outbox cleanup.
 These fixtures do not measure sockets,
 network throughput, or power-loss durability.
+
+## Ingest and replies
+
+Before it checks a signature, `ingest_event` asks the store whether an event
+with the same ID and the same signature was appended since the store was
+opened or last compacted. Ingest verifies every event it appends, so such a
+signature has already been checked, and ingest skips only the signature
+check. It still checks the timestamp bounds and the ID hash, and the hash
+ties the submitted content to that ID. The event then takes the usual path
+through policy and the store, so every reply is unchanged. An event that was
+on disk at startup, or that arrives with a different signature, is verified
+in full.
+
+`secp256k1.verify` keeps parsed x-only keys in a per-thread table of 256
+entries, indexed by the first key byte. Parsing a key costs a field square
+root, about a tenth of a verification.
+
+The reader thread frames OK, NOTICE, CLOSED, COUNT, AUTH, and NEG-* replies
+and writes them with a nonblocking send when the socket has no frame pending.
+Otherwise the writer thread sends them in order. Stored-event replays already
+took this path.
+
+[Measurements](BENCHMARKS.md#ingest-replies-and-author-postings-2026-11-27)
+cover ingest, author filters, boot time, and memory.
 
 ## Stored-event query responses
 

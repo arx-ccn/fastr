@@ -86,7 +86,11 @@ malformed replies, missing events, and duplicate query events fail.
 These are closed-loop client measurements, not maximum relay capacity.
 Each worker has one WebSocket and one outstanding operation. Wall time
 includes thread/connection setup, wire I/O, JSON parsing, body validation,
-and CLOSE messages. Latency runs from send to validated OK/EOSE.
+and CLOSE messages. Latency runs from send to validated OK/EOSE. The driver
+reports it in time-stamp counter cycles and tags each row with that unit; the
+runner's TSV columns are `p50_cycles` and `p99_cycles`. Divide by the
+counter's rate to get time. Tables recorded before 2026-11-27 keep the units
+they are labeled with.
 Rates and percentiles count successful operations only. Each workload
 needs all repeats to succeed; queries also require every ingest workload
 to succeed in that repeat. Startup failures, timeouts, malformed output,
@@ -480,3 +484,94 @@ the final build (141–149 and 151–158), median validated requests/s were:
 Only one run cleared all three cutoffs together. Against starting fastr,
 the final medians changed +0.33%, −1.30% and −0.34% respectively. The
 inbox CPU saving did not establish a throughput improvement on all three.
+
+## Ingest replies and author postings: 2026-11-27
+
+These runs compare two fastr builds: `cac8ed5aa6` (before) and `932f4bbbeb`
+(after). The later build skips verification for an event it has already
+verified and appended, writes replies directly, caches parsed keys, and
+indexes events by author. Both were built with Odin
+`dev-2026-10:84bc3fc21 -o:speed`. The relay ran on CPUs 8–15 and the driver on
+CPUs 0–7 of a Ryzen AI Max+ 395, with the data directory on tmpfs. The
+workstation was not isolated.
+
+Costs are in CPU cycles. Relay cycles and instructions come from
+`perf stat -e cycles:u,instructions:u` attached to the relay for one workload
+and divided by its operations. They count user space only, because
+`perf_event_paranoid` is 2 on this host, so socket and scheduler work in the
+kernel is not in them. Latency is the driver's, in time-stamp counter cycles;
+the counter ran at 2,994 MHz. Cycle columns are in thousands.
+
+### Ingest
+
+`fastr-bench ingest --events 400000 --concurrency 8` ran twice against a fresh
+database, so every event of the second run was a duplicate. Three passes
+alternated the builds. The driver signs with one key, so in the fresh run
+every parsed-key lookup after a connection's first event hit. A relay that
+sees many authors on one connection gains less from that cache. The duplicate
+run skips verification and never reaches it.
+
+| | `cac8ed5aa6` | `932f4bbbeb` |
+|---|---:|---:|
+| Fresh events/s | 138,344–145,210 | 178,277–181,412 |
+| Fresh relay cycles/event | 139.8–143.8 | 123.3–123.8 |
+| Fresh relay instructions/event | 514.8–514.9 | 472.1–472.4 |
+| Fresh latency p50 / p99 | 142.6–149.8 / 274.4–299.5 | 118.1–120.0 / 218.0–222.8 |
+| Duplicate events/s | 148,019–150,220 | 450,300–458,888 |
+| Duplicate relay cycles/event | 136.4–137.8 | 17.0–17.2 |
+| Duplicate relay instructions/event | 510.7–511.1 | 59.1–59.4 |
+| Duplicate latency p50 / p99 | 141.1–143.0 / 271.4–281.2 | 49.3–50.1 / 84.8–86.5 |
+
+Writing a reply without waking the writer thread saves kernel work, which
+these cycle counts leave out. It shows in the fresh-event rate and latency.
+
+### Author filters
+
+The data set was the suite's with 1,000,000 base events: 1,110,000 events from
+eight authors, stored in the order eight connections delivered them. A ninth
+author, X, added 2,000 events. Author A is one of the eight and holds 138,750
+events, just under one eighth. `fastr-bench query` used eight connections,
+4,000 requests per row (1,000 for rows that name A, 500 for the last row), and
+two passes.
+
+| Filter | Relay cycles/req, `cac8ed5aa6` | `932f4bbbeb` | Requests/s, `cac8ed5aa6` | `932f4bbbeb` |
+|---|---:|---:|---:|---:|
+| Author with no events, limit 20 | 22,730–23,310 | 5.8–6.1 | 1,488–1,508 | 363,229–426,503 |
+| X, limit 20 | 20,441–22,034 | 14.5–16.0 | 1,545–1,677 | 98,758–102,151 |
+| X, `kinds` [0], no match | 22,984–23,489 | 12.5–14.4 | 1,485–1,523 | 351,726–357,401 |
+| X, `until` at X's midpoint, limit 20 | 22,635–22,727 | 15.1–16.8 | 1,568–1,593 | 95,073–95,895 |
+| X, a `#t` no event has | 44,774–52,648 | 65.8–66.8 | 666–789 | 193,511–195,898 |
+| A, `kinds` [0], no match | 21,409–23,485 | 365.9–413.9 | 1,499–1,535 | 51,768–62,554 |
+| A, limit 100 | 483.4–487.0 | 263.6–327.9 | 2,346–2,433 | 2,282–2,524 |
+| A and X, limit 100 | 515.5–521.4 | 533.1–595.1 | 2,337–2,438 | 2,245–2,489 |
+| `kinds` [30023] only, no match | 22,710–22,775 | 22,543–22,894 | 1,510–1,588 | 1,556–1,569 |
+
+The last two rows scan in both builds. A and X together hold more than one
+eighth of the index, and kind 30023 has no postings. The driver limits the
+rows that return 100 events: it receives and decodes about 800 KiB per reply.
+Standalone `query` checks that each reply completes, not the event bodies.
+
+### Boot and memory
+
+Each build started on the 1,112,000-event data set and answered one
+`{"limit":1}` REQ. Cycles and instructions are the relay's user-space totals
+from process start, in millions. Three passes.
+
+| | `cac8ed5aa6` | `932f4bbbeb` |
+|---|---:|---:|
+| Cycles to first EOSE | 5,027–5,299 | 6,668–6,877 |
+| Instructions to first EOSE | 10,270–10,287 | 14,817–14,851 |
+| Anonymous RSS at first EOSE, MB | 539.0–539.4 | 135.8–137.1 |
+
+Boot sorts each author's postings by time. The eight connections interleaved
+this data set, so the sort had work to do. On 400,000 events from one author,
+stored in time order, boot took 976–982 million cycles before and
+960–1,001 million after, and RSS fell from 271.3–271.7 MB to 62.3–64.4 MB.
+
+These runs do not cover kernel cycles, cold page cache, deletions, more than
+nine authors over the wire, or queries during compaction. The in-process
+fixture that set `POSTINGS_INDEX_SHARE` used 4,000 authors.
+
+Raw output, binary hashes, the driver scripts (`lib.sh`, `i.sh`, `a.sh`,
+`boot.sh`), and that fixture (`calib_test.odin`) are in
+`~/.cache/fastr-bench/juice/`, with the output under `raw/`.

@@ -43,8 +43,11 @@ data/
 gates, reading fields straight from the `mmap` — no per-record decode. An
 in-memory prefix-max of `created_at` stops the scan as soon as nothing older
 can still crack the top-N (O(limit) for chronological ingest, not O(n)), and
-full-length id lookups skip the scan entirely via an id→slot map. Matching
-blobs are `mmap`-sliced and transcoded to JSON.
+full-length id lookups skip the scan entirely via an id→slot map. A filter
+that names full author keys and no ids reads those authors' in-memory posting
+lists instead, while the authors hold at most an eighth of the index.
+[Performance notes](docs/PERFORMANCE.md) list the other cases that scan.
+Matching blobs are `mmap`-sliced and transcoded to JSON.
 
 **Write path:** append blob, append index record.
 
