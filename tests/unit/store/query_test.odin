@@ -2,7 +2,9 @@
 package store
 
 import "core:fmt"
+import "core:mem"
 import "core:slice"
+import "core:sync"
 import "core:testing"
 
 import "../nostr"
@@ -889,6 +891,88 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 			}
 		}
 	}
+}
+
+// Runs a compaction inside the first temporary allocation that a query makes
+// after it has pinned its files and before it locks anything else: the point
+// where a compaction overtakes a running query.
+@(private = "file")
+Compact_Midway :: struct {
+	s:       ^Store,
+	backing: mem.Allocator,
+	pins:    int, // references to the store's query maps before the query
+	done:    bool,
+	err:     Error,
+}
+
+@(private = "file")
+compact_midway :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	loc := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	hook := (^Compact_Midway)(data)
+	if !hook.done && sync.atomic_load(&hook.s.query_maps.refs) > hook.pins {
+		hook.done = true
+		_, hook.err = store_compact(hook.s)
+	}
+	return hook.backing.procedure(
+		hook.backing.data,
+		mode,
+		size,
+		alignment,
+		old_memory,
+		old_size,
+		loc,
+	)
+}
+
+// A compaction that finishes while a query still reads the old files leaves
+// a ceiling and zones for slots the query does not have. Here it drops slot
+// 0, so the query's only match moves from the second block into the first,
+// and the new second block holds one event newer than the bound. A query
+// that trusted those zones would pass over its match.
+@(test)
+test_bounds_keep_to_layout :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	expired := test_make_event(1, 1, 400, test_tags(test_expiry_tag(1)))
+	nd_legacy(t, dir, expired)
+	s := test_open(t, dir)
+	defer store_close(s)
+	for i in 1 ..< ZONE_SLOTS {
+		newer := test_make_event(2, 1, i64(2000 + i), nil)
+		test_append_ok(t, s, &newer)
+	}
+	match := test_make_event(1, 1, 500, nil)
+	test_append_ok(t, s, &match)
+	last := test_make_event(2, 1, 5000, nil)
+	test_append_ok(t, s, &last)
+
+	f := nostr.Filter {
+		until = 1000,
+		limit = 10,
+	}
+	hook := Compact_Midway {
+		s       = s,
+		backing = context.temp_allocator,
+		pins    = s.query_maps.refs,
+	}
+	got: [][32]u8
+	{
+		context.temp_allocator = mem.Allocator{compact_midway, &hook}
+		got = test_query_ids(t, s, &f, nil)
+	}
+	testing.expect(t, hook.done, "the compaction must run inside the query")
+	testing.expect_value(t, hook.err, Error.None)
+	testing.expect_value(t, int(s.index.logical_len) / INDEX_ENTRY_SIZE, ZONE_SLOTS + 1)
+	testing.expect(t, slice.equal(got, [][32]u8{match.id}))
 }
 
 @(private = "file")
