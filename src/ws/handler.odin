@@ -2,10 +2,10 @@
 // the EVENT/REQ/COUNT/AUTH/NEG-* handlers.
 //
 // Threading model: one reader thread (this proc) + one writer thread per
-// connection. An idle outbox sends replies and replays without waking the writer.
-// Otherwise the writer sends queued frames in order. It also applies the
-// NIP-17/NIP-70 live-event visibility gates using the auth state shared
-// through the outbox.
+// connection. An idle outbox sends replies, replays and live events without
+// waking the writer. Otherwise the writer sends queued frames in order.
+// Whichever thread writes a live event applies the NIP-17/NIP-70 visibility
+// gates, using the auth state reached through the outbox.
 //
 // Allocation model: each inbound message is parsed into
 // context.temp_allocator and the arena is reset after dispatch. Anything
@@ -144,10 +144,16 @@ writer_loop :: proc(cs: ^Conn_State) {
 			dead = send_all(cs.conn.sock, m.wire[m.sent:]) != .None
 			delete(m.wire)
 		case Out_Live:
-			ev := &m.live.shared.ev
 			if live_allowed(cs, m.live) {
-				buf := make([dynamic]u8, 0, 512, context.temp_allocator)
-				nostr.write_event_json(m.live.sub_id, ev, &buf)
+				json := m.live.shared.json
+				buf := make(
+					[dynamic]u8,
+					0,
+					len(json) + len(m.live.sub_id) + 16,
+					context.temp_allocator,
+				)
+				nostr.write_event_head(m.live.sub_id, &buf)
+				append(&buf, ..json)
 				if conn_write_text(&cs.conn, buf[:]) != .None {
 					dead = true
 				}
@@ -168,7 +174,8 @@ writer_loop :: proc(cs: ^Conn_State) {
 	}
 }
 
-// Reject queued events from closed/replaced subscriptions before running policy.
+// Whether a queued live event may still be written: its subscription has
+// not been closed or replaced, and the connection may see the event.
 @(private)
 live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
 	{
@@ -178,9 +185,20 @@ live_allowed :: proc(cs: ^Conn_State, live: Live_Event) -> bool {
 			return false
 		}
 	}
+	return live_visible(cs, live.shared)
+}
+
+// Whether this connection may see a live event, by the keys it has
+// authenticated so far. Takes no fanout lock: a broadcaster calls it with
+// the shard locked.
+@(private)
+live_visible :: proc(cs: ^Conn_State, shared: ^Shared_Event) -> bool {
+	if shared.expires_at != 0 && shared.expires_at <= nostr.unix_now() {
+		return false
+	}
+	ev := &shared.ev
 	keys: [MAX_AUTH_PUBKEYS][32]u8 = ---
 	auth := auth_snapshot(&cs.auth, &keys)
-	ev := &live.shared.ev
 	if cs.relay.cfg.gift_wrap_read == .Recipient && ev.kind == nostr.KIND_GIFT_WRAP {
 		matched := false
 		for &pk in auth {
@@ -225,7 +243,7 @@ handle_connection :: proc(relay: ^Relay, sock: net.TCP_Socket, preload: []u8, co
 	ch, ch_err := chan.create(chan.Chan(Out_Msg), OUTBOX_CAPACITY, context.allocator)
 	assert(ch_err == nil)
 	cs.outbox.ch = ch
-	cs.outbox.conn = &cs.conn
+	cs.outbox.state = cs
 	cs.outbox.conn_id = conn_id
 
 	auth_state_init(&cs.auth)

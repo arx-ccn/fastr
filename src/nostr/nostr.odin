@@ -685,9 +685,21 @@ validate_event :: proc(
 
 // ["EVENT","<sub_id>",{<event>}] — zero intermediate allocations.
 write_event_json :: proc(sub_id: string, ev: ^pack.Event, buf: ^[dynamic]u8) {
+	write_event_head(sub_id, buf)
+	write_event_tail(ev, buf)
+}
+
+// ["EVENT","<sub_id>", — the part of an EVENT message that differs between
+// the subscriptions an event goes to.
+write_event_head :: proc(sub_id: string, buf: ^[dynamic]u8) {
 	append(buf, "[\"EVENT\",")
 	pack.write_json_str(sub_id, buf)
-	append(buf, ",{\"id\":\"")
+	append(buf, ",")
+}
+
+// {<event>}] — the part every subscription shares.
+write_event_tail :: proc(ev: ^pack.Event, buf: ^[dynamic]u8) {
+	append(buf, "{\"id\":\"")
 	pack.hex_encode_into(ev.id[:], buf)
 	append(buf, "\",\"pubkey\":\"")
 	pack.hex_encode_into(ev.pubkey[:], buf)

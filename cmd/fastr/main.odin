@@ -83,6 +83,7 @@ serve :: proc() {
 	relay := new(ws.Relay)
 	plugins := new(Plugin_State)
 	init_relay(relay, st, &cfg, plugins)
+	ws.fanout_start(&relay.fanout)
 
 	// Pre-render the cold-path HTTP responses once.
 	info := relay_info_from_config(&cfg)

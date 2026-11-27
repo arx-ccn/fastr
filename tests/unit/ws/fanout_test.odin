@@ -3,11 +3,13 @@ package ws
 import "../../tests/fixtures"
 
 import "../store"
+import "base:runtime"
 import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:slice"
 import "core:strings"
+import "core:sync"
 import "core:sync/chan"
 import "core:sys/linux"
 import "core:testing"
@@ -16,6 +18,7 @@ import "core:time"
 
 import "../nostr"
 import "../pack"
+import "../policy"
 
 @(private = "file")
 make_shared :: proc(kind: u16) -> ^Shared_Event {
@@ -526,7 +529,7 @@ test_partial_replay_order :: proc(t: ^testing.T) {
 		outbox = o,
 	}
 	cs.conn.sock = net.TCP_Socket(pair[0])
-	o.conn = &cs.conn
+	o.state = &cs
 
 	PAYLOAD :: 128 * 1024
 	first := make([]u8, MAX_FRAME_HEADER_LEN + PAYLOAD)
@@ -594,4 +597,301 @@ test_perf_subscribe :: proc(t: ^testing.T) {
 		}
 		delete(outboxes)
 	}
+}
+
+// A connection whose outbox can write live events itself: a Conn_State over
+// one end of a socket pair. It must not move once opened.
+@(private = "file")
+Live_Conn :: struct {
+	cs:   Conn_State,
+	peer: linux.Fd,
+}
+
+@(private = "file")
+live_conn_open :: proc(c: ^Live_Conn, r: ^Relay, id: u64, capacity: int, sndbuf: i32 = 0) {
+	pair: [2]linux.Fd
+	assert(linux.socketpair(.UNIX, .STREAM, linux.Protocol(0), &pair) == .NONE)
+	if sndbuf > 0 {
+		size := sndbuf
+		assert(linux.setsockopt(pair[0], linux.SOL_SOCKET, .SNDBUF, &size) == .NONE)
+	}
+	c.peer = pair[1]
+	c.cs.relay = r
+	c.cs.conn.sock = net.TCP_Socket(pair[0])
+	c.cs.outbox = make_outbox(id, capacity)
+	c.cs.outbox.state = &c.cs
+}
+
+@(private = "file")
+live_conn_close :: proc(c: ^Live_Conn) {
+	fanout_unsubscribe_all(&c.cs.relay.fanout, c.cs.outbox)
+	outbox_destroy(c.cs.outbox)
+	linux.close(linux.Fd(c.cs.conn.sock))
+	linux.close(c.peer)
+}
+
+// What the peer has received and not yet read, without waiting.
+@(private = "file")
+peer_read :: proc(c: ^Live_Conn) -> []u8 {
+	got := make([dynamic]u8, context.temp_allocator)
+	buf: [16384]u8
+	for {
+		n, err := linux.recv(c.peer, buf[:], {.DONTWAIT})
+		if err != .NONE || n <= 0 {
+			return got[:]
+		}
+		append(&got, ..buf[:n])
+	}
+}
+
+// The next `size` bytes the peer receives, waiting for them. Fewer when the
+// other end stops sending first.
+@(private = "file")
+peer_read_exact :: proc(c: ^Live_Conn, size: int) -> []u8 {
+	got := make([]u8, size, context.temp_allocator)
+	for count := 0; count < size; {
+		n, err := linux.recv(c.peer, got[count:], {})
+		if err != .NONE || n <= 0 {
+			return got[:count]
+		}
+		count += n
+	}
+	return got
+}
+
+// The text frame a subscription gets for an event.
+@(private = "file")
+live_wire :: proc(sub_id: string, ev: ^pack.Event) -> []u8 {
+	json := make([dynamic]u8, context.temp_allocator)
+	nostr.write_event_json(sub_id, ev, &json)
+	header: [MAX_FRAME_HEADER_LEN]u8
+	header_len := encode_frame_header(header[:], .Text, len(json))
+	wire := make([dynamic]u8, context.temp_allocator)
+	append(&wire, ..header[:header_len])
+	append(&wire, ..json[:])
+	return wire[:]
+}
+
+@(private = "file")
+publish :: proc(r: ^Relay, ev: ^pack.Event) {
+	shared := shared_event_new(event_clone(ev, context.allocator))
+	fanout_broadcast(&r.fanout, shared)
+	shared_event_release(shared)
+}
+
+// With no writer on the socket, the broadcasting thread writes the frame
+// itself, and applies the visibility rules the writer would.
+@(test)
+test_live_event_written_direct :: proc(t: ^testing.T) {
+	r: Relay
+	fanout_init(&r.fanout)
+	defer fanout_destroy(&r.fanout)
+	c: Live_Conn
+	live_conn_open(&c, &r, 1, 8)
+	defer live_conn_close(&c)
+	o := c.cs.outbox
+	SUB :: "quo\"ted"
+	fanout_subscribe(&r.fanout, SUB, {nostr.Filter{}}, o)
+
+	note := fixtures.test_make_event(1, 1, 1000, nil)
+	publish(&r, &note)
+	testing.expect(
+		t,
+		slice.equal(peer_read(&c), live_wire(SUB, &note)),
+		"the frame as the writer sends it",
+	)
+	testing.expect(t, chan.len(o.ch) == 0 && o.pending == 0, "nothing left for the writer")
+
+	// A gift wrap goes to its recipient only, and a protected event to its
+	// author only, judged by the keys authenticated when the frame is written.
+	reader, author := fixtures.test_pubkey(9), fixtures.test_pubkey(2)
+	hex := make([dynamic]u8, context.temp_allocator)
+	pack.hex_encode_into(reader[:], &hex)
+	wrap := fixtures.test_make_event(
+		2,
+		nostr.KIND_GIFT_WRAP,
+		1001,
+		{{fields = {"p", string(hex[:])}}},
+	)
+	protected := fixtures.test_make_event(2, 1, 1002, {{fields = {"-"}}})
+	publish(&r, &wrap)
+	publish(&r, &protected)
+	testing.expect_value(t, len(peer_read(&c)), 0)
+	testing.expect(t, chan.len(o.ch) == 0, "a hidden event is not queued either")
+	assert(auth_record(&c.cs.auth, reader))
+	publish(&r, &wrap)
+	publish(&r, &protected)
+	testing.expect(t, slice.equal(peer_read(&c), live_wire(SUB, &wrap)))
+	assert(auth_record(&c.cs.auth, author))
+	publish(&r, &protected)
+	testing.expect(t, slice.equal(peer_read(&c), live_wire(SUB, &protected)))
+}
+
+// A frame that the socket takes only part of is finished by the writer, and
+// the events after it wait their turn behind it.
+@(test)
+test_live_frames_keep_order :: proc(t: ^testing.T) {
+	// Memory passes between this thread and threads on the default heap,
+	// which cannot free what the test runner's allocator handed out.
+	context.allocator = runtime.default_allocator()
+	r: Relay
+	fanout_init(&r.fanout)
+	defer fanout_destroy(&r.fanout)
+	c: Live_Conn
+	live_conn_open(&c, &r, 1, 4, 4096)
+	defer live_conn_close(&c)
+	o := c.cs.outbox
+	fanout_subscribe(&r.fanout, "s", {nostr.Filter{}}, o)
+
+	big := fixtures.test_make_event(1, 1, 1000, nil)
+	big.content = strings.repeat("x", 40 * 1024, context.temp_allocator)
+	small := fixtures.test_make_event(1, 1, 1001, nil)
+	publish(&r, &big)
+	testing.expect_value(t, o.pending, 1)
+	first, second := live_wire("s", &big), live_wire("s", &small)
+	got := make([dynamic]u8, context.temp_allocator)
+	append(&got, ..peer_read(&c))
+	testing.expect(t, 0 < len(got) && len(got) < len(first), "the broadcast began the frame")
+	// The socket has room again, but the writer owns it now.
+	publish(&r, &small)
+	testing.expect_value(t, o.pending, 2)
+	testing.expect_value(t, len(peer_read(&c)), 0)
+
+	chan.close(o.ch)
+	w := thread.create_and_start_with_poly_data(&c.cs, proc(cs: ^Conn_State) {
+		writer_loop(cs)
+		linux.shutdown(linux.Fd(cs.conn.sock), .WR)
+	})
+	defer thread.destroy(w)
+	append(&got, ..peer_read_exact(&c, len(first) + len(second) - len(got)))
+	linux.shutdown(c.peer, .RD)
+	thread.join(w)
+	want := slice.concatenate([][]u8{first, second}, context.temp_allocator)
+	testing.expect(t, slice.equal(got[:], want), "both frames whole, in broadcast order")
+}
+
+// An event waiting in a shard queue must not go to a replacement REQ.
+@(test)
+test_live_skips_earlier_broadcast :: proc(t: ^testing.T) {
+	f: Fanout
+	fanout_init(&f)
+	defer fanout_destroy(&f)
+	o := make_outbox(1, 8)
+	defer outbox_destroy(o)
+
+	earlier := make_shared(1)
+	defer shared_event_release(earlier)
+	fanout_subscribe(&f, "late", {nostr.Filter{}}, o)
+	shard := fanout_shard(&f, o)
+	delivery := Shard_Delivery{earlier, shard.next_key}
+	fanout_subscribe(&f, "late", {nostr.Filter{}}, o)
+	scratch: [dynamic]u8
+	defer delete(scratch)
+	broadcast_shard(shard, delivery, &scratch)
+	testing.expect(t, !recv_one(o), "admitted before the replacement")
+
+	later := make_shared(1)
+	fanout_broadcast(&f, later)
+	shared_event_release(later)
+	testing.expect(t, recv_one(o))
+	fanout_unsubscribe_all(&f, o)
+}
+
+// Both the broadcaster and the writer can reach an event after its deadline.
+@(test)
+test_expiry_in_fanout_queue :: proc(t: ^testing.T) {
+	r: Relay
+	fanout_init(&r.fanout)
+	defer fanout_destroy(&r.fanout)
+	c: Live_Conn
+	live_conn_open(&c, &r, 1, 8)
+	defer live_conn_close(&c)
+	o := c.cs.outbox
+	fanout_subscribe(&r.fanout, "s", {nostr.Filter{}}, o)
+	ev := fixtures.test_make_event(1, 1, 1000, {{fields = {"expiration", "4102444800"}}})
+	shared := shared_event_new(event_clone(&ev, context.allocator))
+	defer shared_event_release(shared)
+	fanout_broadcast(&r.fanout, shared)
+	testing.expect(t, slice.equal(peer_read(&c), live_wire("s", &ev)))
+	testing.expect_value(t, shared.expires_at, i64(4102444800))
+
+	// Move the deadline, not the clock. No worker is running on this shard.
+	shared.expires_at = 1
+	shard := fanout_shard(&r.fanout, o)
+	scratch: [dynamic]u8
+	defer delete(scratch)
+	broadcast_shard(shard, {shared, shard.next_key}, &scratch)
+	testing.expect_value(t, len(peer_read(&c)), 0)
+	testing.expect(t, !live_allowed(&c.cs, {o.subs.first.key, "s", shared}))
+}
+
+// Records which thread judged an event's visibility, and so wrote its frame.
+@(private = "file")
+note_thread :: proc(
+	user: rawptr,
+	principal: ^policy.Principal,
+	ev: ^pack.Event_View,
+) -> policy.Visibility {
+	sync.atomic_store((^int)(user), sync.current_thread_id())
+	return .Show
+}
+
+// With broadcaster threads, fanout_broadcast only queues. Every subscriber
+// still gets every event, in the order one publisher issued them, whether
+// its frames are written directly or go through its outbox.
+@(test)
+test_broadcasters_keep_order :: proc(t: ^testing.T) {
+	// Few enough that a socket pair holds them all unread.
+	EVENTS :: 64
+	// Memory passes between this thread and threads on the default heap,
+	// which cannot free what the test runner's allocator handed out.
+	context.allocator = runtime.default_allocator()
+	writer_thread: int
+	r := Relay {
+		hooks = {user = &writer_thread, check_read = note_thread},
+	}
+	fanout_init(&r.fanout)
+	fanout_start(&r.fanout)
+	conns: [4]Live_Conn
+	for &c, i in conns {
+		live_conn_open(&c, &r, u64(1 + i), 8)
+		fanout_subscribe(&r.fanout, "live", {nostr.Filter{}}, c.cs.outbox)
+	}
+	queued := make_outbox(5, EVENTS)
+	fanout_subscribe(&r.fanout, "queued", {nostr.Filter{}}, queued)
+
+	wire := make([dynamic]u8, context.temp_allocator)
+	for i in 0 ..< EVENTS {
+		ev := fixtures.test_make_event(1, 1, i64(1000 + i), nil)
+		append(&wire, ..live_wire("live", &ev))
+		publish(&r, &ev)
+	}
+	// Join all broadcasters before inspecting the sockets. A missing event
+	// must fail the comparison, not leave a blocking read waiting for it.
+	fanout_destroy(&r.fanout)
+	for &c in conns {
+		testing.expect(t, slice.equal(peer_read(&c), wire[:]))
+	}
+	testing.expect(
+		t,
+		sync.atomic_load(&writer_thread) != sync.current_thread_id(),
+		"the publishing thread only queues",
+	)
+	for i in 0 ..< EVENTS {
+		msg, ok := chan.try_recv(queued.ch)
+		if !testing.expect(t, ok, "missing queued event") {
+			break
+		}
+		live, is_live := msg.(Out_Live)
+		assert(is_live)
+		testing.expect_value(t, live.live.shared.ev.created_at, i64(1000 + i))
+		drop_out_msg(msg)
+	}
+
+	for &c in conns {
+		outbox_destroy(c.cs.outbox)
+		linux.close(linux.Fd(c.cs.conn.sock))
+		linux.close(c.peer)
+	}
+	outbox_destroy(queued)
 }
