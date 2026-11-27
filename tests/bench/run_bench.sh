@@ -97,10 +97,11 @@ record_status() {
   ACTIVE=""
 }
 collect_rows() {
-  # Preserve even malformed machine rows; the stdout log also retains progress.
+  # The per-repeat file keeps even malformed machine rows. The combined TSV
+  # names its latency columns in cycles, so it takes only rows tagged so.
   awk -F '\t' '$1 == "RESULT"' "$RUN_DIR/driver.stdout.log" >"$RUN_DIR/results.tsv"
   awk -F '\t' -v OFS='\t' -v r="$relay" -v n="$repeat" '
-    { sub(/^RESULT\t/, ""); print r, n, $0 }
+    NF == 10 && $10 == "cycles" { sub(/^RESULT\t/, ""); print r, n, $0 }
   ' "$RUN_DIR/results.tsv" >>"$RAW"
   COLLECTED=1
 }
