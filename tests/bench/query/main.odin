@@ -51,7 +51,13 @@ event_created_at :: proc(i: int) -> i64 {
 	return 1_000_000 + i64(i) + jitter
 }
 
-run_filter :: proc(s: ^store.Store, name: string, filter: ^nostr.Filter, iters: int, access: policy.Read_Access = {}) {
+run_filter :: proc(
+	s: ^store.Store,
+	name: string,
+	filter: ^nostr.Filter,
+	iters: int,
+	access: policy.Read_Access = {},
+) {
 	// Warm-up + reference result.
 	ref: Bench_Ctx
 	if err := store.query_authed(s, filter, nil, &ref, bench_cb, access); err != .None {
@@ -60,14 +66,14 @@ run_filter :: proc(s: ^store.Store, name: string, filter: ^nostr.Filter, iters: 
 	}
 	free_all(context.temp_allocator)
 
-	t0 := time.tick_now()
+	t0 := time.read_cycle_counter()
 	for _ in 0 ..< iters {
 		c: Bench_Ctx
 		assert(store.query_authed(s, filter, nil, &c, bench_cb, access) == .None)
 		assert(c.count == ref.count && c.sum == ref.sum)
 		free_all(context.temp_allocator)
 	}
-	dt := time.tick_since(t0)
+	cycles := time.read_cycle_counter() - t0
 	// Count allocator requests separately so tracking does not affect timing.
 	allocs: i64
 	{
@@ -84,11 +90,10 @@ run_filter :: proc(s: ^store.Store, name: string, filter: ^nostr.Filter, iters: 
 		free_all(context.temp_allocator)
 	}
 
-	ns_per := i64(dt) / i64(iters)
 	fmt.printfln(
-		"%-12s %10d ns/query  matched=%d bytes=%d checksum=%d allocs=%d",
+		"%-12s %10d cycles/query  matched=%d bytes=%d checksum=%d allocs=%d",
 		name,
-		ns_per,
+		cycles / u64(iters),
 		ref.count,
 		ref.bytes,
 		ref.sum,
@@ -97,12 +102,20 @@ run_filter :: proc(s: ^store.Store, name: string, filter: ^nostr.Filter, iters: 
 }
 
 @(private)
-allow_all :: proc(user: rawptr, principal: ^policy.Principal, ev: ^pack.Event_View) -> policy.Visibility {
+allow_all :: proc(
+	user: rawptr,
+	principal: ^policy.Principal,
+	ev: ^pack.Event_View,
+) -> policy.Visibility {
 	return .Show
 }
 
 @(private)
-allow_author :: proc(user: rawptr, principal: ^policy.Principal, ev: ^pack.Event_View) -> policy.Visibility {
+allow_author :: proc(
+	user: rawptr,
+	principal: ^policy.Principal,
+	ev: ^pack.Event_View,
+) -> policy.Visibility {
 	if ev.pubkey == (^pack.Pubkey)(user)^ {
 		return .Show
 	}

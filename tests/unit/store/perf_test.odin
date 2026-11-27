@@ -30,7 +30,7 @@ test_perf_recipients :: proc(t: ^testing.T) {
 		key[0] = u8(i)
 	}
 	for n in ([]int{1, 4, 16}) {
-		start := time.tick_now()
+		start := time.read_cycle_counter()
 		for _ in 0 ..< ITERS {
 			set := p_tag_offsets_union(buf, keys[:n])
 			assert(len(set) == N / 128 * n)
@@ -40,7 +40,8 @@ test_perf_recipients :: proc(t: ^testing.T) {
 			delete(set)
 			free_all(context.temp_allocator)
 		}
-		fmt.printfln("PERF recipients-%d %.1f ns/op", n, f64(time.tick_since(start)) / ITERS)
+		cycles := f64(time.read_cycle_counter() - start) / ITERS
+		fmt.printfln("PERF recipients-%d %.0f cycles/op", n, cycles)
 	}
 }
 
@@ -79,13 +80,13 @@ test_perf_author_postings :: proc(t: ^testing.T) {
 			if path == "scan" {
 				s.postings.entries = -1
 			}
-			start := time.tick_now()
+			start := time.read_cycle_counter()
 			for _ in 0 ..< ITERS {
 				assert(test_query_count(t, s, &f) == 20)
 			}
-			ns := f64(time.tick_since(start)) / ITERS
+			cycles := f64(time.read_cycle_counter() - start) / ITERS
 			s.postings.entries = entries
-			fmt.printfln("PERF authors-%d-%s %.1f ns/op", n, path, ns)
+			fmt.printfln("PERF authors-%d-%s %.0f cycles/op", n, path, cycles)
 		}
 	}
 }

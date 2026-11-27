@@ -128,18 +128,18 @@ Worker :: struct {
 	payload_size: int,
 	queries:      int,
 	query:        ^Query_Case,
-	latencies:    [dynamic]i64, // Successful operations only, microseconds.
+	latencies:    [dynamic]i64, // Successful operations only, time-stamp counter cycles.
 	errors:       int,
 	returned:     int,
 }
 
 Query_Case :: struct {
-	name:     string,
-	filters:  string,
-	validate: bool,
+	name:         string,
+	filters:      string,
+	validate:     bool,
 	newest_first: bool, // Suite single-filter stored events only.
-	expected: [dynamic]^Raw_Event,
-	by_id:    map[string]int,
+	expected:     [dynamic]^Raw_Event,
+	by_id:        map[string]int,
 }
 
 gen_worker :: proc(w: ^Worker) {
@@ -212,7 +212,7 @@ ingest_worker :: proc(w: ^Worker) {
 	if !ok {w.errors = len(w.events); return}
 	defer wsclient.conn_close(&conn)
 	for ev, i in w.events {
-		t0 := time.tick_now()
+		t0 := time.read_cycle_counter()
 		if err := wsclient.send_frame(conn.sock, ev.msg); err != .None {
 			worker_error(w, "websocket send failed")
 			w.errors += len(w.events) - i - 1
@@ -235,7 +235,7 @@ ingest_worker :: proc(w: ^Worker) {
 			return
 		}
 		if accepted {
-			append(&w.latencies, i64(time.tick_since(t0)) / 1000)
+			append(&w.latencies, i64(time.read_cycle_counter() - t0))
 		} else {
 			worker_error(w, msg)
 		}
@@ -302,7 +302,7 @@ query_worker :: proc(w: ^Worker) {
 		previous: ^Raw_Event
 		valid := true
 		complete := false
-		t0 := time.tick_now()
+		t0 := time.read_cycle_counter()
 		if wsclient.send_frame(conn.sock, request) != .None {
 			worker_error(w, "websocket send failed")
 			w.errors += w.queries - i - 1
@@ -367,9 +367,12 @@ query_worker :: proc(w: ^Worker) {
 								id,
 							)
 						}
-						if valid && w.query.newest_first && previous != nil &&
+						if valid &&
+						   w.query.newest_first &&
+						   previous != nil &&
 						   (ev.created_at > previous.created_at ||
-						    (ev.created_at == previous.created_at && ev.id_hex < previous.id_hex)) {
+								   (ev.created_at == previous.created_at &&
+										   ev.id_hex < previous.id_hex)) {
 							valid = false
 							fmt.eprintfln(
 								"worker %d %s: out-of-order EVENT %s (created_at=%d) after %s (created_at=%d); expected newest-first, lowest ID first on ties",
@@ -392,7 +395,7 @@ query_worker :: proc(w: ^Worker) {
 			free_all(context.temp_allocator)
 			if complete || !valid {break}
 		}
-		elapsed := i64(time.tick_since(t0)) / 1000
+		elapsed := i64(time.read_cycle_counter() - t0)
 		if w.query.validate && returned != len(w.query.expected) {valid = false}
 		if !valid || !complete {
 			worker_error(

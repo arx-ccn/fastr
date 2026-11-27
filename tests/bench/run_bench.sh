@@ -44,7 +44,7 @@ RAW="$ARTIFACTS/results.tsv"
 STATUS="$ARTIFACTS/status.tsv"
 RESOURCES="$ARTIFACTS/resources.tsv"
 TIMESTAMP="$(($(date +%s) - 60))"
-printf 'relay\trepeat\tworkload\toperations\twall_ms\tthroughput\tp50_us\tp99_us\terrors\treturned_events\n' >"$RAW"
+printf 'relay\trepeat\tworkload\toperations\twall_ms\tthroughput\tp50_cycles\tp99_cycles\terrors\treturned_events\n' >"$RAW"
 printf 'relay\trepeat\tstatus\texit_code\n' >"$STATUS"
 printf 'relay\trepeat\trss_after_kib\tdb_allocated_after_bytes\tprocess_write_bytes_delta\n' >"$RESOURCES"
 fastr-bench suite --list-workloads >"$MANIFEST" 2>"$ARTIFACTS/manifest.log"
@@ -141,7 +141,7 @@ report() {
     printf 'Startup failures, timeouts, unexpected exits, malformed rows and incomplete suites invalidate the entire repeat. Partial measurements remain in the raw files. No winners are assigned.\n\n'
     printf '| Relay | Repeat | Status | Exit code |\n|---|---:|---|---:|\n'
     awk -F '\t' 'NR>1 { printf "| %s | %s | %s | %s |\n", $1,$2,$3,$4 }' "$STATUS"
-    printf '\n| Workload | Relay | Valid repeats | Median ops/s | Median p50 (us) | Median p99 (us) |\n'
+    printf '\n| Workload | Relay | Valid repeats | Median ops/s | Median p50 (cycles) | Median p99 (cycles) |\n'
     printf '|---|---|---:|---:|---:|---:|\n'
     awk -F '\t' -v relays="${selected[*]}" -v repeats="$REPEATS" '
       function median(key, col, n,    i,j,t,a) {

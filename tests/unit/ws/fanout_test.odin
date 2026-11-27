@@ -314,7 +314,7 @@ test_perf_fanout :: proc(t: ^testing.T) {
 			delete(id)
 		}
 		ev := make_shared(1)
-		start := time.tick_now()
+		start := time.read_cycle_counter()
 		for _ in 0 ..< PERF_ITERS {
 			fanout_broadcast(&f, ev)
 			count := 0
@@ -324,7 +324,8 @@ test_perf_fanout :: proc(t: ^testing.T) {
 			assert(count == n)
 			free_all(context.temp_allocator)
 		}
-		fmt.printfln("PERF fanout-%d %.1f ns/op", n, f64(time.tick_since(start)) / PERF_ITERS)
+		cycles := f64(time.read_cycle_counter() - start) / PERF_ITERS
+		fmt.printfln("PERF fanout-%d %.0f cycles/op", n, cycles)
 		shared_event_release(ev)
 		fanout_destroy(&f)
 		outbox_destroy(o)
@@ -398,7 +399,7 @@ test_perf_queries :: proc(t: ^testing.T) {
 		ref: u64
 		assert(store.query_authed(s, &filter, nil, &ref, perf_emit) == .None)
 		free_all(context.temp_allocator)
-		start := time.tick_now()
+		start := time.read_cycle_counter()
 		for _ in 0 ..< PERF_ITERS {
 			checksum: u64
 			assert(store.query_authed(s, &filter, nil, &checksum, perf_emit) == .None)
@@ -406,9 +407,9 @@ test_perf_queries :: proc(t: ^testing.T) {
 			free_all(context.temp_allocator)
 		}
 		fmt.printfln(
-			"PERF ids-%d %.1f ns/op checksum=%d",
+			"PERF ids-%d %.0f cycles/op checksum=%d",
 			n,
-			f64(time.tick_since(start)) / PERF_ITERS,
+			f64(time.read_cycle_counter() - start) / PERF_ITERS,
 			ref,
 		)
 		delete(selected)
@@ -420,7 +421,7 @@ test_perf_queries :: proc(t: ^testing.T) {
 		ref: u64
 		assert(store.query_authed(s, &filter, nil, &ref, perf_emit) == .None)
 		free_all(context.temp_allocator)
-		start := time.tick_now()
+		start := time.read_cycle_counter()
 		for _ in 0 ..< PERF_ITERS {
 			checksum: u64
 			assert(store.query_authed(s, &filter, nil, &checksum, perf_emit) == .None)
@@ -428,9 +429,9 @@ test_perf_queries :: proc(t: ^testing.T) {
 			free_all(context.temp_allocator)
 		}
 		fmt.printfln(
-			"PERF scan-%d %.1f ns/op checksum=%d",
+			"PERF scan-%d %.0f cycles/op checksum=%d",
 			n,
-			f64(time.tick_since(start)) / PERF_ITERS,
+			f64(time.read_cycle_counter() - start) / PERF_ITERS,
 			ref,
 		)
 	}
@@ -454,13 +455,13 @@ test_perf_queries :: proc(t: ^testing.T) {
 			limit = n,
 		}
 		ref: u64
-		elapsed: time.Duration
+		elapsed: u64
 		for iteration in 0 ..< PERF_ITERS + 1 {
-			start := time.tick_now()
+			start := time.read_cycle_counter()
 			handle_req(&cs, "perf", {filter})
 			msg, ok := chan.try_recv(o.ch)
 			assert(ok)
-			elapsed += time.tick_since(start)
+			elapsed += time.read_cycle_counter() - start
 			batch, is_batch := msg.(Out_Batch)
 			assert(is_batch)
 			checksum := replay_checksum(batch, n)
@@ -472,8 +473,8 @@ test_perf_queries :: proc(t: ^testing.T) {
 			drop_msg(msg)
 			free_all(context.temp_allocator)
 		}
-		fmt.printfln("PERF req-%d %.1f ns/op checksum=%d", n, f64(elapsed) / PERF_ITERS, ref)
-		start := time.tick_now()
+		fmt.printfln("PERF req-%d %.0f cycles/op checksum=%d", n, f64(elapsed) / PERF_ITERS, ref)
+		start := time.read_cycle_counter()
 		for _ in 0 ..< PERF_ITERS {
 			handle_req(&cs, "perf", {filter})
 			msg, ok := chan.try_recv(o.ch)
@@ -481,7 +482,8 @@ test_perf_queries :: proc(t: ^testing.T) {
 			drop_msg(msg)
 			free_all(context.temp_allocator)
 		}
-		fmt.printfln("PERF req-cycle-%d %.1f ns/op", n, f64(time.tick_since(start)) / PERF_ITERS)
+		cycles := f64(time.read_cycle_counter() - start) / PERF_ITERS
+		fmt.printfln("PERF req-cycle-%d %.0f cycles/op", n, cycles)
 		// Empty filters must not reset or bypass deduplication of the union.
 		empty := nostr.Filter {
 			limit = 0,
@@ -566,12 +568,13 @@ test_perf_subscribe :: proc(t: ^testing.T) {
 			outbox = make_outbox(u64(i), 1)
 			fanout_subscribe(&f, "same-id", {nostr.Filter{}}, outbox)
 		}
-		start := time.tick_now()
+		start := time.read_cycle_counter()
 		for _ in 0 ..< PERF_ITERS {
 			fanout_subscribe(&f, "same-id", {nostr.Filter{}}, outboxes[n - 1])
 			free_all(context.temp_allocator)
 		}
-		fmt.printfln("PERF subscribe-%d %.1f ns/op", n, f64(time.tick_since(start)) / PERF_ITERS)
+		cycles := f64(time.read_cycle_counter() - start) / PERF_ITERS
+		fmt.printfln("PERF subscribe-%d %.0f cycles/op", n, cycles)
 		ev := make_shared(1)
 		fanout_broadcast(&f, ev)
 		shared_event_release(ev)
