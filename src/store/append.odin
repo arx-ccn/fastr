@@ -517,17 +517,16 @@ append_classified :: proc(
 		   s.postings.tag_bytes == int(before_tags) &&
 		   slot < u64(max(u32)) &&
 		   w.tags.offset / TAG_ENTRY_SIZE <= u64(max(u32)) {
-			if ev.kind == nostr.KIND_GIFT_WRAP {
-				// The writer mutex keeps the mapping stable and all record bytes
-				// are written, including the slot not yet visible to readers.
-				mailbox_add(
-					&s.postings,
-					pos.slot,
-					pos.tag_end,
-					tag_buf[:],
-					&s.index.current.ptr[HEADER_SIZE],
-				)
-			}
+			// The writer mutex keeps the mapping stable and all record bytes
+			// are written, including the slot not yet visible to readers.
+			postings_add(
+				&s.postings,
+				pos,
+				ev.kind,
+				ev.pubkey,
+				tag_buf[:],
+				&s.index.current.ptr[HEADER_SIZE],
+			)
 			s.postings.entries += 1
 			s.postings.tag_bytes = int(w.tags.offset)
 		} else {

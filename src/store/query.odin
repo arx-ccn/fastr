@@ -239,19 +239,124 @@ Posting_Cursor :: struct {
 	next: int,
 }
 
+// A filter reads author postings while its authors hold at most one part in
+// this many of the index; past that it scans. Merging cursors costs more per
+// event than scanning, so postings lose when the authors hold much of the
+// index and the rest of the filter rejects their events. With 500 of 4,000
+// equal authors (one eighth of 400,000 events) and a tag no event carried,
+// postings took 1.7 times as long as the scan. A filter with no such tag ran
+// 5 to 34 times faster on postings at that share.
 @(private)
-mailbox_next :: proc(cursors: []Posting_Cursor, idx: rawptr) -> Event_Slot {
-	best := -1
-	result: Event_Slot
-	for &c, i in cursors {
-		if c.next == len(c.run.slots) do continue
-		slot := c.run.slots[c.next]
-		if best < 0 || slot_newer(slot, result, idx) {
-			best, result = i, slot
+POSTINGS_INDEX_SHARE :: 8
+
+// Pin each run of `list` behind a cursor and return how many postings they
+// hold. Caller holds known_ids_mu.
+@(private)
+cursors_pin :: proc(cursors: ^[dynamic]Posting_Cursor, list: Posting_List) -> (postings: int) {
+	for run in list.runs {
+		sync.atomic_add(&run.refs, 1)
+		append(cursors, Posting_Cursor{run = run})
+		postings += len(run.slots)
+	}
+	return
+}
+
+// The first posting of a newest-first run that is not newer than `until`.
+@(private)
+posting_until :: proc(slots: []Posting, until: i64, idx: rawptr) -> int {
+	entries := cast([^][INDEX_ENTRY_SIZE]u8)idx
+	lo, hi := 0, len(slots)
+	for lo < hi {
+		mid := lo + (hi - lo) / 2
+		if i64(endian.unchecked_get_u64le(entries[slots[mid].slot][8:])) > until {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	cursors[best].next += 1
-	return result
+	return lo
+}
+
+// Advance `c` to its next posting of a wanted kind; no kinds means any kind.
+// Reports whether the cursor has a posting left.
+@(private)
+cursor_seek :: proc(c: ^Posting_Cursor, kinds: []u16) -> bool {
+	slots := c.run.slots[:]
+	if len(kinds) > 0 {
+		for c.next < len(slots) && !slice.contains(kinds, slots[c.next].kind) {
+			c.next += 1
+		}
+	}
+	return c.next < len(slots)
+}
+
+// `heads` is a binary heap of unfinished cursors, the one with the newest
+// next posting first. Move the cursor at `i` down to where it belongs.
+@(private)
+cursor_sift :: proc(heads: []Posting_Cursor, i: int, idx: rawptr) {
+	i := i
+	for {
+		newest := i
+		for child in ([2]int{2 * i + 1, 2 * i + 2}) {
+			if child >= len(heads) {
+				break
+			}
+			a, b := heads[child], heads[newest]
+			if posting_newer(a.run.slots[a.next], b.run.slots[b.next], idx) {
+				newest = child
+			}
+		}
+		if newest == i {
+			return
+		}
+		heads[i], heads[newest] = heads[newest], heads[i]
+		i = newest
+	}
+}
+
+// Start every cursor at its first posting the kinds and `until` allow, and
+// return the heap of those that have one. A finished cursor stays in the
+// backing array, which owns its run reference, past the end of the heap.
+@(private)
+cursors_heap :: proc(
+	cursors: []Posting_Cursor,
+	kinds: []u16,
+	until: Maybe(i64),
+	idx: rawptr,
+) -> []Posting_Cursor {
+	heads := cursors
+	for i := len(heads) - 1; i >= 0; i -= 1 {
+		c := &heads[i]
+		if newest, bounded := until.?; bounded {
+			c.next = posting_until(c.run.slots[:], newest, idx)
+		}
+		if !cursor_seek(c, kinds) {
+			last := len(heads) - 1
+			heads[i], heads[last] = heads[last], heads[i]
+			heads = heads[:last]
+		}
+	}
+	for i := len(heads) / 2 - 1; i >= 0; i -= 1 {
+		cursor_sift(heads, i, idx)
+	}
+	return heads
+}
+
+// Take the newest posting any cursor has left.
+@(private)
+posting_next :: proc(heads: ^[]Posting_Cursor, kinds: []u16, idx: rawptr) -> Posting {
+	top := &heads[0]
+	posting := top.run.slots[top.next]
+	top.next += 1
+	if !cursor_seek(top, kinds) {
+		last := len(heads) - 1
+		heads[0], heads[last] = heads[last], heads[0]
+		heads^ = heads[:last]
+	}
+	if len(heads) > 1 {
+		cursor_sift(heads^, 0, idx)
+	}
+	return posting
 }
 
 // One candidate kept by the query top-N selection.
@@ -295,6 +400,7 @@ query_authed :: proc(
 
 	fkinds, has_kinds := filter.kinds.?
 	fids, has_ids := filter.ids.?
+	fauthors, has_authors := filter.authors.?
 	inbox := has_kinds && len(fkinds) == 1 && fkinds[0] == nostr.KIND_GIFT_WRAP
 	if inbox && len(auth_pks) == 0 {
 		return .None
@@ -306,18 +412,23 @@ query_authed :: proc(
 			break
 		}
 	}
+	full_authors := has_authors && len(fauthors) > 0
+	for author in fauthors {
+		if author.length != 32 {
+			full_authors = false
+			break
+		}
+	}
 
-	// Pin the mappings and mailbox runs under the publication lock. No
+	// Pin the mappings and posting runs under the publication lock. No
 	// pointers into the lookup maps escape the lock.
 	maps: ^Query_Maps
 	idx, data, tags_buf: []u8
 	local_id: [1]Event_Slot
 	cand: []Event_Slot
-	local_run: [1]Posting_Cursor
-	run_storage := local_run[:]
-	cursors := run_storage[:0]
-	mailbox_steps := 0
-	use_mailbox: bool
+	cursors := make([dynamic]Posting_Cursor, context.temp_allocator)
+	posting_steps := 0
+	use_mailbox, use_authors: bool
 	indexed_tags: bool
 	total: int
 	{
@@ -352,35 +463,33 @@ query_authed :: proc(
 		if !use_ids && inbox && indexed_tags {
 			use_mailbox = true
 			for &pk in auth_pks {
-				for run in s.postings.by_recipient[pk].runs {
-					n := len(cursors)
-					if n == len(run_storage) {
-						grown := make([]Posting_Cursor, n * 2, context.temp_allocator)
-						copy(grown, cursors)
-						run_storage = grown
-					}
-					sync.atomic_add(&run.refs, 1)
-					cursors = run_storage[:n + 1]
-					cursors[n] = {
-						run = run,
-					}
-					mailbox_steps += len(run.slots)
-				}
+				posting_steps += cursors_pin(&cursors, s.postings.by_recipient[pk])
 			}
+		} else if !use_ids && full_authors && indexed_tags {
+			for author in fauthors {
+				posting_steps += cursors_pin(&cursors, s.postings.by_author[author.bytes])
+			}
+			use_authors = posting_steps * POSTINGS_INDEX_SHARE <= total
 		}
 		sync.atomic_add(&maps.refs, 1)
 	}
 	defer query_maps_release(s, maps)
 	defer for &c in cursors do posting_release(c.run)
 	steps := total
-	use_slots := use_ids || use_mailbox
-	ordered := use_mailbox || use_ids && indexed_tags
+	use_postings := use_mailbox || use_authors
+	use_slots := use_ids || use_postings
+	ordered := use_postings || use_ids && indexed_tags
 	recipient_offsets: Offset_Set
 	defer delete(recipient_offsets)
+	heads: []Posting_Cursor
+	posting_kinds := fkinds[:] if has_kinds else nil
 	if use_slots {
-		steps = mailbox_steps if use_mailbox else len(cand)
+		steps = posting_steps if use_postings else len(cand)
 		if steps == 0 {
 			return .None
+		}
+		if use_postings {
+			heads = cursors_heap(cursors[:], posting_kinds, filter.until, raw_data(idx))
 		}
 		if use_ids && steps > 1 {
 			if ordered {
@@ -446,7 +555,6 @@ query_authed :: proc(
 	defer pq.destroy(&heap)
 
 	// Pre-extract filter fields to avoid repeated Maybe-unwrapping in the hot loop.
-	fauthors, has_authors := filter.authors.?
 	fsince, has_since := filter.since.?
 	funtil, has_until := filter.until.?
 	fsearch, has_search := filter.search.?
@@ -458,8 +566,11 @@ query_authed :: proc(
 		i: int
 		if use_slots {
 			candidate: Event_Slot
-			if use_mailbox {
-				candidate = mailbox_next(cursors, raw_data(idx))
+			if use_postings {
+				if len(heads) == 0 {
+					break
+				}
+				candidate = posting_next(&heads, posting_kinds, raw_data(idx)).event
 			} else {
 				candidate = cand[si if ordered else steps - 1 - si]
 			}
@@ -550,8 +661,9 @@ query_authed :: proc(
 		}
 
 		// 7. Mailbox slots and the fallback offsets were selected by auth key.
-		//    ID slots still need that check, independently of requested tags.
-		check_recipient := wrap && use_ids
+		//    ID and author slots still need that check, independently of
+		//    requested tags.
+		check_recipient := wrap && (use_ids || use_authors)
 		if check_recipient || len(specs) > 0 {
 			// With a known end, the recipient check alone can stop at its
 			// first match without first walking back to find the start.
@@ -587,8 +699,9 @@ query_authed :: proc(
 			}
 		}
 
-		// 10. Authors filter — same reasoning as ids.
-		if has_authors {
+		// 10. Authors filter — same reasoning as ids. Author postings were
+		//     selected by it.
+		if has_authors && !use_authors {
 			found := false
 			for pk in fauthors {
 				if nostr.hex_prefix_matches(pk, pubkey) {

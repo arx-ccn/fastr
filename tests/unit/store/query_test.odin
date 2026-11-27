@@ -416,6 +416,134 @@ test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
 	}
 }
 
+@(private = "file")
+test_authors_filter :: proc(pubkeys: ..[32]u8) -> nostr.Filter {
+	authors := make([dynamic]nostr.Hex_Prefix, context.temp_allocator)
+	for pubkey in pubkeys {
+		append(&authors, nostr.Hex_Prefix{bytes = pubkey, length = 32})
+	}
+	return {authors = authors}
+}
+
+@(private = "file")
+test_query_ids :: proc(t: ^testing.T, s: ^Store, f: ^nostr.Filter, auth: [][32]u8) -> [][32]u8 {
+	c := collect_ctx_init()
+	testing.expect_value(t, query_authed(s, f, auth, &c, collect_cb), Error.None)
+	return c.ids[:]
+}
+
+// A filter on full author keys reads the authors' postings. It must return
+// what the index scan returns: same events, same order, same visibility.
+@(test)
+test_author_postings_match_scan :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	a, b, reader := test_pubkey(1), test_pubkey(2), test_pubkey(9)
+	wrap :: nostr.KIND_GIFT_WRAP
+	topic := test_tag("t", "topic")
+
+	// Other authors hold most of the index, so a filter on a and b is selective.
+	for i in 0 ..< 160 {
+		filler := test_make_event(u8(20 + i % 4), 1, i64(1000 + i), nil)
+		test_append_ok(t, s, &filler)
+	}
+	old := test_make_event(1, 1, 1010, test_tags(topic))
+	tied := [2]pack.Event {
+		test_make_event(1, 1, 1020, test_tags(test_tag("x", "1"))),
+		test_make_event(1, 1, 1020, test_tags(test_tag("x", "2"))),
+	}
+	reaction := test_make_event(1, 7, 1030, nil)
+	deleted := test_make_event(1, 1, 1040, nil)
+	protected := test_make_event(1, 1, 1050, test_tags(test_tag("-")))
+	to_reader := test_make_event(1, wrap, 1060, test_tags(test_tag("p", test_hex(reader[:]))))
+	to_other := test_make_event(1, wrap, 1061, test_tags(test_tag("p", test_hex(b[:]))))
+	backdated := test_make_event(1, 1, 5, nil)
+	b_note := test_make_event(2, 1, 1025, nil)
+	b_reaction := test_make_event(2, 7, 1055, test_tags(topic))
+	deletion := test_kind5_event(1, deleted.id)
+	for ev in ([]^pack.Event{&old, &b_note, &tied[0], &tied[1], &reaction, &deleted, &b_reaction, &protected, &to_reader, &to_other, &deletion, &backdated}) {
+		test_append_ok(t, s, ev)
+	}
+
+	by_a := test_authors_filter(a)
+	anonymous := test_query_ids(t, s, &by_a, nil)
+	slice.sort_by(tied[:], proc(x, y: pack.Event) -> bool {return id_less(x.id, y.id)})
+	testing.expect(
+		t,
+		slice.equal(
+			anonymous,
+			[][32]u8{deletion.id, reaction.id, tied[0].id, tied[1].id, old.id, backdated.id},
+		),
+		"newest first, lower id on a tie; deleted, protected and wrapped events hidden",
+	)
+	as_reader := test_query_ids(t, s, &by_a, {reader})
+	testing.expect(t, ids_contain(as_reader, to_reader.id), "a recipient reads its gift wrap")
+	testing.expect(t, !ids_contain(as_reader, to_other.id), "not a wrap for someone else")
+	testing.expect(t, !ids_contain(as_reader, protected.id))
+	testing.expect(t, ids_contain(test_query_ids(t, s, &by_a, {a}), protected.id))
+
+	filters := [?]nostr.Filter {
+		by_a,
+		test_authors_filter(a, b),
+		test_authors_filter(a, a),
+		test_authors_filter(a, b),
+		test_authors_filter(a),
+		test_authors_filter(a, b),
+		test_authors_filter(a),
+		test_authors_filter(test_pubkey(200)),
+	}
+	filters[1].limit = 3
+	filters[3].kinds = test_kind_filter(7).kinds
+	// Both bounds are inclusive and each falls on an event.
+	filters[4].since, filters[4].until = 1020, 1030
+	filters[5].tags = test_tag_filter('t', "topic").tags
+	filters[6].kinds = test_kind_filter(wrap, 1).kinds
+
+	for phase in 0 ..< 4 {
+		switch phase {
+		case 1:
+			store_close(s)
+			s = test_open(t, dir)
+		case 2:
+			_, err := store_compact(s)
+			testing.expect_value(t, err, Error.None)
+		case 3:
+			newer := test_make_event(1, 1, 2000, nil)
+			test_append_ok(t, s, &newer)
+		case:
+		}
+		selected := 0
+		for pubkey in ([2][32]u8{a, b}) {
+			for run in s.postings.by_author[pubkey].runs {
+				selected += len(run.slots)
+			}
+		}
+		testing.expect(t, selected >= 10 && selected * POSTINGS_INDEX_SHARE <= event_count(s))
+
+		for &f, fi in filters {
+			for auth in ([][][32]u8{nil, {reader}, {a}}) {
+				from_postings := test_query_ids(t, s, &f, auth)
+				entries := s.postings.entries
+				s.postings.entries = -1 // The index scan answers.
+				from_scan := test_query_ids(t, s, &f, auth)
+				s.postings.entries = entries
+				testing.expectf(
+					t,
+					slice.equal(from_postings, from_scan),
+					"phase %d filter %d readers %d: postings %v, scan %v",
+					phase,
+					fi,
+					len(auth),
+					from_postings,
+					from_scan,
+				)
+			}
+		}
+	}
+}
+
 @(test)
 test_tag_snapshot_ahead :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)

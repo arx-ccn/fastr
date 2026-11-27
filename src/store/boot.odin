@@ -4,7 +4,6 @@
 package store
 
 import "core:encoding/endian"
-import "core:slice"
 import "core:sync"
 
 import "../nostr"
@@ -45,6 +44,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 		   len(tags) % TAG_ENTRY_SIZE == 0 &&
 		   u64(len(tags) / TAG_ENTRY_SIZE) <= u64(max(u32)) {
 			s.postings = {
+				by_author    = make(map[[32]u8]Posting_List),
 				by_recipient = make(map[[32]u8]Posting_List),
 				entries      = total,
 				tag_bytes    = len(tags),
@@ -64,23 +64,20 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 				for tag_pos < len(tags) && endian.unchecked_get_u64le(tags[tag_pos:]) == e.offset {
 					tag_pos += TAG_ENTRY_SIZE
 				}
-				if e.kind == nostr.KIND_GIFT_WRAP {
-					mailbox_add(
-						&s.postings,
-						u32(i),
-						u32(tag_pos / TAG_ENTRY_SIZE),
-						tags[start:tag_pos],
-					)
-				}
+				postings_add(
+					&s.postings,
+					{u32(i), u32(tag_pos / TAG_ENTRY_SIZE)},
+					e.kind,
+					e.pubkey,
+					tags[start:tag_pos],
+				)
 			}
 			s.known_ids[e.id] = {
 				slot    = u32(i),
 				tag_end = u32(tag_pos / TAG_ENTRY_SIZE),
 			}
 		}
-		for _, box in s.postings.by_recipient {
-			slice.sort_by_with_data(box.runs[0].slots[:], slot_newer, raw_data(idx))
-		}
+		postings_sort(&s.postings, raw_data(idx))
 	}
 
 	// Write lock: boot_rebuild must add confirmed tombstones for the losers
