@@ -591,17 +591,21 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 	link := test_tag("r", "https://example.com/a/path/longer/than/thirty-two/bytes")
 
 	// Append refuses an expired event, so one is written the way an earlier
-	// run would have left it, after an event that keeps the common tag's
-	// first record below every rare one.
-	first := test_make_event(20, 1, 900, test_tags(common))
+	// run would have left it.
 	expired := test_make_event(1, 1, 1045, test_tags(rare, test_expiry_tag(1)))
-	nd_legacy(t, dir, first, expired)
+	nd_legacy(t, dir, expired)
 	s := test_open(t, dir)
 	defer store_close(s)
 
 	// Half the fillers carry the common tag, so a filter on it must scan.
 	// Each has a tag value of its own, so the chains outgrow their first
-	// bucket table and link array.
+	// bucket table and link array. The keys of the two twin values have one
+	// hash, so their 30 and 20 records share a chain.
+	twins := [2]string{"twin-25566", "twin-135650"}
+	twin_ids: [3][dynamic][32]u8 // newest first: either value, then both
+	for &ids in twin_ids {
+		ids = make([dynamic][32]u8, context.temp_allocator)
+	}
 	for i in 0 ..< 600 {
 		own := test_tag("x", fmt.tprintf("filler-%d", i))
 		tags := make([dynamic]pack.Tag, context.temp_allocator)
@@ -612,8 +616,30 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 		if i % 15 == 0 {
 			append(&tags, test_tag("z", "some"))
 		}
-		filler := test_make_event(u8(20 + i % 4), 1, i64(1000 + i), tags[:])
+		twin := -1
+		if i % 20 == 1 {
+			twin = 0
+		}
+		if i % 30 == 2 {
+			twin = 1
+		}
+		if twin >= 0 {
+			append(&tags, test_tag("t", twins[twin]))
+		}
+		// One author has 60 of the fillers, and half of those have a tag.
+		sk := u8(20 + i % 4)
+		if i % 10 == 3 {
+			sk = 30
+		}
+		if i % 20 == 3 {
+			append(&tags, test_tag("w", "few"))
+		}
+		filler := test_make_event(sk, 1, i64(1000 + i), tags[:])
 		test_append_ok(t, s, &filler)
+		if twin >= 0 {
+			inject_at(&twin_ids[twin], 0, filler.id)
+			inject_at(&twin_ids[2], 0, filler.id)
+		}
 	}
 	old := test_make_event(1, 1, 1010, test_tags(rare, reply))
 	tied := [2]pack.Event {
@@ -676,6 +702,12 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 		test_tag_filter('t', "rare"),
 		test_tag_filter('e', referenced),
 		test_tag_filter('t', "rare"),
+		test_tag_filter('t', twins[0]),
+		test_tag_filter('t', twins[1]),
+		test_tag_filter('t', twins[0]),
+		test_tag_filter('z', "some"),
+		test_tag_filter('w', "few"),
+		test_tag_filter('e', referenced),
 	}
 	either := make(nostr.Tag_Value_Set, context.temp_allocator)
 	either["rare"], either["other"] = {}, {}
@@ -695,8 +727,23 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 	by_reply_of_a.authors = test_authors_filter(a).authors
 	// The bound admits the last slot, which holds the oldest timestamp.
 	filters[14].until = 1500
-	paged := test_tag_filter('z', "some")
+	both_twins := make(nostr.Tag_Value_Set, context.temp_allocator)
+	both_twins[twins[0]], both_twins[twins[1]] = {}, {}
+	filters[17].tags['t'] = both_twins
+	// A chain passes every record above `until` before its first candidate.
+	// With forty records to pass for one event, this filter scans from the
+	// bound instead.
+	paged := &filters[18]
 	paged.until, paged.limit = 1300, 1
+	// With thirty records to pass for five of this author's 60 events, this
+	// one seeks in the author's postings.
+	seek := &filters[19]
+	seek.authors = test_authors_filter(test_pubkey(30)).authors
+	seek.until, seek.limit = 1300, 5
+	// Two chain records are few enough to pass, bound or not.
+	reply_before := &filters[20]
+	reply_before.authors = test_authors_filter(a).authors
+	reply_before.until = 1500
 
 	for phase in 0 ..< 4 {
 		switch phase {
@@ -737,7 +784,7 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 			chains.buckets,
 			tag_value_hash('t', build_tag_specs(&filters[9])[0].values[0]),
 		)
-		testing.expect(t, rare_bucket.count >= 7 && common_bucket.count >= 302)
+		testing.expect(t, rare_bucket.count >= 7 && common_bucket.count >= 301)
 		rare_count := rare_bucket.count
 		rare_bucket.count = 0
 		testing.expect_value(t, len(test_query_ids(t, s, &by_rare, nil)), 0)
@@ -746,21 +793,20 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 		common_head := &chains.links.links[common_bucket.head]
 		common_prev := common_head.prev
 		common_head.prev = TAG_NONE
-		testing.expect(t, len(test_query_ids(t, s, &filters[9], nil)) >= 302)
+		testing.expect(t, len(test_query_ids(t, s, &filters[9], nil)) >= 301)
 		common_head.prev = common_prev
 
-		// A chain passes every record above `until` before its first
-		// candidate. With forty records to pass for one event, the filter
-		// scans from the bound instead, and a cut chain does not hide it.
-		some_bucket := tag_bucket(
-			chains.buckets,
-			tag_value_hash('z', build_tag_specs(&paged)[0].values[0]),
-		)
-		some_head := &chains.links.links[some_bucket.head]
-		some_prev := some_head.prev
-		some_head.prev = TAG_NONE
-		testing.expect_value(t, len(test_query_ids(t, s, &paged, nil)), 1)
-		some_head.prev = some_prev
+		// The two filters that `until` keeps off their chains do not notice
+		// when a chain is cut to one record.
+		for bounded in ([]^nostr.Filter{paged, seek}) {
+			spec := build_tag_specs(bounded)[0]
+			bucket := tag_bucket(chains.buckets, tag_value_hash(spec.name, spec.values[0]))
+			head := &chains.links.links[bucket.head]
+			prev := head.prev
+			head.prev = TAG_NONE
+			testing.expect_value(t, len(test_query_ids(t, s, bounded, nil)), bounded.limit.?)
+			head.prev = prev
+		}
 
 		// A filter with full author keys and a tag reads whichever names
 		// fewer events. Cutting the rare chain to one record must not hide
@@ -778,24 +824,31 @@ test_tag_chains_match_scan :: proc(t: ^testing.T) {
 			count = a_list.count,
 		}
 		testing.expect(t, ids_contain(test_query_ids(t, s, by_reply_of_a, nil), old.id))
+		testing.expect(t, ids_contain(test_query_ids(t, s, reply_before, nil), old.id))
 		s.postings.by_author[a] = a_list
 
-		// Two values with one hash share a chain. Joined to the common
-		// value's chain, the rare value's filter must still pass over the
-		// records that carry the other value.
-		oldest_rare := rare_bucket.head
-		for chains.links.links[oldest_rare].prev != TAG_NONE {
-			oldest_rare = chains.links.links[oldest_rare].prev
+		// Each twin value finds its own events in the chain the two share.
+		// A filter that names both reads that chain once: counted twice, its
+		// 50 records would pass the cutoff and the filter would scan, and a
+		// scan does not notice a chain cut to one record.
+		twin_bucket := tag_bucket(
+			chains.buckets,
+			tag_value_hash('t', build_tag_specs(&filters[15])[0].values[0]),
+		)
+		testing.expect_value(
+			t,
+			tag_value_hash('t', build_tag_specs(&filters[16])[0].values[0]),
+			twin_bucket.hash,
+		)
+		testing.expect_value(t, twin_bucket.count, 50)
+		for ids, k in twin_ids {
+			testing.expect(t, slice.equal(test_query_ids(t, s, &filters[15 + k], nil), ids[:]))
 		}
-		common_below := common_bucket.head
-		for common_below > oldest_rare {
-			common_below = chains.links.links[common_below].prev
-		}
-		shared := test_query_ids(t, s, &by_rare, nil)
-		chains.links.links[oldest_rare].prev = common_below
-		joined := test_query_ids(t, s, &by_rare, nil)
-		chains.links.links[oldest_rare].prev = TAG_NONE
-		testing.expect(t, slice.equal(joined, shared), "records of another value must not match")
+		twin_head := &chains.links.links[twin_bucket.head]
+		twin_prev := twin_head.prev
+		twin_head.prev = TAG_NONE
+		testing.expect_value(t, len(test_query_ids(t, s, &filters[17], nil)), 1)
+		twin_head.prev = twin_prev
 
 		// Compaction publishes the ceiling of its new layout while a query
 		// may still read the old files. A ceiling of another layout must not

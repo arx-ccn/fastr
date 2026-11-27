@@ -376,31 +376,30 @@ tag_value_hash :: proc(name: u8, value: Tag_Value) -> u32 {
 }
 
 // Pick the tag of `specs` whose values name the fewest records. Returns that
-// count and the newest record of each of those values' chains. Caller holds
-// known_ids_mu.
+// count and the newest record of each chain those values name. Two spellings
+// of one value, or two values with one hash, name one chain, which counts
+// once. Caller holds known_ids_mu.
 @(private)
 tag_chain_heads :: proc(chains: ^Tag_Chains, specs: []Tag_Spec) -> (heads: []u32, records: int) {
-	fewest := 0
 	records = max(int)
-	for spec, j in specs {
+	for spec in specs {
+		found := make([dynamic]u32, 0, len(spec.values), context.temp_allocator)
+		seen := make(map[u32]struct{}, context.temp_allocator)
 		named := 0
 		for value in spec.values {
-			named += int(tag_bucket(chains.buckets, tag_value_hash(spec.name, value)).count)
+			bucket := tag_bucket(chains.buckets, tag_value_hash(spec.name, value))
+			if bucket.count == 0 || bucket.head in seen {
+				continue
+			}
+			seen[bucket.head] = {}
+			append(&found, bucket.head)
+			named += int(bucket.count)
 		}
 		if named < records {
-			fewest, records = j, named
+			heads, records = found[:], named
 		}
 	}
-
-	spec := specs[fewest]
-	found := make([dynamic]u32, 0, len(spec.values), context.temp_allocator)
-	for value in spec.values {
-		bucket := tag_bucket(chains.buckets, tag_value_hash(spec.name, value))
-		if bucket.count > 0 {
-			append(&found, bucket.head)
-		}
-	}
-	return found[:], records
+	return
 }
 
 // Take the newest record any chain has left at or below slot `top` and step
@@ -617,18 +616,20 @@ query_authed :: proc(
 			}
 			if len(specs) > 0 {
 				tag_heads, tag_steps = tag_chain_heads(&s.postings.by_tag, specs)
-				use_tags = tag_steps * TAG_INDEX_SHARE <= total
+				// What the chains have to beat: the author postings when they
+				// qualify, else the scan. The chains must name fewer events.
+				rival := posting_steps if use_authors else total
+				use_tags = tag_steps * TAG_INDEX_SHARE <= total && tag_steps < rival
 				// A chain has no way to start at `until`: it passes every
-				// record above the bound. The scan starts there and reaches
-				// its limit in about limit * total / records slots.
+				// record above the bound. The postings and the scan start
+				// there, and reach the limit in about limit * rival / records
+				// steps when every record is one of theirs.
 				if _, bounded := filter.until.?; use_tags && bounded {
-					use_tags = tag_steps * tag_steps <= limit * total
+					use_tags = tag_steps * tag_steps <= limit * rival
 				}
-			}
-			// With both to choose from, read the one that names fewer events.
-			if use_authors && use_tags {
-				use_authors = posting_steps <= tag_steps
-				use_tags = !use_authors
+				if use_tags {
+					use_authors = false
+				}
 			}
 			if use_authors {
 				for list in lists {
