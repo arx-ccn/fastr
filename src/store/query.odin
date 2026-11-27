@@ -1,4 +1,4 @@
-// Read-side operations: query_authed, iter_negentropy, and the NIP-45
+// Read-side operations: query_authed, collect_negentropy, and the NIP-45
 // count_filters / scan_count family.
 package store
 
@@ -9,6 +9,7 @@ import "core:strings"
 import "core:sync"
 import "core:unicode/utf8"
 
+import "../negentropy"
 import "../nostr"
 import "../pack"
 import "../policy"
@@ -16,10 +17,6 @@ import "../policy"
 // Callback invoked once per matching event with its BASED blob bytes.
 // Returning a non-.None error aborts the query and propagates the error.
 Emit_Proc :: proc(user: rawptr, dp: []u8) -> Error
-
-// Callback for iter_negentropy: one (created_at, id) pair per match,
-// ascending by (created_at, id).
-Neg_Item_Proc :: proc(user: rawptr, ts: i64, id: [32]u8)
 
 // Decode one filter's tag constraints into Tag_Spec values (stack 32-byte
 // values + length, hashing values > 32 bytes).
@@ -1612,22 +1609,17 @@ scan_count_at :: proc(
 }
 
 @(private)
-Neg_Item :: struct {
-	ts: i64,
-	id: [32]u8,
-}
-
-@(private)
-neg_item_less :: proc(a, b: Neg_Item) -> bool {
-	if a.ts != b.ts {
-		return a.ts < b.ts
+neg_item_less :: proc(a, b: negentropy.Item) -> bool {
+	if a.timestamp != b.timestamp {
+		return i64(a.timestamp) < i64(b.timestamp)
 	}
 	return id_less(a.id, b.id)
 }
 
 @(private = "file")
-neg_emit_run :: proc(idx: []u8, slots: []Posting, user: rawptr, cb: Neg_Item_Proc) {
+neg_fill_run :: proc(idx: []u8, slots: []Posting, items: []negentropy.Item) {
 	entries := cast([^][INDEX_ENTRY_SIZE]u8)raw_data(idx)
+	next := 0
 	// Walk timestamp groups oldest first, retaining ascending IDs inside each.
 	for end := len(slots); end > 0; {
 		start := end - 1
@@ -1637,28 +1629,62 @@ neg_emit_run :: proc(idx: []u8, slots: []Posting, user: rawptr, cb: Neg_Item_Pro
 		}
 		for &posting in slots[start:end] {
 			id := cast(^[32]u8)&entries[posting.slot][28]
-			cb(user, i64(ts), id^)
+			items[next] = {
+				timestamp = ts,
+				id        = id^,
+			}
+			next += 1
 		}
 		end = start
 	}
 }
 
-// Collect and iterate (created_at, event_id) pairs for events matching
-// `filter`, emitting them in ascending (created_at, id) order as required
-// for negentropy. Returns (.Rejected, "blocked: ...") when more than
-// `max_records` entries match (#79).
-iter_negentropy :: proc(
+@(private = "file")
+neg_fill_merge :: proc(idx: []u8, cursors: []Posting_Cursor, items: []negentropy.Item) {
+	raw := raw_data(idx)
+	entries := cast([^][INDEX_ENTRY_SIZE]u8)raw
+	heads := cursors_heap(cursors, nil, raw)
+	group_end := len(items)
+	for i := len(items) - 1; i >= 0; i -= 1 {
+		p := posting_next(&heads, nil, raw)
+		entry := &entries[p.slot]
+		ts := endian.unchecked_get_u64le(entry[8:])
+		// The heap emits newest first, so fill backwards and fix each ID tie.
+		if i + 1 < len(items) && items[i + 1].timestamp != ts {
+			if group_end > i + 2 {
+				slice.reverse(items[i + 1:group_end])
+			}
+			group_end = i + 1
+		}
+		items[i] = {
+			timestamp = ts,
+			id        = (cast(^[32]u8)&entry[28])^,
+		}
+	}
+	if group_end > 1 {
+		slice.reverse(items[:group_end])
+	}
+}
+
+// Fill an empty array with matching (created_at, event_id) pairs, ordered
+// oldest first, then by ID. On error it stays empty. Returns .Rejected
+// when more than max_records entries match.
+collect_negentropy :: proc(
 	s: ^Store,
 	filter: ^nostr.Filter,
 	auth_pks: [][32]u8,
 	max_records: int,
-	user: rawptr,
-	cb: Neg_Item_Proc,
+	items: ^[dynamic]negentropy.Item,
 	access: policy.Read_Access = {},
 ) -> (
 	err: Error,
 	reason: string,
 ) {
+	ALLOC_ERROR :: "error: inventory allocation failed"
+	assert(len(items) == 0)
+	defer if err != .None {
+		clear(items)
+	}
 	walk := inventory_open(s, {filter^}, auth_pks, access)
 	defer inventory_close(s, &walk)
 	idx, data := walk.idx, walk.data
@@ -1676,11 +1702,14 @@ iter_negentropy :: proc(
 	if plain_mailbox && len(walk.cursors) == 0 {
 		return .None, ""
 	}
-	if plain_mailbox && len(walk.cursors) == 1 {
-		slots := walk.cursors[0].run.slots[:]
-		// A finite literal count covering the whole run excludes protected
+	if plain_mailbox && walk.literals != max(u32) {
+		total := 0
+		for &c in walk.cursors {
+			total += len(c.run.slots)
+		}
+		// A finite literal count covering every run excludes protected
 		// entries and entries that can expire. Check deletion separately.
-		if walk.literals != max(u32) && walk.literals == u32(len(slots)) {
+		if int(walk.literals) == total {
 			clean: bool
 			{
 				sync.shared_guard(&s.tombstones_mu)
@@ -1688,10 +1717,17 @@ iter_negentropy :: proc(
 				clean = !s.vanish_pending && walk.key not_in s.mailbox_deleted
 			}
 			if clean {
-				if len(slots) > max_records {
+				if total > max_records {
 					return .Rejected, REASON_NEG_TOO_MANY_RECORDS
 				}
-				neg_emit_run(idx, slots, user, cb)
+				if alloc_err := non_zero_resize(items, total); alloc_err != nil {
+					return .Io, ALLOC_ERROR
+				}
+				if len(walk.cursors) == 1 {
+					neg_fill_run(idx, walk.cursors[0].run.slots[:], items^[:])
+				} else {
+					neg_fill_merge(idx, walk.cursors[:], items^[:])
+				}
 				return .None, ""
 			}
 		}
@@ -1722,7 +1758,6 @@ iter_negentropy :: proc(
 	if ordered && len(walk.cursors) > 1 {
 		walk.heads = cursors_heap(walk.cursors[:], nil, raw_data(idx))
 	}
-	items := make([dynamic]Neg_Item, context.temp_allocator)
 
 	{
 		sync.shared_guard(&s.tombstones_mu)
@@ -1730,7 +1765,10 @@ iter_negentropy :: proc(
 		check_dead := !walk.mailbox || s.vanish_pending || walk.key in s.mailbox_deleted
 		if plain_mailbox && !check_dead && walk.literals != max(u32) {
 			// Public literal rows cannot expire or be hidden on this path.
-			reserve(&items, min(int(walk.literals), max(max_records, 0)))
+			want := min(int(walk.literals), max(max_records, 0))
+			if alloc_err := non_zero_reserve(items, want); alloc_err != nil {
+				return .Io, ALLOC_ERROR
+			}
 		}
 		for i, flags := inventory_next(&walk); i >= 0; i, flags = inventory_next(&walk) {
 			entry := index_entry_at(idx, i)
@@ -1801,29 +1839,31 @@ iter_negentropy :: proc(
 				// client can detect the cap and narrow the filter.
 				return .Rejected, REASON_NEG_TOO_MANY_RECORDS
 			}
-			append(&items, Neg_Item{entry.created_at, entry.id})
+			item := negentropy.Item{u64(entry.created_at), entry.id}
+			if _, alloc_err := non_zero_append(items, item); alloc_err != nil {
+				return .Io, ALLOC_ERROR
+			}
 		}
 	}
 
+	ordered_items := items^[:]
 	if ordered {
-		// Runs merge newest first, with IDs ascending within each second.
-		// Visit timestamp groups backwards without reversing their IDs.
-		for end := len(items); end > 0; {
-			start := end - 1
-			for start > 0 && items[start - 1].ts == items[end - 1].ts {
-				start -= 1
+		// Reverse timestamp groups without changing the order within ties.
+		slice.reverse(ordered_items)
+		for start := 0; start < len(ordered_items); {
+			end := start + 1
+			for end < len(ordered_items) &&
+			    ordered_items[end].timestamp == ordered_items[start].timestamp {
+				end += 1
 			}
-			for &item in items[start:end] {
-				cb(user, item.ts, item.id)
+			if end > start + 1 {
+				slice.reverse(ordered_items[start:end])
 			}
-			end = start
+			start = end
 		}
 		return .None, ""
 	}
-	slice.sort_by(items[:], neg_item_less)
-	for &item in items {
-		cb(user, item.ts, item.id)
-	}
+	slice.sort_by(ordered_items, neg_item_less)
 	return .None, ""
 }
 

@@ -7,6 +7,7 @@ import "core:slice"
 import "core:sync"
 import "core:testing"
 
+import "../negentropy"
 import "../nostr"
 import "../pack"
 import "../policy"
@@ -1630,21 +1631,10 @@ test_count_kind_fastpath_unaffected_by_no_expiry_events :: proc(t: ^testing.T) {
 	testing.expect_value(t, count_filters_at(s, one, nil, max(i64)), 3)
 }
 
-// --- iter_negentropy (#79) ---
-
-@(private = "file")
-Neg_Collect :: struct {
-	items: [dynamic]Neg_Item,
-}
-
-@(private = "file")
-neg_collect_cb :: proc(user: rawptr, ts: i64, id: [32]u8) {
-	c := cast(^Neg_Collect)user
-	append(&c.items, Neg_Item{ts, id})
-}
+// --- collect_negentropy (#79) ---
 
 @(test)
-test_iter_negentropy_ascending_order :: proc(t: ^testing.T) {
+test_neg_ascending_order :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
 	s := test_open(t, dir)
@@ -1658,15 +1648,13 @@ test_iter_negentropy_ascending_order :: proc(t: ^testing.T) {
 	}
 
 	f: nostr.Filter
-	c := Neg_Collect {
-		items = make([dynamic]Neg_Item, context.temp_allocator),
-	}
-	err, reason := iter_negentropy(s, &f, nil, 100, &c, neg_collect_cb)
+	items := make([dynamic]negentropy.Item, context.temp_allocator)
+	err, reason := collect_negentropy(s, &f, nil, 100, &items)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, reason, "")
-	testing.expect_value(t, len(c.items), 4)
-	for i in 1 ..< len(c.items) {
-		testing.expect(t, neg_item_less(c.items[i - 1], c.items[i]), "ascending (created_at, id)")
+	testing.expect_value(t, len(items), 4)
+	for i in 1 ..< len(items) {
+		testing.expect(t, neg_item_less(items[i - 1], items[i]), "ascending (created_at, id)")
 	}
 }
 
@@ -1679,11 +1667,11 @@ test_neg_mailbox_order_and_cap :: proc(t: ^testing.T) {
 	recipient := test_pubkey(9)
 	key := test_hex(recipient[:])
 	tag := test_tag("p", key)
-	want: [4]Neg_Item
+	want: [4]negentropy.Item
 	for ts, i in ([4]i64{20, 10, 30, 10}) {
 		ev := test_make_event(u8(i + 1), nostr.KIND_GIFT_WRAP, ts, test_tags(tag))
 		test_append_ok(t, s, &ev)
-		want[i] = {ts, ev.id}
+		want[i] = {u64(ts), ev.id}
 	}
 	target := want[0].id
 	slice.sort_by(want[:], neg_item_less)
@@ -1692,32 +1680,46 @@ test_neg_mailbox_order_and_cap :: proc(t: ^testing.T) {
 	access := policy.Read_Access {
 		gift_wrap_read = .Public,
 	}
-	c: Neg_Collect
-	c.items.allocator = context.temp_allocator
+	items := make([dynamic]negentropy.Item, context.temp_allocator)
 	length := mapped_file_load_len(&s.data)
 	mapped_file_publish_len(&s.data, 0)
-	err, reason := iter_negentropy(s, &filter, nil, 3, &c, neg_collect_cb, access)
+	unavailable: [dynamic]negentropy.Item
+	unavailable.allocator = mem.nil_allocator()
+	alloc_err, _ := collect_negentropy(s, &filter, nil, 4, &unavailable, access)
+	testing.expect_value(t, alloc_err, Error.Io)
+	testing.expect_value(t, len(unavailable), 0)
+	err, reason := collect_negentropy(s, &filter, nil, 3, &items, access)
 	testing.expect_value(t, err, Error.Rejected)
 	testing.expect_value(t, reason, REASON_NEG_TOO_MANY_RECORDS)
-	testing.expect_value(t, len(c.items), 0)
-	err, _ = iter_negentropy(s, &filter, nil, 4, &c, neg_collect_cb, access)
+	testing.expect_value(t, len(items), 0)
+	err, _ = collect_negentropy(s, &filter, nil, 4, &items, access)
 	mapped_file_publish_len(&s.data, length)
 	testing.expect_value(t, err, Error.None)
-	testing.expect(t, slice.equal(c.items[:], want[:]))
+	testing.expect(t, slice.equal(items[:], want[:]))
+
+	// The next append leaves a second run and ties events in the first.
+	tied := test_make_event(8, nostr.KIND_GIFT_WRAP, 10, test_tags(tag))
+	test_append_ok(t, s, &tied)
+	clear(&items)
+	err, _ = collect_negentropy(s, &filter, nil, 5, &items, access)
+	testing.expect_value(t, err, Error.None)
+	merged := [5]negentropy.Item{want[0], want[1], want[2], want[3], {10, tied.id}}
+	slice.sort_by(merged[:], neg_item_less)
+	testing.expect(t, slice.equal(items[:], merged[:]))
 
 	del := test_kind5_event(1, target)
 	test_append_ok(t, s, &del)
-	clear(&c.items)
-	err, _ = iter_negentropy(s, &filter, nil, 3, &c, neg_collect_cb, access)
+	clear(&items)
+	err, _ = collect_negentropy(s, &filter, nil, 4, &items, access)
 	testing.expect_value(t, err, Error.None)
-	testing.expect_value(t, len(c.items), 3)
-	for item in c.items {
+	testing.expect_value(t, len(items), 4)
+	for item in items {
 		testing.expect(t, item.id != target)
 	}
 }
 
 @(test)
-test_iter_negentropy_too_many_records :: proc(t: ^testing.T) {
+test_neg_too_many_records :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
 	s := test_open(t, dir)
@@ -1729,16 +1731,20 @@ test_iter_negentropy_too_many_records :: proc(t: ^testing.T) {
 	}
 
 	f: nostr.Filter
-	c := Neg_Collect {
-		items = make([dynamic]Neg_Item, context.temp_allocator),
-	}
-	err, reason := iter_negentropy(s, &f, nil, 3, &c, neg_collect_cb)
+	items := make([dynamic]negentropy.Item, context.temp_allocator)
+	err, reason := collect_negentropy(s, &f, nil, 3, &items)
 	testing.expect_value(t, err, Error.Rejected)
 	testing.expect_value(t, reason, REASON_NEG_TOO_MANY_RECORDS)
+	testing.expect_value(t, len(items), 0)
+	unavailable: [dynamic]negentropy.Item
+	unavailable.allocator = mem.nil_allocator()
+	err, _ = collect_negentropy(s, &f, nil, 5, &unavailable)
+	testing.expect_value(t, err, Error.Io)
+	testing.expect_value(t, len(unavailable), 0)
 }
 
 @(test)
-test_iter_negentropy_skips_tombstoned :: proc(t: ^testing.T) {
+test_neg_skips_tombstoned :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
 	s := test_open(t, dir)
@@ -1752,13 +1758,11 @@ test_iter_negentropy_skips_tombstoned :: proc(t: ^testing.T) {
 	test_append_ok(t, s, &k5)
 
 	f := test_kind_filter(1)
-	c := Neg_Collect {
-		items = make([dynamic]Neg_Item, context.temp_allocator),
-	}
-	err, _ := iter_negentropy(s, &f, nil, 100, &c, neg_collect_cb)
+	items := make([dynamic]negentropy.Item, context.temp_allocator)
+	err, _ := collect_negentropy(s, &f, nil, 100, &items)
 	testing.expect_value(t, err, Error.None)
-	testing.expect_value(t, len(c.items), 1)
-	testing.expect_value(t, c.items[0].id, live.id)
+	testing.expect_value(t, len(items), 1)
+	testing.expect_value(t, items[0].id, live.id)
 }
 
 // --- scan_ceiling early exit -----------------------------------------------

@@ -3,6 +3,7 @@ package store
 import "core:os"
 import "core:testing"
 
+import "../negentropy"
 import "../nostr"
 import "../pack"
 import "../policy"
@@ -20,9 +21,13 @@ older_visible :: proc(
 }
 
 @(private)
-policy_collect_id :: proc(user: rawptr, ts: i64, id: [32]u8) {
-	c := (^Collect_Ctx)(user)
-	append(&c.ids, id)
+neg_contains :: proc(items: []negentropy.Item, id: [32]u8) -> bool {
+	for &item in items {
+		if item.id == id {
+			return true
+		}
+	}
+	return false
 }
 
 @(test)
@@ -49,23 +54,23 @@ test_policy_read_paths :: proc(t: ^testing.T) {
 	testing.expect_value(t, count_filters(s, {f}, nil), u64(4))
 	testing.expect_value(t, count_filters(s, {f}, nil, access), u64(2))
 	testing.expect_value(t, count_filters(s, {f, f}, nil, access), u64(2))
-	clear(&c.ids)
-	err, _ = iter_negentropy(s, &f, nil, 2, &c, policy_collect_id, access)
+	items := make([dynamic]negentropy.Item, context.temp_allocator)
+	err, _ = collect_negentropy(s, &f, nil, 2, &items, access)
 	testing.expect_value(t, err, Error.None)
-	testing.expect_value(t, len(c.ids), 2)
+	testing.expect_value(t, len(items), 2)
 
 	// An allow-all plugin still cannot reveal a protected event's ID.
 	protected := test_make_event(5, 1, 5, test_tags(test_tag("-")))
 	test_append_ok(t, s, &protected)
-	clear(&c.ids)
-	err, _ = iter_negentropy(s, &f, nil, 2, &c, policy_collect_id, access)
+	clear(&items)
+	err, _ = collect_negentropy(s, &f, nil, 2, &items, access)
 	testing.expect_value(t, err, Error.None)
-	testing.expect_value(t, len(c.ids), 2)
-	testing.expect(t, !ids_contain(c.ids[:], protected.id))
-	clear(&c.ids)
-	err, _ = iter_negentropy(s, &f, {protected.pubkey}, 3, &c, policy_collect_id, access)
+	testing.expect_value(t, len(items), 2)
+	testing.expect(t, !neg_contains(items[:], protected.id))
+	clear(&items)
+	err, _ = collect_negentropy(s, &f, {protected.pubkey}, 3, &items, access)
 	testing.expect_value(t, err, Error.None)
-	testing.expect(t, ids_contain(c.ids[:], protected.id))
+	testing.expect(t, neg_contains(items[:], protected.id))
 }
 
 @(test)
@@ -106,18 +111,18 @@ test_gift_wrap_read_modes :: proc(t: ^testing.T) {
 		for id in want {
 			testing.expectf(t, ids_contain(c.ids[:], id), "%s REQ missing %x", name, id)
 		}
-		clear(&c.ids)
-		err, _ = iter_negentropy(s, &f, auth, 3, &c, policy_collect_id, access)
+		items := make([dynamic]negentropy.Item, context.temp_allocator)
+		err, _ = collect_negentropy(s, &f, auth, 3, &items, access)
 		testing.expectf(
 			t,
-			err == .None && len(c.ids) == len(want),
+			err == .None && len(items) == len(want),
 			"%s inventory: %v, %v",
 			name,
 			err,
-			c.ids,
+			items,
 		)
 		for id in want {
-			testing.expectf(t, ids_contain(c.ids[:], id), "%s inventory missing %x", name, id)
+			testing.expectf(t, neg_contains(items[:], id), "%s inventory missing %x", name, id)
 		}
 		cases := [?][]nostr.Filter{{f}, {f, f}}
 		for filters in cases {
@@ -203,22 +208,22 @@ test_mailbox_count_and_neg :: proc(t: ^testing.T) {
 		mapped_file_publish_len(&s.data, 0)
 		defer mapped_file_publish_len(&s.data, length)
 		testing.expect_value(t, count_filters_at(s, {mailbox}, nil, expires, access), u64(3))
-		c := collect_ctx_init()
-		err, _ := iter_negentropy(s, &mailbox, nil, 3, &c, policy_collect_id, access)
+		items := make([dynamic]negentropy.Item, context.temp_allocator)
+		err, _ := collect_negentropy(s, &mailbox, nil, 3, &items, access)
 		testing.expect_value(t, err, Error.Rejected)
-		testing.expect_value(t, len(c.ids), 0)
-		err, _ = iter_negentropy(s, &mailbox, nil, 4, &c, policy_collect_id, access)
+		testing.expect_value(t, len(items), 0)
+		err, _ = collect_negentropy(s, &mailbox, nil, 4, &items, access)
 		testing.expect_value(t, err, Error.None)
-		testing.expect_value(t, len(c.ids), 4)
-		if len(c.ids) == 4 {
+		testing.expect_value(t, len(items), 4)
+		if len(items) == 4 {
 			first, second := older.id, tied.id
 			if id_less(second, first) {
 				first, second = second, first
 			}
-			testing.expect_value(t, c.ids[0], expiring.id)
-			testing.expect_value(t, c.ids[1], first)
-			testing.expect_value(t, c.ids[2], second)
-			testing.expect_value(t, c.ids[3], newer.id)
+			testing.expect_value(t, items[0].id, expiring.id)
+			testing.expect_value(t, items[1].id, first)
+			testing.expect_value(t, items[2].id, second)
+			testing.expect_value(t, items[3].id, newer.id)
 		}
 	}
 }
@@ -261,11 +266,11 @@ test_mailbox_literal_count :: proc(t: ^testing.T) {
 		author := test_pubkey(1)
 		testing.expect_value(t, count_filters(s, {mailbox}, nil, access), u64(1))
 		testing.expect_value(t, count_filters(s, {mailbox}, {author}, access), want)
-		c := collect_ctx_init()
-		err, _ := iter_negentropy(s, &mailbox, nil, 2, &c, policy_collect_id, access)
+		items := make([dynamic]negentropy.Item, context.temp_allocator)
+		err, _ := collect_negentropy(s, &mailbox, nil, 2, &items, access)
 		testing.expect_value(t, err, Error.None)
-		testing.expect_value(t, len(c.ids), 2)
-		testing.expect(t, ids_contain(c.ids[:], alias_only.id) && ids_contain(c.ids[:], both.id))
+		testing.expect_value(t, len(items), 2)
+		testing.expect(t, neg_contains(items[:], alias_only.id) && neg_contains(items[:], both.id))
 	}
 }
 
@@ -340,9 +345,9 @@ test_mailbox_partial_tags :: proc(t: ^testing.T) {
 		mailbox.kinds = test_kind_filter(nostr.KIND_GIFT_WRAP).kinds
 		want := 1 - i
 		testing.expect_value(t, count_filters(s, {mailbox}, nil, access), u64(want))
-		c := collect_ctx_init()
-		err, _ := iter_negentropy(s, &mailbox, nil, 2, &c, policy_collect_id, access)
+		items := make([dynamic]negentropy.Item, context.temp_allocator)
+		err, _ := collect_negentropy(s, &mailbox, nil, 2, &items, access)
 		testing.expect_value(t, err, Error.None)
-		testing.expect_value(t, len(c.ids), want)
+		testing.expect_value(t, len(items), want)
 	}
 }

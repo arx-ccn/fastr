@@ -124,9 +124,6 @@ sync_once :: proc(
 	storage := negentropy.storage_make()
 	defer negentropy.storage_destroy(&storage)
 
-	fill := Neg_Fill_Ctx {
-		storage = &storage,
-	}
 	principal := policy.Principal {
 		source = .Peer,
 		peer   = p.url,
@@ -148,19 +145,15 @@ sync_once :: proc(
 		check          = relay.hooks.check_read,
 		gift_wrap_read = relay.cfg.gift_wrap_read,
 	}
-	if serr, _ := store.iter_negentropy(
+	if serr, _ := store.collect_negentropy(
 		relay.store,
 		&filter,
 		nil,
 		max_neg_records,
-		&fill,
-		neg_fill,
+		&storage.items,
 		access,
 	); serr != .None {
 		return 0, false, "local store scan failed"
-	}
-	if fill.insert_err != .None {
-		return 0, false, "local negentropy build failed"
 	}
 	if serr := negentropy.seal(&storage); serr != .None {
 		return 0, false, "local negentropy seal failed"
@@ -238,23 +231,6 @@ sync_once :: proc(
 	p.backoff = BACKOFF_BASE_SEC
 	p.next_try = 0
 	return ingested, true, ""
-}
-
-@(private)
-Neg_Fill_Ctx :: struct {
-	storage:    ^negentropy.Storage_Vector,
-	insert_err: negentropy.Error,
-}
-
-@(private)
-neg_fill :: proc(user: rawptr, ts: i64, id: [32]u8) {
-	ctx := cast(^Neg_Fill_Ctx)user
-	if ctx.insert_err != .None {
-		return
-	}
-	if err := negentropy.insert(ctx.storage, u64(ts), id); err != .None {
-		ctx.insert_err = err
-	}
 }
 
 @(private)

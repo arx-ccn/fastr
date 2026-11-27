@@ -5,14 +5,9 @@ import "core:strings"
 import "core:testing"
 
 import "../../tests/fixtures"
+import "../negentropy"
 import "../nostr"
 import "../pack"
-
-@(private = "file")
-nd_sync_cb :: proc(user: rawptr, ts: i64, id: [32]u8) {
-	c := cast(^Collect_Ctx)user
-	append(&c.ids, id)
-}
 
 @(private = "file")
 nd_visible :: proc(t: ^testing.T, s: ^Store, ev: ^pack.Event) {
@@ -24,10 +19,10 @@ nd_visible :: proc(t: ^testing.T, s: ^Store, ev: ^pack.Event) {
 	scan := f
 	scan.since = i64(0)
 	testing.expect_value(t, count_filters_at(s, {scan}, nil, nostr.unix_now()), u64(1))
-	c = collect_ctx_init()
-	err, _ := iter_negentropy(s, &f, nil, 100, &c, nd_sync_cb)
+	items := make([dynamic]negentropy.Item, context.temp_allocator)
+	err, _ := collect_negentropy(s, &f, nil, 100, &items)
 	testing.expect_value(t, err, Error.None)
-	testing.expect(t, ids_contain(c.ids[:], ev.id), "sync must retain marked target")
+	testing.expect(t, neg_contains(items[:], ev.id), "sync must retain marked target")
 	_, found := event_by_id(s, ev.id, context.temp_allocator)
 	testing.expect(t, found, "point lookup must retain marked target")
 }

@@ -823,23 +823,6 @@ neg_error_reason :: proc(err: negentropy.Error) -> string {
 }
 
 @(private)
-Neg_Fill_Ctx :: struct {
-	storage:    ^negentropy.Storage_Vector,
-	insert_err: negentropy.Error,
-}
-
-@(private)
-neg_fill :: proc(user: rawptr, ts: i64, id: [32]u8) {
-	ctx := cast(^Neg_Fill_Ctx)user
-	if ctx.insert_err != .None {
-		return
-	}
-	if err := negentropy.insert(ctx.storage, u64(ts), id); err != .None {
-		ctx.insert_err = err
-	}
-}
-
-@(private)
 handle_neg_open :: proc(cs: ^Conn_State, sub_id: string, filter: ^nostr.Filter, msg: []u8) {
 	cfg := &cs.relay.cfg
 
@@ -863,26 +846,17 @@ handle_neg_open :: proc(cs: ^Conn_State, sub_id: string, filter: ^nostr.Filter, 
 		session.storage = negentropy.storage_make()
 	}
 
-	fill := Neg_Fill_Ctx {
-		storage = &session.storage,
-	}
-	if err, reason := store.iter_negentropy(
+	if err, reason := store.collect_negentropy(
 		cs.relay.store,
 		filter,
 		access.principal.auth_pks,
 		cfg.max_neg_records,
-		&fill,
-		neg_fill,
+		&session.storage.items,
 		access,
 	); err != .None {
 		// #79: record-cap rejections carry "blocked:" and max_records.
 		max_records := cfg.max_neg_records if strings.has_prefix(reason, "blocked:") else -1
 		send_neg_err(cs, sub_id, reason, max_records)
-		neg_session_destroy(session)
-		return
-	}
-	if fill.insert_err != .None {
-		send_neg_err(cs, sub_id, neg_error_reason(fill.insert_err))
 		neg_session_destroy(session)
 		return
 	}
