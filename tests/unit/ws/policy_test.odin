@@ -107,15 +107,19 @@ test_write_policy :: proc(t: ^testing.T) {
 	err, _ = ingest_event(&r, {}, &ev)
 	testing.expect_value(t, err, store.Error.Duplicate)
 	testing.expect_value(t, spy.stored, 1)
-	// A stored id skips the signature check, never the id check.
-	err, _ = ingest_event(&r, {}, &bad)
-	testing.expect_value(t, err, store.Error.Duplicate)
+	// Only the stored id and signature together skip verification, and the
+	// id is still checked against the content. Neither forgery reaches policy.
+	writes := spy.writes[.Client]
+	why: string
+	err, why = ingest_event(&r, {}, &bad)
+	testing.expect_value(t, err, store.Error.Invalid_Event)
+	testing.expect_value(t, why, "invalid: bad signature")
 	forged := ev
 	forged.content = "forged"
-	forged_reason: string
-	err, forged_reason = ingest_event(&r, {}, &forged)
+	err, why = ingest_event(&r, {}, &forged)
 	testing.expect_value(t, err, store.Error.Invalid_Event)
-	testing.expect_value(t, forged_reason, "invalid: bad event id")
+	testing.expect_value(t, why, "invalid: bad event id")
+	testing.expect_value(t, spy.writes[.Client], writes)
 	testing.expect_value(t, store.event_count(st), 1)
 	for kind in ([3]u16{20_001, 5, 62}) {
 		next := fixtures.signed_event(1, kind, 1001)

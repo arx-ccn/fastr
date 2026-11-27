@@ -648,9 +648,9 @@ leading_zero_bits :: proc(id: ^[32]u8) -> int {
 	return bits
 }
 
-// Skip is only for an event whose id the store already holds: the id check
-// below proves the content is the content that was verified on arrival.
-// A caller that skips the signature must not store the event.
+// Skip is only for an event the store already holds under the same id and
+// signature: the id check below ties the content to that id, and the store
+// verified that signature over it.
 Signature_Check :: enum {
 	Verify,
 	Skip,

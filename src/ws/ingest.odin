@@ -52,10 +52,11 @@ ingest_event :: proc(
 			return .Rejected, pow_reject_reason(pow, cfg.min_pow_difficulty)
 		}
 	}
-	// A resubmitted event pays for a hash, not a signature check. The rules
-	// below still apply to it, so its reply does not change.
-	stored := store.store_has_id(relay.store, ev.id)
-	if reason, valid := nostr.validate_event(ev, .Skip if stored else .Verify); !valid {
+	// A resubmission with the id and signature of a stored event pays for a
+	// hash, not a signature check: the hash ties its content to that id, and
+	// the store verified that signature over it.
+	verified := store.store_has_signed(relay.store, &ev.id, &ev.sig)
+	if reason, valid := nostr.validate_event(ev, .Skip if verified else .Verify); !valid {
 		return .Invalid_Event, reason
 	}
 	marked, protection_reason := nostr.deletion_protection(ev)
@@ -76,14 +77,6 @@ ingest_event :: proc(
 		if d.reason != .Allow {
 			return .Rejected, policy.decision_reason(d)
 		}
-	}
-	if stored {
-		// Its signature was not checked, so it must not reach the store. The
-		// store would answer an already stored id the same way.
-		if expiry, has := nostr.event_expiry(ev); has && expiry <= nostr.unix_now() {
-			return .Invalid_Event, "invalid: " + store.REASON_EXPIRED
-		}
-		return .Duplicate, "duplicate: already have this event"
 	}
 
 	kind_class, d_hash := nostr.classify_kind(ev.kind, ev.tags)

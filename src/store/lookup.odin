@@ -4,15 +4,46 @@
 // (kind 30618), and PR events by id.
 package store
 
+import "core:encoding/endian"
 import "core:sync"
 
 import "../pack"
 
-// Whether the index holds an event with this id. Tombstoned and expired
-// entries count until compaction removes them.
-store_has_id :: proc(s: ^Store, id: [32]u8) -> bool {
-	sync.shared_guard(&s.known_ids_mu)
-	return id in s.known_ids
+// Whether the store holds this id under this exact signature, which it
+// verified when the event arrived. Tombstoned and expired events count until
+// compaction removes them.
+store_has_signed :: proc(s: ^Store, id: ^[32]u8, sig: ^[64]u8) -> bool {
+	maps: ^Query_Maps
+	idx, data: []u8
+	slot: int
+	{
+		sync.shared_guard(&s.known_ids_mu)
+		known, found := s.known_ids[id^]
+		if !found {
+			return false
+		}
+		slot = int(known.slot)
+		maps = s.query_maps
+		idx = query_map_slice(maps.index, &s.index)
+		data = query_map_slice(maps.data, &s.data)
+		sync.atomic_add(&maps.refs, 1)
+	}
+	defer query_maps_release(s, maps)
+
+	// The slot can be stale between a compaction swap and the known_ids
+	// rebuild. The blob's own id decides; a miss only costs the caller a
+	// signature check.
+	total := index_entry_count(idx)
+	if slot >= total {
+		return false
+	}
+	offset := endian.unchecked_get_u64le(idx[slot * INDEX_ENTRY_SIZE:])
+	start, end, ok := blob_bounds(idx, slot, total, len(data), offset)
+	if !ok || end - start < pack.FIXED_LEN {
+		return false
+	}
+	blob := data[start:end]
+	return string(blob[:32]) == string(id[:]) && string(blob[64:128]) == string(sig[:])
 }
 
 // Fetch the stored event with the given id. Excludes NIP-09 tombstoned and
