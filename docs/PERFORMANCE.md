@@ -29,8 +29,9 @@ The union still sorts newest first.
 For a full-ID lookup, the store binary-searches the offset-ordered tag file
 only when the candidate needs a tag or recipient check. It no longer builds
 a set of every event addressed to the signed-in keys before reading one DM.
-Broad inbox reads still build a recipient offset set before scanning. For
-both paths, a `#p` filter must match independently of the recipient check.
+In recipient-only mode, broad authenticated scans still build a recipient
+offset set when the filter can match kind 1059. A `#p` filter must match
+regardless of mode.
 COUNT and negentropy keep their own scans.
 
 A filter whose `authors` are all full 32-byte keys reads those authors'
@@ -39,13 +40,14 @@ extended on every append. Each posting carries the event's kind, so a `kinds`
 filter passes over other kinds without reading `index.o`, and `until` starts
 each run with a binary search. The query merges the runs through a heap and
 stops at `limit` or `since`. Tombstone, expiry, tag, protected-event, and
-read-policy checks run on each candidate as they do in the scan. A gift wrap
-found through its author still needs a `p` tag for an authenticated key.
+read-policy checks run on each candidate as they do in the scan. In
+recipient-only mode, a gift wrap found through its author still needs a `p`
+tag for an authenticated key.
 
 When the named authors hold more than one eighth of the index, the query
 scans as before. `POSTINGS_INDEX_SHARE` in `src/store/query.odin` records the
 measurement behind that cutoff. Exact-ID lookups and authenticated gift-wrap
-inbox reads keep their own paths and take precedence. A query also scans
+inbox reads in recipient-only mode take precedence. A query also scans
 while the postings do not match its snapshot of the index, which lasts from a
 compaction swap until the rebuild that follows it.
 
