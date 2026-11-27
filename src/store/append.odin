@@ -209,13 +209,19 @@ store_append :: proc(s: ^Store, ev: ^pack.Event) -> (err: Error, reason: string)
 	return append_classified(s, ev, class, d_hash)
 }
 
-// Append an event with a pre-computed kind class. `d_hash` is only
-// meaningful when class == .Addressable.
+Append_Trust :: enum {
+	Unchecked,
+	Verified,
+}
+
+// Append an event with a pre-computed kind class. `.Verified` certifies
+// that the caller checked both the canonical ID and its signature.
 append_classified :: proc(
 	s: ^Store,
 	ev: ^pack.Event,
 	class: nostr.Kind_Class,
 	d_hash: [32]u8,
+	trust := Append_Trust.Unchecked,
 ) -> (
 	err: Error,
 	reason: string,
@@ -236,6 +242,18 @@ append_classified :: proc(
 	expiry_ts, has_expiry := nostr.event_expiry(ev)
 	if has_expiry && expiry_ts <= nostr.unix_now() {
 		return .Invalid_Event, REASON_EXPIRED
+	}
+	if published_duplicate(s, ev, marked) {
+		// Direct store callers can supply events that do not fit BASED.
+		for tag in ev.tags {
+			if len(tag.fields) > 255 {
+				return .Pack_Invalid, ""
+			}
+		}
+		if u64(len(ev.content)) > 0xffff_ffff {
+			return .Pack_Invalid, ""
+		}
+		return .Duplicate, ""
 	}
 	expiry := expiry_ts if has_expiry else 0
 	flags: Posting_Flags
@@ -262,7 +280,8 @@ append_classified :: proc(
 		return .Rejected, "blocked: pubkey has vanished"
 	}
 
-	// Dedup: O(1) lookup against the full set of known event IDs.
+	// Recheck after taking the writer lock: another writer may have
+	// published this ID after the reader-side lookup missed it.
 	{
 		sync.shared_guard(&s.known_ids_mu)
 		if ev.id in s.known_ids {
@@ -519,11 +538,17 @@ append_classified :: proc(
 	{
 		sync.guard(&s.known_ids_mu)
 		slot := before_index / INDEX_ENTRY_SIZE
+		if slot == u64(max(u32)) + 1 {
+			sync.atomic_store(&s.duplicate_slots, u64(0))
+		}
 		pos := Event_Slot {
 			slot    = u32(slot),
 			tag_end = u32(w.tags.offset / TAG_ENTRY_SIZE),
 		}
-		s.known_ids[ev.id] = pos
+		s.known_ids[ev.id] = {
+			event    = pos,
+			verified = trust == .Verified,
+		}
 		if s.postings.entries == int(slot) &&
 		   s.postings.tag_bytes == int(before_tags) &&
 		   slot < u64(max(u32)) &&
@@ -571,8 +596,21 @@ append_classified :: proc(
 	if has_expiry {
 		mark_expiry_present(s, ev.kind, ev.pubkey)
 	}
+	slots := w.index.offset / INDEX_ENTRY_SIZE
+	sync.atomic_store(&s.duplicate_slots, slots if slots <= u64(max(u32)) + 1 else 0)
 
 	return .None, ""
+}
+
+// Only published map entries qualify. The writer rechecks all misses.
+@(private)
+published_duplicate :: proc(s: ^Store, ev: ^pack.Event, marked: bool) -> bool {
+	sync.shared_guard(&s.known_ids_mu)
+	known, found := s.known_ids[ev.id]
+	if !found || u64(known.slot) >= sync.atomic_load(&s.duplicate_slots) {
+		return false
+	}
+	return marked || !store_is_vanished(s, ev.pubkey)
 }
 
 // NIP-62: Vanish a pubkey - tombstone all their events, ban future events.

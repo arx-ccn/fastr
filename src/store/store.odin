@@ -72,18 +72,14 @@ Store :: struct {
 	authors_with_expiry:    Key_Set,
 	// Full dedup map: every event ID currently in the index -> its index
 	// slot. Appends insert (id, slot) before publishing the index length.
-	// Membership (the dedup use) is always exact; the slot value can be
-	// stale between a compaction swap and the phase-4 rebuild, so readers
-	// resolving ids through it must verify the entry id at the slot and
-	// fall back to a full scan on mismatch or out-of-range.
+	// Membership and slots can be stale between a compaction swap and the
+	// phase-4 rebuild. Readers resolving slots verify the entry ID before
+	// use. Reader-side dedup waits for current membership.
 	known_ids_mu:           sync.RW_Mutex,
-	known_ids:              map[[32]u8]Event_Slot,
+	known_ids:              map[[32]u8]Known_Event,
+	duplicate_slots:        u64, // atomic; set after counters, zero during a swap
 	// known_ids_mu also protects the postings and REQ snapshot publication.
 	postings:               Postings,
-	// First index slot appended since the store was opened or last compacted;
-	// under known_ids_mu. Earlier slots came from disk, where nothing vouches
-	// for their signatures.
-	session_slot:           int,
 	query_maps:             ^Query_Maps,
 	// Query early-exit: scan_ceiling[i] is the maximum created_at over index
 	// entries [0..=i] (monotone in i). Scanning newest-slot-first, once the
@@ -377,7 +373,7 @@ store_open :: proc(dir: string, allocator := context.allocator) -> (s: ^Store, e
 	s.author_counts = make(map[[32]u8]u64)
 	s.kinds_with_expiry = make(map[u16]struct{})
 	s.authors_with_expiry = make(Key_Set)
-	s.known_ids = make(map[[32]u8]Event_Slot)
+	s.known_ids = make(map[[32]u8]Known_Event)
 	s.mailbox_deleted = make(Key_Set)
 	s.scan_ceiling = make([dynamic]i64)
 	s.zones = make([dynamic]Time_Zone)

@@ -107,8 +107,11 @@ test_write_policy :: proc(t: ^testing.T) {
 	err, _ = ingest_event(&r, {}, &ev)
 	testing.expect_value(t, err, store.Error.Duplicate)
 	testing.expect_value(t, spy.stored, 1)
-	// Only the stored id and signature together skip verification, and the
-	// id is still checked against the content. Neither forgery reaches policy.
+	spy.reason = .Blocked
+	err, _ = ingest_event(&r, {}, &ev)
+	testing.expect_value(t, err, store.Error.Rejected)
+	spy.reason = .Allow
+	// Reusing the stored signature does not vouch for changed event fields.
 	writes := spy.writes[.Client]
 	why: string
 	err, why = ingest_event(&r, {}, &bad)
@@ -163,6 +166,13 @@ test_reopened_signature_checked :: proc(t: ^testing.T) {
 	fanout_init(&r.fanout)
 	defer fanout_destroy(&r.fanout)
 	err, reason := ingest_event(&r, {}, &unverified)
+	testing.expect_value(t, err, store.Error.Invalid_Event)
+	testing.expect_value(t, reason, "invalid: bad signature")
+	unchecked := fixtures.signed_event(1, 1, 1001)
+	unchecked.sig[0] ~= 1
+	aerr, _ := store.store_append(st, &unchecked)
+	testing.expect_value(t, aerr, store.Error.None)
+	err, reason = ingest_event(&r, {}, &unchecked)
 	testing.expect_value(t, err, store.Error.Invalid_Event)
 	testing.expect_value(t, reason, "invalid: bad signature")
 }

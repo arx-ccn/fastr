@@ -195,6 +195,57 @@ serialize_fast :: proc(ev: ^Event, buf: ^[dynamic]u8) -> Error {
 	return serialize_inner(ev, buf, false)
 }
 
+// Compare the event to a record from serialize_fast without decoding strings.
+matches_fast_record :: proc(dp: []u8, ev: ^Event) -> bool {
+	if len(dp) < FIXED_LEN ||
+	   string(dp[:32]) != string(ev.id[:]) ||
+	   string(dp[32:64]) != string(ev.pubkey[:]) ||
+	   string(dp[64:128]) != string(ev.sig[:]) ||
+	   i64(endian.unchecked_get_u64le(dp[128:])) != ev.created_at ||
+	   endian.unchecked_get_u16le(dp[136:]) != ev.kind {
+		return false
+	}
+	dp := dp[FIXED_LEN:]
+	tag_bytes, prefix, err := varint_decode(dp)
+	if err != .None || tag_bytes > u64(len(dp) - prefix) {
+		return false
+	}
+	tag_end := prefix + int(tag_bytes)
+	tags := dp[prefix:tag_end]
+	count, width, count_err := varint_decode(tags)
+	if count_err != .None || count != u64(len(ev.tags)) {
+		return false
+	}
+	tags = tags[width:]
+	for tag in ev.tags {
+		if len(tags) == 0 || int(tags[0]) != len(tag.fields) {
+			return false
+		}
+		tags = tags[1:]
+		for text in tag.fields {
+			if !match_raw_field(&tags, text) {
+				return false
+			}
+		}
+	}
+	content := dp[tag_end:]
+	return len(tags) == 0 && match_raw_field(&content, ev.content) && len(content) == 0
+}
+
+@(private)
+match_raw_field :: proc(dp: ^[]u8, text: string) -> bool {
+	n, hexed, width, err := read_len_flag(dp^)
+	if err != .None ||
+	   hexed ||
+	   n != len(text) ||
+	   n > len(dp^) - width ||
+	   string(dp^[width:width + n]) != text {
+		return false
+	}
+	dp^ = dp^[width + n:]
+	return true
+}
+
 // Deserialize a BASED blob. Events are verified at ingest time, so
 // deserialization is always trusted (no signature re-verification).
 deserialize_trusted :: proc(buf: []u8, allocator := context.allocator) -> (ev: Event, err: Error) {

@@ -54,6 +54,12 @@ Event_Slot :: struct {
 	tag_end: u32, // One past this event's last record in tags.s.
 }
 
+@(private)
+Known_Event :: struct {
+	using event: Event_Slot,
+	verified:    bool, // only a validated append in this process sets it
+}
+
 // One event in a posting run. The kind lets a cursor pass over postings that
 // a kinds filter rejects without reading index.o.
 @(private)
@@ -97,6 +103,7 @@ Posting_List :: struct {
 Postings :: struct {
 	by_author:    map[[32]u8]Posting_List, // every event, by pubkey
 	by_recipient: map[[32]u8]Posting_List, // gift wraps, by each p tag
+	by_kind:      map[u16]Posting_List,
 	by_tag:       Tag_Chains, // every tags.s record, by name and value
 	entries:      int, // -1 until rebuilt after a compaction swap, or out of u32 range.
 	tag_bytes:    int,
@@ -113,14 +120,19 @@ posting_release :: proc(run: ^Posting_Run) {
 
 @(private)
 postings_destroy :: proc(m: ^Postings) {
-	for lists in ([2]map[[32]u8]Posting_List{m.by_author, m.by_recipient}) {
-		for _, list in lists {
-			for run in list.runs do posting_release(run)
-			delete(list.runs)
-		}
-		delete(lists)
-	}
+	posting_lists_destroy(m.by_author)
+	posting_lists_destroy(m.by_recipient)
+	posting_lists_destroy(m.by_kind)
 	tag_chains_destroy(&m.by_tag)
+}
+
+@(private)
+posting_lists_destroy :: proc(lists: map[$K]Posting_List) {
+	for _, list in lists {
+		for run in list.runs do posting_release(run)
+		delete(list.runs)
+	}
+	delete(lists)
 }
 
 // Marks a tag record with no earlier record under its key.
@@ -283,7 +295,7 @@ posting_newer :: proc(a, b: Posting, data: rawptr) -> bool {
 // posting about one move per doubling of its list; a query can retain the old
 // runs across publication.
 @(private)
-posting_add :: proc(lists: ^map[[32]u8]Posting_List, key: [32]u8, posting: Posting, idx: rawptr) {
+posting_add :: proc(lists: ^map[$K]Posting_List, key: K, posting: Posting, idx: rawptr) {
 	list, ok := &lists[key]
 	if !ok {
 		lists[key] = {
@@ -320,10 +332,9 @@ posting_add :: proc(lists: ^map[[32]u8]Posting_List, key: [32]u8, posting: Posti
 		count += len(list.runs[n].slots)
 	}
 	run := new(Posting_Run)
-	run^ = {
-		slots = make([dynamic]Posting, count, count),
-		refs  = 1,
-	}
+	run.refs = 1
+	run.slots.allocator = context.allocator
+	non_zero_resize(&run.slots, count)
 
 	// The merged postings fill the tail of the new run, from `merged` on. Each
 	// older run merges into the gap in front of them; the write position
@@ -351,7 +362,7 @@ posting_add :: proc(lists: ^map[[32]u8]Posting_List, key: [32]u8, posting: Posti
 	append(&list.runs, run)
 }
 
-// Index the author and the tag records ending at `event.tag_end`.
+// Index the author, kind, and tag records ending at `event.tag_end`.
 @(private)
 postings_add :: proc(
 	m: ^Postings,
@@ -366,6 +377,7 @@ postings_add :: proc(
 		kind  = kind,
 	}
 	posting_add(&m.by_author, pubkey, posting, idx)
+	posting_add(&m.by_kind, kind, posting, idx)
 	first := event.tag_end - u32(len(tags) / TAG_ENTRY_SIZE)
 	for pos := 0; pos < len(tags); pos += TAG_ENTRY_SIZE {
 		tag := tags[pos:pos + TAG_ENTRY_SIZE]
@@ -478,13 +490,18 @@ mailbox_mark_slot :: proc(s: ^Store, idx, tags, data: []u8, slot: int, entry: ^I
 // stored in time order already sorted.
 @(private)
 postings_sort :: proc(m: ^Postings, idx: rawptr) {
-	for lists in ([2]map[[32]u8]Posting_List{m.by_author, m.by_recipient}) {
-		for _, list in lists {
-			shrink(&list.runs[0].slots)
-			slots := list.runs[0].slots[:]
-			slice.reverse(slots)
-			slice.sort_by_with_data(slots, posting_newer, idx)
-		}
+	posting_lists_sort(m.by_author, idx)
+	posting_lists_sort(m.by_recipient, idx)
+	posting_lists_sort(m.by_kind, idx)
+}
+
+@(private)
+posting_lists_sort :: proc(lists: map[$K]Posting_List, idx: rawptr) {
+	for _, list in lists {
+		shrink(&list.runs[0].slots)
+		slots := list.runs[0].slots[:]
+		slice.reverse(slots)
+		slice.sort_by_with_data(slots, posting_newer, idx)
 	}
 }
 

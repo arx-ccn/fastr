@@ -2,6 +2,7 @@ package nostr
 
 import "core:fmt"
 import "core:mem"
+import "core:simd"
 import "core:strings"
 import "core:unicode/utf16"
 import "core:unicode/utf8"
@@ -76,7 +77,21 @@ read_event_text :: proc(s: ^string) -> (Event_Text, bool) {
 	text := s^
 	if len(text) == 0 || text[0] != '"' {return {}, false}
 	saved := 0
-	for i := 1; i < len(text); {
+	i := 1
+	when simd.HAS_HARDWARE_SIMD {
+		for ; len(text) - i >= 16; i += 16 {
+			v := simd.from_array((^[16]u8)(&raw_data(text)[i])^)
+			stop :=
+				v |
+				simd.lanes_lt(v, simd.u8x16(' ')) |
+				simd.lanes_eq(v, simd.u8x16('"')) |
+				simd.lanes_eq(v, simd.u8x16('\\'))
+			if simd.extract_msbs(stop) != {} {
+				break
+			}
+		}
+	}
+	for i < len(text) {
 		c := text[i]
 		switch {
 		case c == '"':

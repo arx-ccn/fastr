@@ -76,9 +76,14 @@ inbox reads in recipient-only mode take precedence. A query also scans
 while the postings do not match its snapshot of the index, which lasts from a
 compaction swap until the rebuild that follows it.
 
-A posting is 12 bytes. Every event has one under its author, and a gift wrap
-has one more under each recipient. The maps, lists, and runs that hold them
-come on top.
+When neither author postings nor a tag chain is selected, a `kinds` filter
+merges its kind runs. It seeks to `until` and stops at `since` or `limit`
+without building a result heap. A gift-wrap query with one `#p` and no other
+tag or author constraint can read the recipient's runs in either read mode.
+
+A posting is 12 bytes. Each event has one under its author and one under its
+kind. A gift wrap has another under each recipient. The maps and runs add
+to that cost.
 
 A filter with a tag reads tag chains. Every `tags.s` record links to the
 previous record with the same name and value, and a hash table holds the
@@ -138,7 +143,7 @@ network throughput, or power-loss durability.
 ## Ingest and replies
 
 Client `EVENT` and `AUTH` messages, relay `EVENT` messages, bare JSONL
-events and HTTP auth events use the same field decoder. It reads the
+events and HTTP auth events use the same native field decoder. It reads the
 seven event fields without building a JSON object tree. Tag strings and
 content belong to the caller's allocator; the input buffer can be reused.
 The event decoder checks unknown fields and trailing envelope elements. The
@@ -151,15 +156,13 @@ filter fields. The relay copies returned strings into its own allocator.
 Frames above 16 KiB, NIP-50 search, extension fields, and inputs the fast
 path rejects use the original JSON decoder and error replies.
 
-Before it checks a signature, `ingest_event` asks the store whether an event
-with the same ID and the same signature was appended since the store was
-opened or last compacted. Ingest verifies every event it appends, so such a
-signature has already been checked, and ingest skips only the signature
-check. It still checks the timestamp bounds and the ID hash, and the hash
-ties the submitted content to that ID. The event then takes the usual path
-through policy and the store, so every reply is unchanged. An event that was
-on disk at startup, or that arrives with a different signature, is verified
-in full.
+`ingest_event` skips hashing and signature verification only when every field
+matches a record that this process validated and appended. It still checks
+the timestamp bounds and write policy. Records rebuilt from disk do not
+carry this proof. After expiry checks, the store answers a duplicate from
+the published ID map without serializing the event or taking the writer
+mutex. The writer rechecks misses before appending, so concurrent submissions
+of a new ID can publish only one record.
 
 `secp256k1.verify` keeps parsed x-only keys in a per-thread table of 256
 entries, indexed by the first key byte. Parsing a key costs a field square

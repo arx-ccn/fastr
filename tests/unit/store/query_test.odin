@@ -42,6 +42,44 @@ test_query_kinds_filter :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_kind_query_seeks_and_merges :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	events := [5]pack.Event {
+		test_make_event(1, 1, 60, nil),
+		test_make_event(1, 7, 20, nil),
+		test_make_event(1, 1, 20, nil),
+		test_make_event(1, 7, 40, nil),
+		test_make_event(1, 2, 30, nil),
+	}
+	for &ev in events {test_append_ok(t, s, &ev)}
+	kinds := make([dynamic]u16, context.temp_allocator)
+	append(&kinds, 1, 7, 1, 999)
+	f := nostr.Filter {
+		kinds = kinds,
+		since = 20,
+		until = 45,
+		limit = 3,
+	}
+	for phase in 0 ..< 2 {
+		if phase == 1 {
+			_, err := store_compact(s)
+			testing.expect_value(t, err, Error.None)
+		}
+		c := test_query_collect(t, s, &f)
+		testing.expect_value(t, len(c.ids), 3)
+		if len(c.ids) != 3 {return}
+		testing.expect_value(t, c.ids[0], events[3].id)
+		a, b := events[1].id, events[2].id
+		if id_less(b, a) {a, b = b, a}
+		testing.expect_value(t, c.ids[1], a)
+		testing.expect_value(t, c.ids[2], b)
+	}
+}
+
+@(test)
 test_query_limit :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
@@ -352,7 +390,9 @@ test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
 	defer test_rm_dir(dir)
 	s := test_open(t, dir)
 	defer store_close(s)
-	keys := [2][32]u8{test_pubkey(1), test_pubkey(7)}
+	raw_p := "0123456789abcdefghijklmnopqrstuv"
+	keys := [2][32]u8{{}, test_pubkey(7)}
+	copy(keys[0][:], transmute([]u8)raw_p)
 	p := test_hex(keys[0][:])
 	tag := test_tag("p", p)
 	other_tag := test_tag("p", test_hex(keys[1][:]))
@@ -362,7 +402,8 @@ test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
 	test_append_ok(t, s, &other)
 	removed := test_make_event(2, wrap, 40, test_tags(tag, other_tag))
 	older := test_make_event(3, wrap, 20, test_tags(tag, other_tag, tag, test_tag("t", "topic")))
-	tied := test_make_event(4, wrap, 20, test_tags(tag))
+	// REQ matches the indexed bytes, including the raw spelling.
+	tied := test_make_event(4, wrap, 20, test_tags(test_tag("p", raw_p)))
 	protected := test_make_event(5, wrap, 50, test_tags(tag, test_tag("-")))
 	backdated := test_make_event(8, wrap, 10, test_tags(tag, other_tag))
 	for ev in ([]^pack.Event{&removed, &older, &tied, &protected, &backdated}) {
@@ -382,6 +423,13 @@ test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
 		Error.None,
 	)
 	testing.expect(t, slice.equal(selected.ids[:], [][32]u8{older.id}))
+	public := policy.Read_Access {
+		gift_wrap_read = .Public,
+	}
+	testing.expect(
+		t,
+		slice.equal(test_query_ids(t, s, &compound, nil, public), [][32]u8{older.id}),
+	)
 	expected := [3][32]u8{{}, older.id, tied.id}
 	slice.sort_by(expected[1:], test_id_less)
 	f := test_tag_filter('p', p)
@@ -414,6 +462,15 @@ test_wrap_mailbox_reopen_compact_and_append :: proc(t: ^testing.T) {
 			"phase %d: got %v, want %v",
 			phase,
 			c.ids,
+			want,
+		)
+		got := test_query_ids(t, s, &f, nil, public)
+		testing.expectf(
+			t,
+			slice.equal(got, want),
+			"public phase %d: got %v, want %v",
+			phase,
+			got,
 			want,
 		)
 	}
@@ -1849,12 +1906,25 @@ test_query_ids_fast_path_exact :: proc(t: ^testing.T) {
 	// A stale slot must retain the ID check on the fallback scan.
 	saved := s.known_ids[want_old]
 	s.known_ids[want_old] = {
-		slot = 101,
+		event = {slot = 101},
 	}
 	stale := test_query_collect(t, s, &f)
 	testing.expect_value(t, len(stale.ids), 2)
 	testing.expect_value(t, stale.ids[0], want_new)
 	testing.expect_value(t, stale.ids[1], want_old)
+
+	// An exact miss is conclusive only for a complete lookup map.
+	delete_key(&s.known_ids, want_old)
+	wanted := make([dynamic]nostr.Hex_Prefix, context.temp_allocator)
+	append(&wanted, nostr.Hex_Prefix{bytes = want_old, length = 32})
+	missing := nostr.Filter {
+		ids = wanted,
+	}
+	slots := sync.atomic_load(&s.duplicate_slots)
+	sync.atomic_store(&s.duplicate_slots, u64(0))
+	fallback := test_query_collect(t, s, &missing)
+	testing.expect(t, slice.equal(fallback.ids[:], [][32]u8{want_old}))
+	sync.atomic_store(&s.duplicate_slots, slots)
 	s.known_ids[want_old] = saved
 
 	// Other gates still apply on the fast path: kind mismatch yields nothing.

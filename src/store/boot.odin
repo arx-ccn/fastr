@@ -28,6 +28,12 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 	idx := idx_g.data
 	dtags_buf := dtags_g.data
 	total := index_entry_count(idx)
+	// Registered before the guards below so reads of the acknowledged slot
+	// see the rebuilt counters after those guards release.
+	defer sync.atomic_store(
+		&s.duplicate_slots,
+		u64(total) if u64(total) <= u64(max(u32)) + 1 else 0,
+	)
 	now := nostr.unix_now()
 	scratch: mem.Dynamic_Arena
 	mem.dynamic_arena_init(&scratch)
@@ -46,7 +52,6 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 		reserve(&s.scan_ceiling, total)
 		clear(&s.zones)
 		s.ceiling_layout = s.layout
-		s.session_slot = total
 		postings_destroy(&s.postings)
 		tags := tags_g.data
 		s.postings = {
@@ -58,6 +63,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 			s.postings = {
 				by_author    = make(map[[32]u8]Posting_List),
 				by_recipient = make(map[[32]u8]Posting_List),
+				by_kind      = make(map[u16]Posting_List),
 				by_tag       = tag_chains_make(len(tags) / TAG_ENTRY_SIZE),
 				entries      = total,
 				tag_bytes    = len(tags),
@@ -103,8 +109,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 				}
 			}
 			s.known_ids[e.id] = {
-				slot    = u32(i),
-				tag_end = u32(tag_pos / TAG_ENTRY_SIZE),
+				event = {slot = u32(i), tag_end = u32(tag_pos / TAG_ENTRY_SIZE)},
 			}
 		}
 		postings_sort(&s.postings, raw_data(idx))

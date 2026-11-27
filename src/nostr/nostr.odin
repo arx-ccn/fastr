@@ -558,18 +558,17 @@ leading_zero_bits :: proc(id: ^[32]u8) -> int {
 	return bits
 }
 
-// Skip is only for an event whose id and signature this process has already
-// verified together: the id check below ties the content to that id.
-Signature_Check :: enum {
+// An exact replay must match all the fields of a previously validated event.
+Event_Validation :: enum {
 	Verify,
-	Skip,
+	Verified_Replay,
 }
 
 // NIP-01 validation: timestamp window, canonical id, and signature.
 // Returns ok, or a reason string suitable for ["OK", id, false, reason].
 validate_event :: proc(
 	ev: ^pack.Event,
-	signature := Signature_Check.Verify,
+	validation := Event_Validation.Verify,
 ) -> (
 	reason: string,
 	ok: bool,
@@ -581,10 +580,13 @@ validate_event :: proc(
 	if ev.created_at > now + CREATED_AT_WINDOW {
 		return "invalid: created_at too far in the future", false
 	}
+	if validation == .Verified_Replay {
+		return "", true
+	}
 	if event_id_hash(ev) != ev.id {
 		return "invalid: bad event id", false
 	}
-	if signature == .Verify && !secp.verify(&ev.sig, &ev.id, &ev.pubkey) {
+	if !secp.verify(&ev.sig, &ev.id, &ev.pubkey) {
 		return "invalid: bad signature", false
 	}
 	return "", true

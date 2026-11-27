@@ -10,18 +10,16 @@ import "core:sync"
 import "../nostr"
 import "../pack"
 
-// Whether an event with this id and this exact signature was appended since
-// the store was opened or last compacted. A caller that verifies everything
-// it appends can take that as proof the signature was checked. Events read
-// from disk never qualify: older data may carry signatures nobody checked.
-store_appended_signed :: proc(s: ^Store, id: ^[32]u8, sig: ^[64]u8) -> bool {
+// A replay must match every field of an event verified and appended in
+// this process. Never derive trust from a record rebuilt from disk.
+store_matches_verified :: proc(s: ^Store, ev: ^pack.Event) -> bool {
 	maps: ^Query_Maps
 	idx, data: []u8
 	slot: int
 	{
 		sync.shared_guard(&s.known_ids_mu)
-		known, found := s.known_ids[id^]
-		if !found || int(known.slot) < s.session_slot {
+		known, found := s.known_ids[ev.id]
+		if !found || !known.verified || u64(known.slot) >= sync.atomic_load(&s.duplicate_slots) {
 			return false
 		}
 		slot = int(known.slot)
@@ -32,22 +30,16 @@ store_appended_signed :: proc(s: ^Store, id: ^[32]u8, sig: ^[64]u8) -> bool {
 	}
 	defer query_maps_release(s, maps)
 
-	// The slot can be stale between a compaction swap and the known_ids
-	// rebuild. Compaction only moves events to lower slots, so whatever sits
-	// at this slot was still appended this session, and the blob's own id
-	// decides whether it is the event asked about. A miss only costs the
-	// caller a signature check.
 	total := index_entry_count(idx)
 	if slot >= total {
 		return false
 	}
 	offset := endian.unchecked_get_u64le(idx[slot * INDEX_ENTRY_SIZE:])
 	start, end, ok := blob_bounds(idx, slot, total, len(data), offset)
-	if !ok || end - start < pack.FIXED_LEN {
+	if !ok {
 		return false
 	}
-	blob := data[start:end]
-	return string(blob[:32]) == string(id[:]) && string(blob[64:128]) == string(sig[:])
+	return pack.matches_fast_record(data[start:end], ev)
 }
 
 // Fetch the stored event with the given id. Excludes NIP-09 tombstoned and

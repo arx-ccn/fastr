@@ -276,9 +276,17 @@ POSTINGS_INDEX_SHARE :: 8
 // Pin each run of `list` behind a cursor. Caller holds known_ids_mu.
 @(private)
 cursors_pin :: proc(cursors: ^[dynamic]Posting_Cursor, list: Posting_List) {
-	for run in list.runs {
+	start := len(cursors)
+	end := start + len(list.runs)
+	if end > cap(cursors) {
+		non_zero_reserve(cursors, max(end, 2 * cap(cursors)))
+	}
+	non_zero_resize(cursors, end)
+	for run, i in list.runs {
 		sync.atomic_add(&run.refs, 1)
-		append(cursors, Posting_Cursor{run = run})
+		cursors^[start + i] = {
+			run = run,
+		}
 	}
 }
 
@@ -543,29 +551,47 @@ query_authed :: proc(
 	fkinds, has_kinds := filter.kinds.?
 	fids, has_ids := filter.ids.?
 	fauthors, has_authors := filter.authors.?
-	require_recipient := access.gift_wrap_read == .Recipient
-	inbox :=
-		require_recipient && has_kinds && len(fkinds) == 1 && fkinds[0] == nostr.KIND_GIFT_WRAP
-	if inbox && len(auth_pks) == 0 {
+	if (has_kinds && len(fkinds) == 0) ||
+	   (has_ids && len(fids) == 0) ||
+	   (has_authors && len(fauthors) == 0) {
 		return .None
 	}
-	use_ids := has_ids && len(fids) > 0
-	for fid in fids {
+	require_recipient := access.gift_wrap_read == .Recipient
+	inbox := has_kinds && len(fkinds) == 1 && fkinds[0] == nostr.KIND_GIFT_WRAP
+	if inbox && require_recipient && len(auth_pks) == 0 {
+		return .None
+	}
+	use_ids := has_ids
+	for &fid in fids {
 		if fid.length != 32 {
 			use_ids = false
 			break
 		}
 	}
-	full_authors := has_authors && len(fauthors) > 0
-	for author in fauthors {
-		if author.length != 32 {
-			full_authors = false
-			break
+	exact_ids := use_ids
+	full_authors := has_authors && !exact_ids
+	if full_authors {
+		for &author in fauthors {
+			if author.length != 32 {
+				full_authors = false
+				break
+			}
 		}
 	}
-	// Tag records follow increasing data offsets, including after compaction.
-	// Ordered reads reset the cursor from each candidate's stored tag_end.
-	specs := build_tag_specs(filter)
+	specs: []Tag_Spec
+	mailbox_spec := -1
+	if !exact_ids {
+		specs = build_tag_specs(filter)
+		if inbox && !has_authors && len(specs) == 1 {
+			spec := specs[0]
+			if spec.name == 'p' &&
+			   len(spec.values) == 1 &&
+			   spec.values[0].length == 32 &&
+			   (!require_recipient || pk_in(auth_pks, spec.values[0].bytes)) {
+				mailbox_spec = 0
+			}
+		}
+	}
 	newest, bounded := filter.until.?
 
 	// Pin the mappings, posting runs and tag links under the publication
@@ -574,66 +600,93 @@ query_authed :: proc(
 	idx, data, tags_buf: []u8
 	local_id: [1]Event_Slot
 	cand: []Event_Slot
-	cursors := make([dynamic]Posting_Cursor, context.temp_allocator)
+	cursors: [dynamic]Posting_Cursor
 	posting_steps := 0
 	tag_heads: []u32
 	tag_steps := 0
 	links: ^Tag_Links
-	use_mailbox, use_authors, use_tags: bool
+	use_mailbox, use_authors, use_tags, use_kinds: bool
 	indexed_tags: bool
 	total: int
 	layout: u64
 	{
 		sync.shared_guard(&s.known_ids_mu)
 		maps = s.query_maps
-		layout = s.layout
-		idx = query_map_slice(maps.index, &s.index)
-		total = index_entry_count(idx)
+		// Compaction can publish new files before rebuilding known_ids.
+		use_ids = use_ids && sync.atomic_load(&s.duplicate_slots) != 0
 		if use_ids {
 			cand = local_id[:]
-			if len(fids) > len(cand) do cand = make([]Event_Slot, len(fids), context.temp_allocator)
 			n := 0
-			for fid in fids {
-				slot, ok := s.known_ids[fid.bytes]
+			for &fid in fids {
+				known, ok := s.known_ids[fid.bytes]
 				if !ok {
 					continue
 				}
-				i := int(slot.slot)
-				// Compaction may have swapped the mappings but not rebuilt known_ids.
+				if n == 0 {
+					idx = query_map_slice(maps.index, &s.index)
+					total = index_entry_count(idx)
+				}
+				i := int(known.slot)
 				if i >= total || (cast(^[32]u8)&idx[i * INDEX_ENTRY_SIZE + 28])^ != fid.bytes {
 					use_ids = false
 					break
 				}
-				cand[n] = slot
+				if n == len(cand) {
+					cand = make([]Event_Slot, len(fids), context.temp_allocator)
+					cand[0] = local_id[0]
+				}
+				cand[n] = known.event
 				n += 1
 			}
 			cand = cand[:n]
 			if use_ids && n == 0 do return .None
 		}
+		if idx == nil {
+			idx = query_map_slice(maps.index, &s.index)
+			total = index_entry_count(idx)
+		}
+		if total == 0 do return .None
+		layout = s.layout
 		data = query_map_slice(maps.data, &s.data)
 		tags_buf = query_map_slice(maps.tags, &s.tags)
 		indexed_tags = total == s.postings.entries && len(tags_buf) == s.postings.tag_bytes
-		if !use_ids && inbox && indexed_tags {
+		if !exact_ids && indexed_tags && (mailbox_spec >= 0 || (inbox && require_recipient)) {
 			use_mailbox = true
-			for &pk in auth_pks {
-				list := s.postings.by_recipient[pk]
-				posting_steps += int(list.count)
+			cursors = make([dynamic]Posting_Cursor, context.temp_allocator)
+			if mailbox_spec >= 0 {
+				list := s.postings.by_recipient[specs[mailbox_spec].values[0].bytes]
+				posting_steps = int(list.count)
 				cursors_pin(&cursors, list)
+			} else {
+				for &pk in auth_pks {
+					list := s.postings.by_recipient[pk]
+					posting_steps += int(list.count)
+					cursors_pin(&cursors, list)
+				}
 			}
-		} else if !use_ids && indexed_tags {
+		} else if !exact_ids && indexed_tags {
 			// A repeated key names one list. Count it once, and pin nothing
 			// until a plan is chosen.
-			lists := make([dynamic]Posting_List, context.temp_allocator)
+			one: [1]Posting_List
+			lists: []Posting_List
 			if full_authors {
-				named := make(Key_Set, context.temp_allocator)
-				for author in fauthors {
-					list, held := s.postings.by_author[author.bytes]
-					if !held || author.bytes in named {
-						continue
+				if len(fauthors) == 1 {
+					one[0] = s.postings.by_author[fauthors[0].bytes]
+					lists = one[:]
+					posting_steps = int(one[0].count)
+				} else {
+					named := make(Key_Set, context.temp_allocator)
+					found := make([dynamic]Posting_List, context.temp_allocator)
+					for &author in fauthors {
+						list, held := s.postings.by_author[author.bytes]
+						if !held || author.bytes in named {
+							continue
+						}
+						named[author.bytes] = {}
+						posting_steps += int(list.count)
+						append(&found, list)
 					}
-					named[author.bytes] = {}
-					posting_steps += int(list.count)
-					append(&lists, list)
+					lists = found[:]
 				}
 				use_authors = posting_steps * POSTINGS_INDEX_SHARE <= total
 			}
@@ -649,6 +702,7 @@ query_authed :: proc(
 				use_tags = !use_authors
 			}
 			if use_authors {
+				cursors = make([dynamic]Posting_Cursor, context.temp_allocator)
 				for list in lists {
 					cursors_pin(&cursors, list)
 				}
@@ -656,6 +710,39 @@ query_authed :: proc(
 			if use_tags {
 				links = s.postings.by_tag.links
 				sync.atomic_add(&links.refs, 1)
+			}
+			if !use_authors && !use_tags && has_kinds {
+				posting_steps = 0
+				local_kinds: [8]Posting_List = ---
+				kind_lists := slice.into_dynamic(local_kinds[:])
+				seen: map[u16]struct{}
+				if len(fkinds) > len(local_kinds) {
+					kind_lists = make([dynamic]Posting_List, context.temp_allocator)
+					seen.allocator = context.temp_allocator
+				}
+				for k, j in fkinds {
+					list, found := s.postings.by_kind[k]
+					if !found {continue}
+					if len(fkinds) <= len(local_kinds) {
+						if slice.contains(fkinds[:j], k) {continue}
+					} else {
+						if k in seen {continue}
+						seen[k] = {}
+					}
+					posting_steps += int(list.count)
+					append(&kind_lists, list)
+				}
+				use_kinds =
+					bounded ||
+					filter.since != nil ||
+					limit > 1 ||
+					posting_steps * POSTINGS_INDEX_SHARE <= total
+				if use_kinds {
+					cursors.allocator = context.temp_allocator
+					for list in kind_lists {
+						cursors_pin(&cursors, list)
+					}
+				}
 			}
 		}
 		sync.atomic_add(&maps.refs, 1)
@@ -665,6 +752,7 @@ query_authed :: proc(
 	defer if links != nil {
 		tag_links_release(links)
 	}
+	if exact_ids do specs = build_tag_specs(filter)
 
 	// Seek each pinned run to `until`. What the runs hold from there on is
 	// all that the postings can return.
@@ -686,13 +774,13 @@ query_authed :: proc(
 		use_authors = use_authors && !use_tags
 	}
 	steps := total
-	use_postings := use_mailbox || use_authors
+	use_postings := use_mailbox || use_authors || use_kinds
 	use_slots := use_ids || use_postings || use_tags
 	ordered := use_postings || use_ids && indexed_tags
 	recipient_offsets: Offset_Set
 	defer delete(recipient_offsets)
 	heads: []Posting_Cursor
-	posting_kinds := fkinds[:] if has_kinds else nil
+	posting_kinds := fkinds[:] if has_kinds && !use_mailbox && !use_kinds else nil
 	// Records are in slot order, so the chains merge newest slot first.
 	chain: Chain_Walk
 	defer pq.destroy(&chain.records)
@@ -739,7 +827,10 @@ query_authed :: proc(
 		recipient_offsets = p_tag_offsets_union(tags_buf, auth_pks)
 	}
 
-	if use_mailbox {
+	if use_mailbox && mailbox_spec >= 0 {
+		specs[mailbox_spec] = specs[len(specs) - 1]
+		specs = specs[:len(specs) - 1]
+	} else if use_mailbox {
 		// Every posting matches one authenticated p tag. The query's p
 		// predicate is redundant only if it accepts every source mailbox.
 		for spec, j in specs {
@@ -819,16 +910,20 @@ query_authed :: proc(
 
 	// Hold the tombstone snapshot for the scan and emission.
 	sync.shared_guard(&s.tombstones_mu)
+	has_tombstones := len(s.tombstones.map_) != 0
 	prev_slot := -1
 	for ; si < steps; si += 1 {
 		i: int
+		posting_flags: Posting_Flags
 		if use_slots {
 			candidate: Event_Slot
 			if use_postings {
 				if len(heads) == 0 {
 					break
 				}
-				candidate = posting_next(&heads, posting_kinds, raw_data(idx)).event
+				posting := posting_next(&heads, posting_kinds, raw_data(idx))
+				candidate = posting.event
+				posting_flags = posting.flags
 			} else if use_tags {
 				found: bool
 				candidate, found = tag_chain_next(&chain)
@@ -892,7 +987,7 @@ query_authed :: proc(
 		// 1. Kinds filter — cheapest: 2-byte read, most selective for typical
 		//    queries. Byte layout: kind u16le at offset 24.
 		kind := endian.unchecked_get_u16le(base[24:26])
-		if has_kinds {
+		if has_kinds && !use_postings {
 			found := false
 			for k in fkinds {
 				if k == kind {
@@ -943,10 +1038,9 @@ query_authed :: proc(
 			continue
 		}
 
-		// 7. Mailbox slots and the fallback offsets were selected by auth key.
-		//    ID, author and tag slots still need that check, independently of
-		//    requested tags.
-		check_recipient := check_wrap && (use_ids || use_authors || use_tags)
+		// 7. Only mailbox slots and the scan's offset set have already checked
+		//    recipient membership. Other indexed plans check each gift wrap.
+		check_recipient := check_wrap && use_slots && !use_mailbox
 		if check_recipient || len(specs) > 0 {
 			if use_tags {
 				for tag_end * TAG_ENTRY_SIZE < len(tags_buf) &&
@@ -1008,8 +1102,10 @@ query_authed :: proc(
 
 		// 11. NIP-09: tombstone check — only entries that matched the filter
 		//     pay the map-key hash.
-		if v, ok := s.tombstones.map_[id^]; ok && v.confirmed {
-			continue
+		if has_tombstones {
+			if v, ok := s.tombstones.map_[id^]; ok && v.confirmed {
+				continue
+			}
 		}
 
 		// 12. Exact heap tiebreak (created_at == worst requires id comparison).
@@ -1039,17 +1135,21 @@ query_authed :: proc(
 			if has_search && !content_contains_all(dp, fsearch) {
 				continue
 			}
-			if !authed && pack.dp_has_protected_tag(dp) {
+			if !authed &&
+			   (.Protected in posting_flags ||
+					   (.Covered not_in posting_flags && pack.dp_has_protected_tag(dp))) {
 				continue
 			}
 			// ponytail: arbitrary predicates scan candidates; add index constraints
 			// if selective policies dominate query profiles.
-			visible, verr := policy.read_packed(access, dp)
-			if verr != .None {
-				return .Pack_Invalid
-			}
-			if !visible {
-				continue
+			if access.check != nil {
+				visible, verr := policy.read_packed(access, dp)
+				if verr != .None {
+					return .Pack_Invalid
+				}
+				if !visible {
+					continue
+				}
 			}
 			if steps == 1 {
 				return emit(user, dp)

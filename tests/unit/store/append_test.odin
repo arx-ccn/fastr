@@ -3,9 +3,13 @@ package store
 
 import "core:os"
 import "core:sync"
+import "core:sync/chan"
 import "core:testing"
+import "core:thread"
+import "core:time"
 
 import "../nostr"
+import "../pack"
 
 @(test)
 test_duplicate_rejected :: proc(t: ^testing.T) {
@@ -17,6 +21,73 @@ test_duplicate_rejected :: proc(t: ^testing.T) {
 	test_append_ok(t, s, &ev)
 	err, _ := store_append(s, &ev)
 	testing.expect_value(t, err, Error.Duplicate)
+}
+
+@(test)
+test_duplicate_bypasses_writer :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	ev := test_make_event(1, 1, 0, nil)
+	test_append_ok(t, s, &ev)
+	done, cerr := chan.create(chan.Chan(Error), 1, context.allocator)
+	assert(cerr == nil)
+	defer chan.destroy(done)
+	Job :: struct {
+		store: ^Store,
+		event: ^pack.Event,
+		done:  chan.Chan(Error),
+	}
+	job := Job{s, &ev, done}
+	sync.lock(&s.writer_mu)
+	worker := thread.create_and_start_with_poly_data(&job, proc(job: ^Job) {
+		err, _ := store_append(job.store, job.event)
+		_ = chan.send(job.done, err)
+	})
+	assert(worker != nil)
+	err, status := chan.recv_with_timeout(done, time.Second)
+	sync.unlock(&s.writer_mu)
+	thread.join(worker)
+	thread.destroy(worker)
+	if testing.expect(t, status == .Ok, "duplicate waited for the writer mutex") {
+		testing.expect_value(t, err, Error.Duplicate)
+	}
+	testing.expect_value(t, event_count(s), 1)
+}
+
+@(test)
+test_simultaneous_first_append :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	ev := test_make_event(1, 1, 0, nil)
+	Job :: struct {
+		store: ^Store,
+		event: ^pack.Event,
+		ready: ^sync.Barrier,
+		err:   Error,
+	}
+	ready: sync.Barrier
+	sync.barrier_init(&ready, 3)
+	jobs := [2]Job{{s, &ev, &ready, .None}, {s, &ev, &ready, .None}}
+	workers: [2]^thread.Thread
+	for &job, i in jobs {
+		workers[i] = thread.create_and_start_with_poly_data(&job, proc(job: ^Job) {
+			sync.barrier_wait(job.ready)
+			job.err, _ = store_append(job.store, job.event)
+		})
+		assert(workers[i] != nil)
+	}
+	sync.barrier_wait(&ready)
+	for worker in workers {
+		thread.join(worker)
+		thread.destroy(worker)
+	}
+	a, b := jobs[0].err, jobs[1].err
+	testing.expect(t, (a == .None && b == .Duplicate) || (b == .None && a == .Duplicate))
+	testing.expect_value(t, event_count(s), 1)
 }
 
 // NIP-40 expiry tests
@@ -167,7 +238,11 @@ test_nip09_preemptive_tombstone_rejected_on_mismatched_pubkey :: proc(t: ^testin
 	testing.expect(t, !store_is_tombstoned(s, target.id), "tombstone must be discarded")
 	{
 		sync.shared_guard(&s.tombstones_mu)
-		testing.expect(t, target.id not_in s.tombstones.map_, "mismatched tombstone removed entirely")
+		testing.expect(
+			t,
+			target.id not_in s.tombstones.map_,
+			"mismatched tombstone removed entirely",
+		)
 	}
 }
 
@@ -201,7 +276,11 @@ test_nip09_preemptive_multi_candidate_preserved :: proc(t: ^testing.T) {
 	// write and promoted to confirmed (#78).
 	err, _ := store_append(s, &future_target)
 	testing.expect_value(t, err, Error.Duplicate)
-	testing.expect(t, store_is_tombstoned(s, future_target.id), "confirmed when matching author arrives")
+	testing.expect(
+		t,
+		store_is_tombstoned(s, future_target.id),
+		"confirmed when matching author arrives",
+	)
 }
 
 @(test)
@@ -348,7 +427,12 @@ test_vanish_tombstones_gift_wraps_p_tagged_to_pubkey :: proc(t: ^testing.T) {
 
 	vanish_ev := test_make_event(1, nostr.KIND_VANISH, 3000, nil)
 	a_pk := vanish_ev.pubkey
-	gw_to_a := test_make_event(2, nostr.KIND_GIFT_WRAP, 1000, test_tags(test_tag("p", test_hex(a_pk[:]))))
+	gw_to_a := test_make_event(
+		2,
+		nostr.KIND_GIFT_WRAP,
+		1000,
+		test_tags(test_tag("p", test_hex(a_pk[:]))),
+	)
 	other_pk: [32]u8
 	for &b in other_pk {
 		b = 0x42
@@ -365,8 +449,16 @@ test_vanish_tombstones_gift_wraps_p_tagged_to_pubkey :: proc(t: ^testing.T) {
 	test_append_ok(t, s, &vanish_ev)
 	testing.expect_value(t, store_vanish(s, &vanish_ev), Error.None)
 
-	testing.expect(t, store_is_tombstoned(s, gw_to_a.id), "gift wrap p-tagged to vanisher tombstoned")
-	testing.expect(t, !store_is_tombstoned(s, gw_to_other.id), "unrelated gift wrap NOT tombstoned")
+	testing.expect(
+		t,
+		store_is_tombstoned(s, gw_to_a.id),
+		"gift wrap p-tagged to vanisher tombstoned",
+	)
+	testing.expect(
+		t,
+		!store_is_tombstoned(s, gw_to_other.id),
+		"unrelated gift wrap NOT tombstoned",
+	)
 }
 
 @(test)
@@ -383,7 +475,12 @@ test_preemptive_tombstone_cap_via_append :: proc(t: ^testing.T) {
 		for j in 0 ..< u64(8) {
 			id[j] = u8(u64(i) >> (j * 8))
 		}
-		k5 := test_make_event(1, 5, 1_700_000_000 + i64(i), test_tags(test_tag("e", test_hex(id[:]))))
+		k5 := test_make_event(
+			1,
+			5,
+			1_700_000_000 + i64(i),
+			test_tags(test_tag("e", test_hex(id[:]))),
+		)
 		test_append_ok(t, s, &k5)
 	}
 
@@ -549,7 +646,11 @@ test_24_replaceable_dedup_rolled_back_on_write_failure :: proc(t: ^testing.T) {
 
 	c2 := test_query_collect(t, s, &f)
 	testing.expect(t, ids_contain(c2.ids[:], yet_newer.id))
-	testing.expect(t, !ids_contain(c2.ids[:], old_id), "yet_newer must have tombstoned old normally")
+	testing.expect(
+		t,
+		!ids_contain(c2.ids[:], old_id),
+		"yet_newer must have tombstoned old normally",
+	)
 }
 
 @(test)

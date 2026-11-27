@@ -190,9 +190,8 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 		}
 	}
 
-	// From here on every append/dedup mutation is excluded: appenders take
-	// the writer mutex before reading the dedup maps, so holding it through
-	// the rename + swap + phase-4 rebuild closes the #64 race window.
+	// Hold the writer mutex through the swap and rebuild so no append can
+	// change the index or dedup maps (#64).
 	sync.guard(&s.writer_mu)
 	w := &s.writer
 
@@ -293,6 +292,7 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 	{
 		sync.guard(&s.known_ids_mu)
 		defer publish_query_maps(s)
+		sync.atomic_store(&s.duplicate_slots, u64(0))
 		// Old posting slot numbers cannot resolve against the new mappings.
 		s.postings.entries = -1
 		s.layout += 1

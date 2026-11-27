@@ -381,7 +381,8 @@ test_extract_sub_id_negative_cases :: proc(t: ^testing.T) {
 @(test)
 test_decoder_preserves_signature :: proc(t: ^testing.T) {
 	signed := make_golden_event()
-	signed.content = "𝄞\nquoted \"note\""
+	text_prefix :: "this ASCII prefix spans two full sixteen-byte vectors: "
+	signed.content = text_prefix + "𝄞\nquoted \"note\""
 	signed.tags = {{fields = {"t", "café"}}, {fields = {"x", "", "a\\b"}}}
 	signed.id = event_id_hash(&signed)
 	sk: [32]u8
@@ -389,8 +390,9 @@ test_decoder_preserves_signature :: proc(t: ^testing.T) {
 	signed.sig, _ = secp.test_sign(&sk, &signed.id)
 	// Key order, escaped key names and extensions do not change signed data.
 	obj := fmt.tprintf(
-		`{{"tags":[["t","caf\u00e9"],["x","","a\\b"]],"ext":{{"v":[false,null,1e1]}},"kind":1,"s\u0069g":"%s","created_at":1700000000,"content":"\uD834\uDD1E\nquoted \"note\"","id":"%s","pubkey":"%s"}}`,
+		`{{"tags":[["t","caf\u00e9"],["x","","a\\b"]],"ext":{{"v":[false,null,1e1]}},"kind":1,"s\u0069g":"%s","created_at":1700000000,"content":"%s\uD834\uDD1E\nquoted \"note\"","id":"%s","pubkey":"%s"}}`,
 		hex64(signed.sig),
+		text_prefix,
 		hex32(signed.id),
 		hex32(signed.pubkey),
 	)

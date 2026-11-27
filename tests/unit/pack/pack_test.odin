@@ -111,6 +111,28 @@ test_serialize_fast_round_trip :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_fast_record_replay :: proc(t: ^testing.T) {
+	ev := make_ev(-1, 65535, {{fields = {"p", HEX64}}, {fields = {""}}}, HEX64 + HEX64)
+	buf := make([dynamic]u8, context.temp_allocator)
+	testing.expect_value(t, serialize_fast(&ev, &buf), Error.None)
+	testing.expect(t, matches_fast_record(buf[:], &ev))
+	mutations := [7]Event{ev, ev, ev, ev, ev, ev, ev}
+	mutations[0].id[0] ~= 1
+	mutations[1].pubkey[0] ~= 1
+	mutations[2].sig[0] ~= 1
+	mutations[3].kind -= 1
+	mutations[4].created_at += 1
+	mutations[5].tags = {{fields = {"e", HEX64}}, {fields = {""}}}
+	mutations[6].content = HEX64
+	for &other in mutations {
+		testing.expect(t, !matches_fast_record(buf[:], &other))
+	}
+	for end in 0 ..< len(buf) {
+		testing.expect(t, !matches_fast_record(buf[:end], &ev))
+	}
+}
+
+@(test)
 test_hex_compressed_tag_field :: proc(t: ^testing.T) {
 	e := make_ev(0, 0, []Tag{{fields = []string{"e", HEX64}}}, "")
 	got := rt(t, &e)

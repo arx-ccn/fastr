@@ -44,7 +44,8 @@ ingest_event :: proc(
 	if len(ev.tags) > cfg.max_event_tags {
 		return .Invalid_Event, "invalid: too many tags"
 	}
-	if utf8.rune_count_in_string(ev.content) > relay_content_limit_for_kind(cfg, ev.kind) {
+	content_limit := relay_content_limit_for_kind(cfg, ev.kind)
+	if len(ev.content) > content_limit && utf8.rune_count_in_string(ev.content) > content_limit {
 		return .Invalid_Event, "invalid: content too long"
 	}
 	if cfg.min_pow_difficulty > 0 {
@@ -52,11 +53,8 @@ ingest_event :: proc(
 			return .Rejected, pow_reject_reason(pow, cfg.min_pow_difficulty)
 		}
 	}
-	// Every event this process appends passed the check below. A resubmission
-	// with the id and signature of one of them pays for a hash, not a
-	// signature check: the hash ties its content to that id.
-	verified := store.store_appended_signed(relay.store, &ev.id, &ev.sig)
-	if reason, valid := nostr.validate_event(ev, .Skip if verified else .Verify); !valid {
+	replay := store.store_matches_verified(relay.store, ev)
+	if reason, valid := nostr.validate_event(ev, .Verified_Replay if replay else .Verify); !valid {
 		return .Invalid_Event, reason
 	}
 	marked, protection_reason := nostr.deletion_protection(ev)
@@ -81,7 +79,9 @@ ingest_event :: proc(
 
 	kind_class, d_hash := nostr.classify_kind(ev.kind, ev.tags)
 	if kind_class != .Ephemeral {
-		err, reason := store.append_classified(relay.store, ev, kind_class, d_hash)
+		// A write hook receives the mutable event after validation.
+		trust: store.Append_Trust = .Verified if relay.hooks.check_write == nil else .Unchecked
+		err, reason := store.append_classified(relay.store, ev, kind_class, d_hash, trust)
 		switch err {
 		case .None:
 		case .Duplicate:
