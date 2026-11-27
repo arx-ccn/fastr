@@ -575,18 +575,272 @@ test_author_postings_match_scan :: proc(t: ^testing.T) {
 	}
 }
 
+// A filter on a tag value that few events carry reads that value's chain of
+// tag records. It must return what the index scan returns: same events,
+// same order, same visibility.
+@(test)
+test_tag_chains_match_scan :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	a, reader := test_pubkey(1), test_pubkey(9)
+	wrap :: nostr.KIND_GIFT_WRAP
+	rare := test_tag("t", "rare")
+	common := test_tag("t", "common")
+	referenced := test_hex(a[:]) // a 64-character hex value, stored as 32 bytes
+	reply := test_tag("e", referenced)
+	link := test_tag("r", "https://example.com/a/path/longer/than/thirty-two/bytes")
+
+	// Append refuses an expired event, so one is written the way an earlier
+	// run would have left it, after an event that keeps the common tag's
+	// first record below every rare one.
+	first := test_make_event(20, 1, 900, test_tags(common))
+	expired := test_make_event(1, 1, 1045, test_tags(rare, test_expiry_tag(1)))
+	nd_legacy(t, dir, first, expired)
+	s := test_open(t, dir)
+	defer store_close(s)
+
+	// Half the fillers carry the common tag, so a filter on it must scan.
+	// Each has a tag value of its own, so the chains outgrow their first
+	// bucket table and link array.
+	for i in 0 ..< 600 {
+		own := test_tag("x", fmt.tprintf("filler-%d", i))
+		tags := make([dynamic]pack.Tag, context.temp_allocator)
+		append(&tags, own, test_tag("y", "all"))
+		if i % 2 == 0 {
+			append(&tags, common)
+		}
+		if i % 15 == 0 {
+			append(&tags, test_tag("z", "some"))
+		}
+		filler := test_make_event(u8(20 + i % 4), 1, i64(1000 + i), tags[:])
+		test_append_ok(t, s, &filler)
+	}
+	old := test_make_event(1, 1, 1010, test_tags(rare, reply))
+	tied := [2]pack.Event {
+		test_make_event(1, 1, 1020, test_tags(rare, test_tag("x", "1"))),
+		test_make_event(2, 1, 1020, test_tags(test_tag("x", "2"), rare, rare)),
+	}
+	reaction := test_make_event(2, 7, 1030, test_tags(reply, link))
+	deleted := test_make_event(1, 1, 1040, test_tags(rare))
+	protected := test_make_event(1, 1, 1050, test_tags(test_tag("-"), rare))
+	to_reader := test_make_event(
+		3,
+		wrap,
+		1060,
+		test_tags(rare, test_tag("p", test_hex(reader[:]))),
+	)
+	to_other := test_make_event(3, wrap, 1061, test_tags(test_tag("p", referenced), rare))
+	linked := test_make_event(3, 1, 1070, test_tags(link, test_tag("t", "other")))
+	backdated := test_make_event(1, 1, 5, test_tags(rare, common))
+	deletion := test_kind5_event(1, deleted.id)
+	for ev in ([]^pack.Event{&old, &tied[0], &tied[1], &reaction, &deleted, &protected, &to_reader, &to_other, &linked, &deletion, &backdated}) {
+		test_append_ok(t, s, ev)
+	}
+
+	by_rare := test_tag_filter('t', "rare")
+	slice.sort_by(tied[:], proc(x, y: pack.Event) -> bool {return id_less(x.id, y.id)})
+	testing.expect(
+		t,
+		slice.equal(
+			test_query_ids(t, s, &by_rare, nil),
+			[][32]u8{tied[0].id, tied[1].id, old.id, backdated.id},
+		),
+		"newest first, lower id on a tie; deleted, protected, wrapped and expired events hidden",
+	)
+	newest_two := by_rare
+	newest_two.limit = 2
+	testing.expect(
+		t,
+		slice.equal(test_query_ids(t, s, &newest_two, nil), [][32]u8{tied[0].id, tied[1].id}),
+		"the limit keeps the newest events, not the last stored",
+	)
+	as_reader := test_query_ids(t, s, &by_rare, {reader})
+	testing.expect(t, ids_contain(as_reader, to_reader.id), "a recipient reads its gift wrap")
+	testing.expect(t, !ids_contain(as_reader, to_other.id), "not a wrap for someone else")
+	testing.expect(t, !ids_contain(as_reader, protected.id))
+	testing.expect(t, ids_contain(test_query_ids(t, s, &by_rare, {a}), protected.id))
+
+	filters := [?]nostr.Filter {
+		by_rare,
+		newest_two,
+		test_tag_filter('e', referenced),
+		test_tag_filter('r', "https://example.com/a/path/longer/than/thirty-two/bytes"),
+		test_tag_filter('t', "rare"),
+		test_tag_filter('t', "rare"),
+		test_tag_filter('t', "rare"),
+		test_tag_filter('t', "rare"),
+		test_tag_filter('t', "rare"),
+		test_tag_filter('t', "common"),
+		test_tag_filter('t', "absent"),
+		test_tag_filter('t', "rare"),
+		test_tag_filter('t', "rare"),
+		test_tag_filter('e', referenced),
+		test_tag_filter('t', "rare"),
+	}
+	either := make(nostr.Tag_Value_Set, context.temp_allocator)
+	either["rare"], either["other"] = {}, {}
+	filters[4].tags['t'] = either
+	filters[5].tags['e'] = test_tag_filter('e', referenced).tags['e'] // both tags
+	filters[6].kinds = test_kind_filter(wrap, 7).kinds
+	// Both bounds are inclusive and each falls on an event.
+	filters[7].since, filters[7].until = 1020, 1040
+	filters[8].authors = test_authors_filter(a).authors
+	filters[11].tags['t'] = either
+	filters[11].limit = 1
+	// This author has fewer events than the rare tag, so its postings answer.
+	by_author_3 := &filters[12]
+	by_author_3.authors = test_authors_filter(test_pubkey(3)).authors
+	// This tag names fewer events than the author has, so its chain answers.
+	by_reply_of_a := &filters[13]
+	by_reply_of_a.authors = test_authors_filter(a).authors
+	// The bound admits the last slot, which holds the oldest timestamp.
+	filters[14].until = 1500
+	paged := test_tag_filter('z', "some")
+	paged.until, paged.limit = 1300, 1
+
+	for phase in 0 ..< 4 {
+		switch phase {
+		case 1:
+			store_close(s)
+			s = test_open(t, dir)
+		case 2:
+			_, err := store_compact(s)
+			testing.expect_value(t, err, Error.None)
+		case 3:
+			// Each is newer than every event stored before it, so a query
+			// that reads the two chains out of slot order stops too early.
+			newer := test_make_event(1, 1, 1_800_000_000, test_tags(rare))
+			test_append_ok(t, s, &newer)
+			late := test_make_event(1, 1, 1_900_000_000, test_tags(test_tag("t", "other")))
+			test_append_ok(t, s, &late)
+		case:
+		}
+
+		// Every tag record is in exactly one chain, however the bucket table
+		// and the link array have grown.
+		chained := 0
+		for bucket in s.postings.by_tag.buckets {
+			chained += int(bucket.count)
+		}
+		testing.expect_value(t, chained, s.postings.tag_bytes / TAG_ENTRY_SIZE)
+
+		// Only a difference between the chains and tags.s shows which one
+		// answered. With the rare value's chain emptied, its filter finds
+		// nothing. With the common value's chain cut to one record, its
+		// filter, which must scan, still finds every event.
+		chains := &s.postings.by_tag
+		rare_bucket := tag_bucket(
+			chains.buckets,
+			tag_value_hash('t', build_tag_specs(&by_rare)[0].values[0]),
+		)
+		common_bucket := tag_bucket(
+			chains.buckets,
+			tag_value_hash('t', build_tag_specs(&filters[9])[0].values[0]),
+		)
+		testing.expect(t, rare_bucket.count >= 7 && common_bucket.count >= 302)
+		rare_count := rare_bucket.count
+		rare_bucket.count = 0
+		testing.expect_value(t, len(test_query_ids(t, s, &by_rare, nil)), 0)
+		testing.expect_value(t, len(test_query_ids(t, s, &filters[7], nil)), 0)
+		rare_bucket.count = rare_count
+		common_head := &chains.links.links[common_bucket.head]
+		common_prev := common_head.prev
+		common_head.prev = TAG_NONE
+		testing.expect(t, len(test_query_ids(t, s, &filters[9], nil)) >= 302)
+		common_head.prev = common_prev
+
+		// A chain passes every record above `until` before its first
+		// candidate. With forty records to pass for one event, the filter
+		// scans from the bound instead, and a cut chain does not hide it.
+		some_bucket := tag_bucket(
+			chains.buckets,
+			tag_value_hash('z', build_tag_specs(&paged)[0].values[0]),
+		)
+		some_head := &chains.links.links[some_bucket.head]
+		some_prev := some_head.prev
+		some_head.prev = TAG_NONE
+		testing.expect_value(t, len(test_query_ids(t, s, &paged, nil)), 1)
+		some_head.prev = some_prev
+
+		// A filter with full author keys and a tag reads whichever names
+		// fewer events. Cutting the rare chain to one record must not hide
+		// the wrap that the author's postings reach, and an author list
+		// without runs must not hide the event that the reply chain reaches.
+		rare_head := &chains.links.links[rare_bucket.head]
+		rare_prev := rare_head.prev
+		rare_head.prev = TAG_NONE
+		testing.expect(t, ids_contain(test_query_ids(t, s, by_author_3, {reader}), to_reader.id))
+		// Of two tags, the one that names fewer events answers too.
+		testing.expect(t, ids_contain(test_query_ids(t, s, &filters[5], nil), old.id))
+		rare_head.prev = rare_prev
+		a_list := s.postings.by_author[a]
+		s.postings.by_author[a] = Posting_List {
+			count = a_list.count,
+		}
+		testing.expect(t, ids_contain(test_query_ids(t, s, by_reply_of_a, nil), old.id))
+		s.postings.by_author[a] = a_list
+
+		// Two values with one hash share a chain. Joined to the common
+		// value's chain, the rare value's filter must still pass over the
+		// records that carry the other value.
+		oldest_rare := rare_bucket.head
+		for chains.links.links[oldest_rare].prev != TAG_NONE {
+			oldest_rare = chains.links.links[oldest_rare].prev
+		}
+		common_below := common_bucket.head
+		for common_below > oldest_rare {
+			common_below = chains.links.links[common_below].prev
+		}
+		shared := test_query_ids(t, s, &by_rare, nil)
+		chains.links.links[oldest_rare].prev = common_below
+		joined := test_query_ids(t, s, &by_rare, nil)
+		chains.links.links[oldest_rare].prev = TAG_NONE
+		testing.expect(t, slice.equal(joined, shared), "records of another value must not match")
+
+		for &f, fi in filters {
+			for auth in ([][][32]u8{nil, {reader}, {a}}) {
+				for access in ([]policy.Read_Access{{}, {check = hide_reactions}}) {
+					from_chains := test_query_ids(t, s, &f, auth, access)
+					entries := s.postings.entries
+					s.postings.entries = -1 // The index scan answers.
+					from_scan := test_query_ids(t, s, &f, auth, access)
+					s.postings.entries = entries
+					testing.expectf(
+						t,
+						slice.equal(from_chains, from_scan),
+						"phase %d filter %d readers %d policy %v: chains %v, scan %v",
+						phase,
+						fi,
+						len(auth),
+						access.check != nil,
+						from_chains,
+						from_scan,
+					)
+				}
+			}
+		}
+	}
+}
+
 @(private = "file")
 Timed_Id :: struct {
 	created_at: i64,
 	id:         [32]u8,
+	tagged:     bool,
 }
 
-// The newest `limit` ids within [since, until], in NIP-01 order.
+// The newest `limit` ids within [since, until], in NIP-01 order. `tagged`
+// keeps only the events that carry the tag.
 @(private = "file")
-test_newest_within :: proc(events: []Timed_Id, since, until: i64, limit: int) -> [][32]u8 {
+test_newest_within :: proc(
+	events: []Timed_Id,
+	since, until: i64,
+	limit: int,
+	tagged := false,
+) -> [][32]u8 {
 	matched := make([dynamic]Timed_Id, context.temp_allocator)
 	for ev in events {
-		if ev.created_at >= since && ev.created_at <= until {
+		if ev.created_at >= since && ev.created_at <= until && (ev.tagged || !tagged) {
 			append(&matched, ev)
 		}
 	}
@@ -610,9 +864,17 @@ test_time_zones_skip_blocks :: proc(t: ^testing.T) {
 	defer store_close(s)
 	stored := make([dynamic]Timed_Id, context.temp_allocator)
 	add :: proc(t: ^testing.T, s: ^Store, stored: ^[dynamic]Timed_Id, sk: u8, created_at: i64) {
-		ev := test_make_event(sk, 1, created_at, nil)
+		// Half the events carry a tag: too many for its chain, so a filter
+		// on it scans, and its place in tags.s must survive every skip.
+		tagged := created_at % 2 == 0
+		ev := test_make_event(
+			sk,
+			1,
+			created_at,
+			test_tags(test_tag("t", "half")) if tagged else nil,
+		)
 		test_append_ok(t, s, &ev)
-		append(stored, Timed_Id{created_at, ev.id})
+		append(stored, Timed_Id{created_at, ev.id, tagged})
 	}
 
 	// Three full blocks in time order, then half a block of older events
@@ -656,22 +918,25 @@ test_time_zones_skip_blocks :: proc(t: ^testing.T) {
 		case:
 		}
 		for w, wi in windows {
-			f := nostr.Filter {
-				since = w.since,
-				until = w.until,
-				limit = w.limit,
+			for tagged in ([2]bool{false, true}) {
+				f: nostr.Filter
+				if tagged {
+					f = test_tag_filter('t', "half")
+				}
+				f.since, f.until, f.limit = w.since, w.until, w.limit
+				got := test_query_ids(t, s, &f, nil)
+				want := test_newest_within(stored[:], w.since, w.until, w.limit, tagged)
+				testing.expectf(
+					t,
+					slice.equal(got, want),
+					"phase %d window %d tagged %v: %d ids, want %d",
+					phase,
+					wi,
+					tagged,
+					len(got),
+					len(want),
+				)
 			}
-			got := test_query_ids(t, s, &f, nil)
-			want := test_newest_within(stored[:], w.since, w.until, w.limit)
-			testing.expectf(
-				t,
-				slice.equal(got, want),
-				"phase %d window %d: %d ids, want %d",
-				phase,
-				wi,
-				len(got),
-				len(want),
-			)
 		}
 
 		// Only a wrong zone shows that the scan consults them: with block 1

@@ -49,6 +49,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 			s.postings = {
 				by_author    = make(map[[32]u8]Posting_List),
 				by_recipient = make(map[[32]u8]Posting_List),
+				by_tag       = tag_chains_make(len(tags) / TAG_ENTRY_SIZE),
 				entries      = total,
 				tag_bytes    = len(tags),
 			}

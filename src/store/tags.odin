@@ -1,8 +1,10 @@
 // Tag index records (tags.s).
 package store
 
+import "base:runtime"
 import "core:crypto/sha2"
 import "core:encoding/endian"
+import "core:hash"
 import "core:slice"
 import "core:sync"
 
@@ -38,6 +40,12 @@ Tag_Entry :: struct {
 
 TAG_ENTRY_SIZE :: 49
 
+// The bytes of a record that make its key: name, value, value length.
+@(private)
+TAG_KEY_START :: 8
+@(private)
+TAG_KEY_END :: 42
+
 @(private)
 Event_Slot :: struct {
 	slot:    u32,
@@ -72,6 +80,7 @@ Posting_List :: struct {
 Postings :: struct {
 	by_author:    map[[32]u8]Posting_List, // every event, by pubkey
 	by_recipient: map[[32]u8]Posting_List, // gift wraps, by each p tag
+	by_tag:       Tag_Chains, // every tags.s record, by name and value
 	entries:      int, // -1 until rebuilt after a compaction swap, or out of u32 range.
 	tag_bytes:    int,
 }
@@ -94,6 +103,148 @@ postings_destroy :: proc(m: ^Postings) {
 		}
 		delete(lists)
 	}
+	tag_chains_destroy(&m.by_tag)
+}
+
+// Marks a tag record with no earlier record under its key.
+@(private)
+TAG_NONE :: max(u32)
+
+// One entry per tags.s record, in file order.
+@(private)
+Tag_Link :: struct {
+	prev: u32, // the previous record with the same key, or TAG_NONE
+	slot: u32, // the index slot of the record's event
+}
+
+// A link is final once written, so a query walks the links below its
+// snapshot without a lock. It pins the array, which a larger copy replaces
+// when it fills.
+@(private)
+Tag_Links :: struct {
+	links:     []Tag_Link,
+	refs:      int,
+	allocator: runtime.Allocator,
+}
+
+// The newest record of one key, found by the key's hash. Keys that share a
+// hash share a chain, so a query checks each record it reaches against the
+// filter, as the scan does.
+@(private)
+Tag_Bucket :: struct {
+	hash:  u32,
+	head:  u32,
+	count: u32, // records in the chain; 0 marks an empty bucket
+}
+
+// Every tags.s record chained to the previous record with the same name and
+// value, so a tag filter visits its matches, newest slot first, where the
+// scan reads every slot. A record costs 8 bytes and a key 24 to 48. Posting
+// lists would cost a few hundred bytes per key, and most tag values name one
+// event.
+//
+//   buckets            links (one per tags.s record)
+//   hash -> head ----> [9] prev=4 slot=7
+//                      [4] prev=1 slot=3
+//                      [1] prev=TAG_NONE slot=0
+@(private)
+Tag_Chains :: struct {
+	buckets: []Tag_Bucket, // open addressing: a power of two long, at most half full
+	keys:    int,
+	links:   ^Tag_Links,
+}
+
+@(private)
+tag_key_hash :: proc(key: []u8) -> u32 {
+	h := hash.fnv64a(key)
+	return u32(h) ~ u32(h >> 32)
+}
+
+// The bucket that holds `key_hash`, or the empty one where it belongs.
+@(private)
+tag_bucket :: proc(buckets: []Tag_Bucket, key_hash: u32) -> ^Tag_Bucket {
+	mask := u32(len(buckets) - 1)
+	for i := key_hash & mask;; i = (i + 1) & mask {
+		bucket := &buckets[i]
+		if bucket.count == 0 || bucket.hash == key_hash {
+			return bucket
+		}
+	}
+}
+
+@(private)
+tag_links_make :: proc(capacity: int, written: []Tag_Link = nil) -> ^Tag_Links {
+	links := new(Tag_Links)
+	links^ = {
+		links     = make([]Tag_Link, capacity),
+		refs      = 1,
+		allocator = context.allocator,
+	}
+	copy(links.links, written)
+	return links
+}
+
+@(private)
+tag_links_release :: proc(links: ^Tag_Links) {
+	if sync.atomic_sub(&links.refs, 1) == 1 {
+		allocator := links.allocator
+		delete(links.links, allocator)
+		free(links, allocator)
+	}
+}
+
+// Empty chains with room for `records` tag records.
+@(private)
+tag_chains_make :: proc(records: int) -> Tag_Chains {
+	return {
+		buckets = make([]Tag_Bucket, 1024),
+		links = tag_links_make(max(1024, records + records / 8)),
+	}
+}
+
+@(private)
+tag_chains_destroy :: proc(c: ^Tag_Chains) {
+	if c.links != nil {
+		tag_links_release(c.links)
+	}
+	delete(c.buckets)
+}
+
+// Chain tags.s record `record`, which belongs to the event at `slot`, under
+// `key`: the record's name, value and value length. Records arrive in order.
+@(private)
+tag_chain_add :: proc(c: ^Tag_Chains, record, slot: u32, key: []u8) {
+	if int(record) >= len(c.links.links) {
+		grown := tag_links_make(2 * int(record), c.links.links)
+		tag_links_release(c.links)
+		c.links = grown
+	}
+	if 2 * (c.keys + 1) > len(c.buckets) {
+		grown := make([]Tag_Bucket, 2 * len(c.buckets))
+		for bucket in c.buckets {
+			if bucket.count > 0 {
+				tag_bucket(grown, bucket.hash)^ = bucket
+			}
+		}
+		delete(c.buckets)
+		c.buckets = grown
+	}
+
+	key_hash := tag_key_hash(key)
+	bucket := tag_bucket(c.buckets, key_hash)
+	link := Tag_Link {
+		prev = TAG_NONE,
+		slot = slot,
+	}
+	if bucket.count == 0 {
+		bucket.hash = key_hash
+		c.keys += 1
+	} else {
+		link.prev = bucket.head
+	}
+	c.links.links[record] = link
+	bucket.head = record
+	bucket.count += 1
 }
 
 @(private)
@@ -170,8 +321,9 @@ posting_add :: proc(lists: ^map[[32]u8]Posting_List, key: [32]u8, posting: Posti
 	append(&list.runs, run)
 }
 
-// Index one event by its author, and a gift wrap by each recipient it names.
-// `tags` holds the event's records from tags.s.
+// Index one event by its author and by each of its tags, and a gift wrap by
+// each recipient it names. `tags` holds the event's records from tags.s,
+// which end at `event.tag_end`.
 @(private)
 postings_add :: proc(
 	m: ^Postings,
@@ -183,12 +335,12 @@ postings_add :: proc(
 ) {
 	posting := Posting{event, kind}
 	posting_add(&m.by_author, pubkey, posting, idx)
-	if kind != nostr.KIND_GIFT_WRAP {
-		return
-	}
+	first := event.tag_end - u32(len(tags) / TAG_ENTRY_SIZE)
 	for pos := 0; pos < len(tags); pos += TAG_ENTRY_SIZE {
 		tag := tags[pos:pos + TAG_ENTRY_SIZE]
-		if tag[8] == 'p' && tag[41] == 32 {
+		record := first + u32(pos / TAG_ENTRY_SIZE)
+		tag_chain_add(&m.by_tag, record, event.slot, tag[TAG_KEY_START:TAG_KEY_END])
+		if kind == nostr.KIND_GIFT_WRAP && tag[8] == 'p' && tag[41] == 32 {
 			posting_add(&m.by_recipient, (cast(^[32]u8)&tag[9])^, posting, idx)
 		}
 	}

@@ -356,6 +356,83 @@ posting_next :: proc(heads: ^[]Posting_Cursor, kinds: []u16, idx: rawptr) -> Pos
 	return posting
 }
 
+// A filter reads tag chains while the tag values it names hold at most one
+// part in this many of the index; past that it scans. Measured on 1.11
+// million events with eight clients asking for a kind that matches nothing,
+// so both plans visit every candidate: per REQ the chains took 14.8 to 16.9
+// million cycles against the scan's 22.9 to 23.2 million at one part in 8,
+// and 35.9 to 36.6 million against 22.6 to 22.7 million at one in 4.
+@(private)
+TAG_INDEX_SHARE :: 8
+
+@(private)
+tag_value_hash :: proc(name: u8, value: Tag_Value) -> u32 {
+	value := value
+	key: [TAG_KEY_END - TAG_KEY_START]u8
+	key[0] = name
+	copy(key[1:], value.bytes[:])
+	key[len(key) - 1] = value.length
+	return tag_key_hash(key[:])
+}
+
+// Pick the tag of `specs` whose values name the fewest records. Returns that
+// count and the newest record of each of those values' chains. Caller holds
+// known_ids_mu.
+@(private)
+tag_chain_heads :: proc(chains: ^Tag_Chains, specs: []Tag_Spec) -> (heads: []u32, records: int) {
+	fewest := 0
+	records = max(int)
+	for spec, j in specs {
+		named := 0
+		for value in spec.values {
+			named += int(tag_bucket(chains.buckets, tag_value_hash(spec.name, value)).count)
+		}
+		if named < records {
+			fewest, records = j, named
+		}
+	}
+
+	spec := specs[fewest]
+	found := make([dynamic]u32, 0, len(spec.values), context.temp_allocator)
+	for value in spec.values {
+		bucket := tag_bucket(chains.buckets, tag_value_hash(spec.name, value))
+		if bucket.count > 0 {
+			append(&found, bucket.head)
+		}
+	}
+	return found[:], records
+}
+
+// Take the newest record any chain has left at or below slot `top` and step
+// its chain back. Returns the record's event, or false when the chains are
+// spent. `tag_end` is the end of that one record: the event may have more
+// after it, which only a candidate that gets as far as its tags looks up.
+@(private)
+tag_chain_next :: proc(
+	chain: ^pq.Priority_Queue(u32),
+	links: []Tag_Link,
+	top: int,
+) -> (
+	event: Event_Slot,
+	found: bool,
+) {
+	for pq.len(chain^) > 0 {
+		record := pq.peek(chain^)
+		link := links[record]
+		if link.prev == TAG_NONE {
+			pq.pop(chain)
+		} else {
+			chain.queue[0] = link.prev
+			pq.fix(chain, 0)
+		}
+		if int(link.slot) > top {
+			continue
+		}
+		return {slot = link.slot, tag_end = record + 1}, true
+	}
+	return {}, false
+}
+
 // Where a scan bounded by since or until goes on from slot `i`, the highest
 // slot of its block left to visit: the highest slot at or below `i` whose
 // block may hold a match. Reports false when no slot below can match.
@@ -453,16 +530,22 @@ query_authed :: proc(
 			break
 		}
 	}
+	// Tag records follow increasing data offsets, including after compaction.
+	// Ordered reads reset the cursor from each candidate's stored tag_end.
+	specs := build_tag_specs(filter)
 
-	// Pin the mappings and posting runs under the publication lock. No
-	// pointers into the lookup maps escape the lock.
+	// Pin the mappings, posting runs and tag links under the publication
+	// lock. No pointers into the lookup maps escape the lock.
 	maps: ^Query_Maps
 	idx, data, tags_buf: []u8
 	local_id: [1]Event_Slot
 	cand: []Event_Slot
 	cursors := make([dynamic]Posting_Cursor, context.temp_allocator)
 	posting_steps := 0
-	use_mailbox, use_authors: bool
+	tag_heads: []u32
+	tag_steps := 0
+	links: ^Tag_Links
+	use_mailbox, use_authors, use_tags: bool
 	indexed_tags: bool
 	total: int
 	layout: u64
@@ -503,46 +586,92 @@ query_authed :: proc(
 				posting_steps += list.count
 				cursors_pin(&cursors, list)
 			}
-		} else if !use_ids && full_authors && indexed_tags {
+		} else if !use_ids && indexed_tags {
 			// A repeated key names one list. Count it once, and pin nothing
-			// until the postings are chosen.
-			named := make(Key_Set, context.temp_allocator)
-			lists := make([dynamic]Posting_List, 0, len(fauthors), context.temp_allocator)
-			for author in fauthors {
-				list, held := s.postings.by_author[author.bytes]
-				if !held || author.bytes in named {
-					continue
+			// until a plan is chosen.
+			lists := make([dynamic]Posting_List, context.temp_allocator)
+			if full_authors {
+				named := make(Key_Set, context.temp_allocator)
+				for author in fauthors {
+					list, held := s.postings.by_author[author.bytes]
+					if !held || author.bytes in named {
+						continue
+					}
+					named[author.bytes] = {}
+					posting_steps += list.count
+					append(&lists, list)
 				}
-				named[author.bytes] = {}
-				posting_steps += list.count
-				append(&lists, list)
+				use_authors = posting_steps * POSTINGS_INDEX_SHARE <= total
 			}
-			use_authors = posting_steps * POSTINGS_INDEX_SHARE <= total
+			if len(specs) > 0 {
+				tag_heads, tag_steps = tag_chain_heads(&s.postings.by_tag, specs)
+				use_tags = tag_steps * TAG_INDEX_SHARE <= total
+				// A chain has no way to start at `until`: it passes every
+				// record above the bound. The scan starts there and reaches
+				// its limit in about limit * total / records slots.
+				if _, bounded := filter.until.?; use_tags && bounded {
+					use_tags = tag_steps * tag_steps <= limit * total
+				}
+			}
+			// With both to choose from, read the one that names fewer events.
+			if use_authors && use_tags {
+				use_authors = posting_steps <= tag_steps
+				use_tags = !use_authors
+			}
 			if use_authors {
 				for list in lists {
 					cursors_pin(&cursors, list)
 				}
+			}
+			if use_tags {
+				links = s.postings.by_tag.links
+				sync.atomic_add(&links.refs, 1)
 			}
 		}
 		sync.atomic_add(&maps.refs, 1)
 	}
 	defer query_maps_release(s, maps)
 	defer for &c in cursors do posting_release(c.run)
+	defer if links != nil {
+		tag_links_release(links)
+	}
 	steps := total
 	use_postings := use_mailbox || use_authors
-	use_slots := use_ids || use_postings
+	use_slots := use_ids || use_postings || use_tags
 	ordered := use_postings || use_ids && indexed_tags
 	recipient_offsets: Offset_Set
 	defer delete(recipient_offsets)
 	heads: []Posting_Cursor
 	posting_kinds := fkinds[:] if has_kinds else nil
+	// The newest record each tag chain has left, largest on top: records are
+	// in slot order, so the chains merge newest slot first.
+	chain: pq.Priority_Queue(u32)
+	defer pq.destroy(&chain)
 	if use_slots {
-		steps = posting_steps if use_postings else len(cand)
+		steps = len(cand)
+		if use_postings {
+			steps = posting_steps
+		}
+		if use_tags {
+			steps = tag_steps
+		}
 		if steps == 0 {
 			return .None
 		}
 		if use_postings {
 			heads = cursors_heap(cursors[:], posting_kinds, filter.until, raw_data(idx))
+		}
+		if use_tags {
+			pq.init(
+				&chain,
+				proc(a, b: u32) -> bool {return a > b},
+				pq.default_swap_proc(u32),
+				len(tag_heads),
+				context.temp_allocator,
+			)
+			for head in tag_heads {
+				pq.push(&chain, head)
+			}
 		}
 		if use_ids && steps > 1 {
 			if ordered {
@@ -560,9 +689,6 @@ query_authed :: proc(
 		recipient_offsets = p_tag_offsets_union(tags_buf, auth_pks)
 	}
 
-	// Tag records follow increasing data offsets, including after compaction.
-	// Ordered reads reset the cursor from each candidate's stored tag_end.
-	specs := build_tag_specs(filter)
 	if use_mailbox {
 		// Every posting matches one authenticated p tag. The query's p
 		// predicate is redundant only if it accepts every source mailbox.
@@ -613,9 +739,22 @@ query_authed :: proc(
 	fsearch, has_search := filter.search.?
 	timed := !use_slots && (has_since || has_until)
 
+	// Tag chains run from the newest slot down. They start at the highest
+	// slot `until` allows, and stop where nothing below can reach `since`.
+	chain_top := total - 1
+	if use_tags && has_until {
+		entry, found := zone_entry(s, chain_top, layout, nil, filter.until)
+		if !found {
+			return .None
+		}
+		chain_top = entry
+	}
+	since_checked := total + ZONE_SLOTS
+
 	// Hold the tombstone snapshot for the scan and emission.
 	sync.shared_guard(&s.tombstones_mu)
 	prev_slot := -1
+	ceiling_checked := total
 	for si := 0; si < steps; si += 1 {
 		i: int
 		if use_slots {
@@ -625,6 +764,19 @@ query_authed :: proc(
 					break
 				}
 				candidate = posting_next(&heads, posting_kinds, raw_data(idx)).event
+			} else if use_tags {
+				found: bool
+				candidate, found = tag_chain_next(&chain, links.links, chain_top)
+				if !found {
+					break
+				}
+				if has_since && int(candidate.slot) + ZONE_SLOTS <= since_checked {
+					since_checked = int(candidate.slot)
+					if _, reachable := zone_entry(s, since_checked, layout, filter.since, nil);
+					   !reachable {
+						break
+					}
+				}
 			} else {
 				candidate = cand[si if ordered else steps - 1 - si]
 			}
@@ -645,6 +797,11 @@ query_authed :: proc(
 				if !found {
 					break
 				}
+				if entry < i {
+					// The tag cursor is now far above this slot. It finds its
+					// place by search, not by walking the records in between.
+					walk = .Sparse
+				}
 				si += i - entry
 				i = entry
 			}
@@ -656,7 +813,10 @@ query_authed :: proc(
 		//    chronological ingest this makes the scan O(limit), not O(n).
 		//    Slots past len(scan_ceiling) (snapshot newer than the ceiling)
 		//    are treated as unbounded and never stop the scan.
-		if i & 1023 == 1023 && pq.len(heap) == limit {
+		//    Tag chains jump between slots, so they test once they have moved
+		//    1024 slots down.
+		if pq.len(heap) == limit && (i & 1023 == 1023 || use_tags && i + 1024 <= ceiling_checked) {
+			ceiling_checked = i
 			worst_ts := pq.peek(heap).created_at
 			stop: bool
 			{
@@ -727,13 +887,22 @@ query_authed :: proc(
 		// 7. Mailbox slots and the fallback offsets were selected by auth key.
 		//    ID and author slots still need that check, independently of
 		//    requested tags.
-		check_recipient := wrap && (use_ids || use_authors)
+		check_recipient := wrap && (use_ids || use_authors || use_tags)
 		if check_recipient || len(specs) > 0 {
+			if use_tags {
+				for tag_end * TAG_ENTRY_SIZE < len(tags_buf) &&
+				    endian.unchecked_get_u64le(tags_buf[tag_end * TAG_ENTRY_SIZE:]) == offset {
+					tag_end += 1
+				}
+			}
 			// With a known end, the recipient check alone can stop at its
 			// first match without first walking back to find the start.
 			tags := tags_buf[:tag_end * TAG_ENTRY_SIZE]
 			if !indexed_tags || len(specs) > 0 {
 				tags = candidate_tags(tags_buf, &tag_end, offset, walk)
+				if timed {
+					walk = .Sequential
+				}
 			}
 			if (check_recipient && !has_recipient(tags, offset, auth_pks)) ||
 			   !event_tags_match_specs(tags, specs) {
