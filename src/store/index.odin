@@ -44,6 +44,29 @@ HAS_EXPIRY_FLAG: u8 : 0x01
 @(private)
 NO_DELETE_FLAG: u8 : 0x02
 
+// Index slots per time zone.
+@(private)
+ZONE_SLOTS :: 1024
+
+// The created_at range of one block of ZONE_SLOTS consecutive index slots.
+@(private)
+Time_Zone :: struct {
+	oldest: i64,
+	newest: i64,
+}
+
+// Widen the zone of `slot` to hold `created_at`. Slots arrive in order.
+@(private)
+zones_add :: proc(zones: ^[dynamic]Time_Zone, slot: int, created_at: i64) {
+	if slot / ZONE_SLOTS == len(zones) {
+		append(zones, Time_Zone{created_at, created_at})
+		return
+	}
+	zone := &zones[slot / ZONE_SLOTS]
+	zone.oldest = min(zone.oldest, created_at)
+	zone.newest = max(zone.newest, created_at)
+}
+
 // Construct a new entry, inferring `has_expiry` from the `expiry` value
 // (`expiry != 0` ⇒ flag set). Set `has_expiry` directly to represent an
 // explicit `["expiration", "0"]` tag (#118).

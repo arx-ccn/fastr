@@ -492,10 +492,10 @@ append_classified :: proc(
 		}
 	}
 
-	// Extend the query early-exit ceiling BEFORE publishing the index length
-	// so any reader that sees the new entry also sees its ceiling slot. All
-	// fallible writes are behind us: a rollback can no longer desync the
-	// ceiling from the index.
+	// Extend the query early-exit ceiling and the time zones BEFORE
+	// publishing the index length so any reader that sees the new entry also
+	// sees its ceiling slot and a zone that holds it. All fallible writes are
+	// behind us: a rollback can no longer desync them from the index.
 	{
 		sync.guard(&s.scan_ceiling_mu)
 		ceil := ev.created_at
@@ -503,6 +503,7 @@ append_classified :: proc(
 			ceil = max(ceil, s.scan_ceiling[n - 1])
 		}
 		append(&s.scan_ceiling, ceil)
+		zones_add(&s.zones, int(before_index / INDEX_ENTRY_SIZE), ev.created_at)
 	}
 
 	{

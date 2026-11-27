@@ -356,6 +356,43 @@ posting_next :: proc(heads: ^[]Posting_Cursor, kinds: []u16, idx: rawptr) -> Pos
 	return posting
 }
 
+// Where a scan bounded by since or until goes on from slot `i`, the highest
+// slot of its block left to visit: the highest slot at or below `i` whose
+// block may hold a match. Reports false when no slot below can match.
+// `layout` is the one the scan's snapshot was taken in.
+@(private)
+zone_entry :: proc(
+	s: ^Store,
+	i: int,
+	layout: u64,
+	since, until: Maybe(i64),
+) -> (
+	entry: int,
+	found: bool,
+) {
+	sync.shared_guard(&s.scan_ceiling_mu)
+	floor, has_floor := since.?
+	newest, bounded := until.?
+	for entry = i; entry >= 0; {
+		// The ceiling bounds every slot from here down, in any layout.
+		if has_floor && entry < len(s.scan_ceiling) && s.scan_ceiling[entry] < floor {
+			return entry, false
+		}
+		block := entry / ZONE_SLOTS
+		if s.zones_layout != layout || block >= len(s.zones) {
+			return entry, true
+		}
+		zone := s.zones[block]
+		too_old := has_floor && zone.newest < floor
+		too_new := bounded && zone.oldest > newest
+		if !too_old && !too_new {
+			return entry, true
+		}
+		entry = block * ZONE_SLOTS - 1
+	}
+	return entry, false
+}
+
 // One candidate kept by the query top-N selection.
 @(private)
 Heap_Item :: struct {
@@ -428,9 +465,11 @@ query_authed :: proc(
 	use_mailbox, use_authors: bool
 	indexed_tags: bool
 	total: int
+	layout: u64
 	{
 		sync.shared_guard(&s.known_ids_mu)
 		maps = s.query_maps
+		layout = s.layout
 		idx = query_map_slice(maps.index, &s.index)
 		total = index_entry_count(idx)
 		if use_ids {
@@ -572,6 +611,7 @@ query_authed :: proc(
 	fsince, has_since := filter.since.?
 	funtil, has_until := filter.until.?
 	fsearch, has_search := filter.search.?
+	timed := !use_slots && (has_since || has_until)
 
 	// Hold the tombstone snapshot for the scan and emission.
 	sync.shared_guard(&s.tombstones_mu)
@@ -598,6 +638,16 @@ query_authed :: proc(
 			}
 		} else {
 			i = total - 1 - si
+			// A time bound is judged once per block, on entering it, and may
+			// pass this block and others below it.
+			if timed && (si == 0 || i % ZONE_SLOTS == ZONE_SLOTS - 1) {
+				entry, found := zone_entry(s, i, layout, filter.since, filter.until)
+				if !found {
+					break
+				}
+				si += i - entry
+				i = entry
+			}
 		}
 		// 0. Early exit: scan_ceiling[i] bounds the created_at of every entry
 		//    at slot <= i. Once the heap is full and the ceiling is strictly

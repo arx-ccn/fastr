@@ -575,6 +575,131 @@ test_author_postings_match_scan :: proc(t: ^testing.T) {
 	}
 }
 
+@(private = "file")
+Timed_Id :: struct {
+	created_at: i64,
+	id:         [32]u8,
+}
+
+// The newest `limit` ids within [since, until], in NIP-01 order.
+@(private = "file")
+test_newest_within :: proc(events: []Timed_Id, since, until: i64, limit: int) -> [][32]u8 {
+	matched := make([dynamic]Timed_Id, context.temp_allocator)
+	for ev in events {
+		if ev.created_at >= since && ev.created_at <= until {
+			append(&matched, ev)
+		}
+	}
+	slice.sort_by(matched[:], proc(a, b: Timed_Id) -> bool {
+		return a.created_at > b.created_at || (a.created_at == b.created_at && id_less(a.id, b.id))
+	})
+	ids := make([dynamic][32]u8, context.temp_allocator)
+	for ev in matched[:min(limit, len(matched))] {
+		append(&ids, ev.id)
+	}
+	return ids[:]
+}
+
+// A scan bounded by since or until passes over whole blocks of slots whose
+// time range rules them out. It must still return the newest matches.
+@(test)
+test_time_zones_skip_blocks :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	s := test_open(t, dir)
+	defer store_close(s)
+	stored := make([dynamic]Timed_Id, context.temp_allocator)
+	add :: proc(t: ^testing.T, s: ^Store, stored: ^[dynamic]Timed_Id, sk: u8, created_at: i64) {
+		ev := test_make_event(sk, 1, created_at, nil)
+		test_append_ok(t, s, &ev)
+		append(stored, Timed_Id{created_at, ev.id})
+	}
+
+	// Three full blocks in time order, then half a block of older events
+	// stored last: the newest, partial block holds the oldest timestamps.
+	IN_ORDER :: 3 * ZONE_SLOTS
+	for i in 0 ..< IN_ORDER {
+		add(t, s, &stored, u8(1 + i % 3), i64(10_000 + i))
+	}
+	for i in 0 ..< ZONE_SLOTS / 2 {
+		add(t, s, &stored, 4, i64(5_000 + i))
+	}
+	last_in_order := i64(10_000 + IN_ORDER - 1)
+	block_edge := i64(10_000 + 2 * ZONE_SLOTS)
+
+	Window :: struct {
+		since, until: i64,
+		limit:        int,
+	}
+	windows := [?]Window {
+		{0, 11_500, 50}, // newer blocks pass, then the limit ends the scan
+		{12_900, max(i64), 500}, // the partial block passes, older blocks end the scan
+		{5_100, 5_200, 500}, // only the backfill, under three blocks to pass
+		{block_edge - 1, block_edge, 500}, // one event on each side of a block edge
+		{block_edge, block_edge, 1},
+		{last_in_order, last_in_order + 10_000, 10}, // the appends after compaction
+		{20_000, 30_000, 10}, // nothing
+	}
+
+	for phase in 0 ..< 4 {
+		switch phase {
+		case 1:
+			store_close(s)
+			s = test_open(t, dir)
+		case 2:
+			_, err := store_compact(s)
+			testing.expect_value(t, err, Error.None)
+		case 3:
+			for i in 1 ..= 5 {
+				add(t, s, &stored, 5, last_in_order + i64(i))
+			}
+		case:
+		}
+		for w, wi in windows {
+			f := nostr.Filter {
+				since = w.since,
+				until = w.until,
+				limit = w.limit,
+			}
+			got := test_query_ids(t, s, &f, nil)
+			want := test_newest_within(stored[:], w.since, w.until, w.limit)
+			testing.expectf(
+				t,
+				slice.equal(got, want),
+				"phase %d window %d: %d ids, want %d",
+				phase,
+				wi,
+				len(got),
+				len(want),
+			)
+		}
+
+		// Only a wrong zone shows that the scan consults them: with block 1
+		// marked too new, its events go missing. A zone built for another
+		// layout must be ignored, wrong or not.
+		f := nostr.Filter {
+			until = 11_500,
+			limit = 50,
+		}
+		want := test_newest_within(stored[:], 0, 11_500, 50)
+		honest := s.zones[1]
+		s.zones[1].oldest = max(i64)
+		testing.expect(
+			t,
+			!slice.equal(test_query_ids(t, s, &f, nil), want),
+			"zones must be consulted",
+		)
+		s.zones_layout += 1
+		testing.expect(
+			t,
+			slice.equal(test_query_ids(t, s, &f, nil), want),
+			"stale zones must be ignored",
+		)
+		s.zones_layout -= 1
+		s.zones[1] = honest
+	}
+}
+
 @(test)
 test_tag_snapshot_ahead :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)

@@ -96,6 +96,15 @@ Store :: struct {
 	// (readers skip the test for slots past len(scan_ceiling)).
 	scan_ceiling_mu:        sync.RW_Mutex,
 	scan_ceiling:           [dynamic]i64,
+	// Oldest and newest created_at of each block of ZONE_SLOTS index slots,
+	// under scan_ceiling_mu. A scan bounded by since or until passes over a
+	// block whose range rules it out. A zone describes slots, and a
+	// compaction renumbers them, so readers use the zones only while
+	// zones_layout equals the layout their snapshot was taken in.
+	zones:                  [dynamic]Time_Zone,
+	zones_layout:           u64,
+	// Counts compaction swaps; under known_ids_mu.
+	layout:                 u64,
 	// Store directory path (owned copy) - needed for compaction temp files.
 	dir:                    string,
 	// Allocator for all long-lived state.
@@ -372,6 +381,7 @@ store_open :: proc(dir: string, allocator := context.allocator) -> (s: ^Store, e
 	s.authors_with_expiry = make(Key_Set)
 	s.known_ids = make(map[[32]u8]Event_Slot)
 	s.scan_ceiling = make([dynamic]i64)
+	s.zones = make([dynamic]Time_Zone)
 
 	if berr := boot_rebuild(s); berr != .None {
 		store_close(s)
@@ -421,6 +431,7 @@ store_close :: proc(s: ^Store) {
 	delete(s.known_ids)
 	postings_destroy(&s.postings)
 	delete(s.scan_ceiling)
+	delete(s.zones)
 	delete(s.dir)
 	free(s)
 }

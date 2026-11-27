@@ -308,6 +308,9 @@ store_compact :: proc(s: ^Store) -> (retained: int, err: Error) {
 		defer publish_query_maps(s)
 		// Old posting slot numbers cannot resolve against the new mappings.
 		s.postings.entries = -1
+		// Nor can the time zones: they stay with the old layout until
+		// boot_rebuild builds them for this one.
+		s.layout += 1
 		// Shrink lengths before swapping for readers that pin files separately.
 		mapped_file_publish_len(&s.data, new_data_offset)
 		mapped_file_publish_len(&s.index, new_index_offset)

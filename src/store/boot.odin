@@ -35,6 +35,8 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 		clear(&s.known_ids)
 		clear(&s.scan_ceiling)
 		reserve(&s.scan_ceiling, total)
+		clear(&s.zones)
+		s.zones_layout = s.layout
 		s.session_slot = total
 		postings_destroy(&s.postings)
 		tags := tags_g.data
@@ -57,6 +59,7 @@ boot_rebuild :: proc(s: ^Store) -> Error {
 			e := index_entry_at(idx, i)
 			ceil = max(ceil, e.created_at)
 			append(&s.scan_ceiling, ceil)
+			zones_add(&s.zones, i, e.created_at)
 			if s.postings.entries >= 0 {
 				for tag_pos < len(tags) && endian.unchecked_get_u64le(tags[tag_pos:]) < e.offset {
 					tag_pos += TAG_ENTRY_SIZE
