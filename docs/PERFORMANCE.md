@@ -54,11 +54,12 @@ regardless of mode.
 For kind 1059 and one hex-encoded `#p` key, anonymous COUNT can use the
 list's stored public count. If expiry or deletion can change that answer,
 or the connection has authenticated, COUNT walks the postings instead.
-NIP-77 reads timestamps and IDs from the same index. Neither operation
-needs event payloads for covered entries;
-content search and read-policy hooks still need the records. Recipient-only
-mode requires authentication as the requested key. The relay rebuilds the
-covering metadata at startup and after compaction without changing disk format.
+NIP-77 reads timestamps and IDs from the same index. Both paths skip event
+payloads for covered entries. Content search and read-policy hooks still
+need the records. Recipient-only mode requires authentication as the
+requested key. UTF-8 checks for mailbox coverage skip full ASCII blocks
+before validating the remainder. Startup and compaction rebuild the
+covering metadata without changing the disk format.
 NIP-77 merges fully covered mailbox runs and visits timestamp groups oldest
 first without sorting the matched IDs again. When every entry in a single
 run qualifies, NIP-77 checks the record cap up front and emits directly from

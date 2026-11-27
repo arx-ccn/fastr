@@ -5,6 +5,7 @@ import "base:runtime"
 import "core:crypto/sha2"
 import "core:encoding/endian"
 import "core:hash"
+import "core:simd"
 import "core:slice"
 import "core:sync"
 import "core:unicode/utf8"
@@ -386,14 +387,28 @@ postings_add :: proc(
 	}
 }
 
+@(private = "file")
+valid_mailbox_text :: proc(text: string) -> bool {
+	i := 0
+	when simd.HAS_HARDWARE_SIMD {
+		#no_bounds_check for ; len(text) - i >= 16; i += 16 {
+			v := simd.from_array((^[16]u8)(&raw_data(text)[i])^)
+			if simd.extract_msbs(v) != {} {
+				break
+			}
+		}
+	}
+	return utf8.valid_string(text[i:])
+}
+
 @(private)
 mailbox_flags :: proc(tags: []pack.Tag, content: string, expires: bool) -> Posting_Flags {
-	if !utf8.valid_string(content) {
+	if !valid_mailbox_text(content) {
 		return {}
 	}
 	for tag in tags {
 		for field in tag.fields {
-			if !utf8.valid_string(field) {
+			if !valid_mailbox_text(field) {
 				return {}
 			}
 		}

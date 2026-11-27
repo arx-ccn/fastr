@@ -270,6 +270,42 @@ test_mailbox_literal_count :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_mailbox_count_utf8 :: proc(t: ^testing.T) {
+	dir := test_tmp_dir(t)
+	defer test_rm_dir(dir)
+	key := test_pubkey(2)
+	value := test_hex(key[:])
+	p := test_tag("p", value)
+	f := test_tag_filter('p', value)
+	f.kinds = test_kind_filter(nostr.KIND_GIFT_WRAP).kinds
+	access := policy.Read_Access {
+		gift_wrap_read = .Public,
+	}
+	prefix :: "0123456789abcdef0123456789abcdef"
+	{
+		s := test_open(t, dir)
+		defer store_close(s)
+		valid := test_make_event(1, nostr.KIND_GIFT_WRAP, 10, test_tags(p))
+		valid.content = prefix + "羊"
+		bad_content := test_make_event(1, nostr.KIND_GIFT_WRAP, 20, test_tags(p))
+		bad_content.content = prefix + "\xff"
+		bad_tag := test_make_event(
+			1,
+			nostr.KIND_GIFT_WRAP,
+			30,
+			test_tags(p, test_tag("t", prefix + "\xff")),
+		)
+		for ev in ([]^pack.Event{&valid, &bad_content, &bad_tag}) {
+			test_append_ok(t, s, ev)
+		}
+		testing.expect_value(t, count_filters(s, {f}, nil, access), u64(1))
+	}
+	s := test_open(t, dir)
+	defer store_close(s)
+	testing.expect_value(t, count_filters(s, {f}, nil, access), u64(1))
+}
+
+@(test)
 test_mailbox_partial_tags :: proc(t: ^testing.T) {
 	dir := test_tmp_dir(t)
 	defer test_rm_dir(dir)
