@@ -1,8 +1,8 @@
 // fastr — a Nostr relay that goes brrrrrrrr. Odin rewrite.
 //
 // Entry point: `fastr` serves; `fastr import <dir> <events.jsonl>` bulk-loads.
-// The acceptors share one listener and start one reader thread per client
-// (the ws package adds a writer thread when needed).
+// Plaintext connections share epoll readers. TLS uses one reader per connection.
+// The ws package starts a writer thread when needed.
 package main
 
 import "core:fmt"
@@ -46,12 +46,17 @@ Conn_Ctx :: struct {
 	slot:    ^tls.Cert_Slot,
 	active:  ^int, // atomic connection counter
 	conn_id: u64,
-	nip11:   string, // pre-rendered NIP-11 HTTP response
-	index:   string, // pre-rendered index page HTTP response
-	icon:    string, // pre-rendered /icon.png HTTP response (binary body)
-	banner:  string, // pre-rendered /banner.png HTTP response (binary body)
-	tos:     string, // pre-rendered /tos.txt HTTP response
-	grasp:   ^Grasp_Http, // GRASP-01 git smart HTTP routing
+	http:    ^Http_Routes,
+}
+
+@(private)
+Http_Routes :: struct {
+	nip11:  string, // pre-rendered NIP-11 HTTP response
+	index:  string, // pre-rendered index page HTTP response
+	icon:   string, // pre-rendered /icon.png HTTP response (binary body)
+	banner: string, // pre-rendered /banner.png HTTP response (binary body)
+	tos:    string, // pre-rendered /tos.txt HTTP response
+	grasp:  ^Grasp_Http, // GRASP-01 git smart HTTP routing
 }
 
 @(private = "file")
@@ -197,16 +202,32 @@ serve :: proc() {
 
 	state := new(Accept_Ctx)
 	state^ = {
-		listener        = listener,
+		listener = listener,
 		max_connections = cfg.max_connections,
-		relay           = relay,
-		slot            = slot,
-		nip11           = nip11_resp,
-		index           = index_resp,
-		icon            = icon_resp,
-		banner          = banner_resp,
-		tos             = tos_resp,
-		grasp           = grasp_http,
+		relay = relay,
+		slot = slot,
+		http = {
+			nip11 = nip11_resp,
+			index = index_resp,
+			icon = icon_resp,
+			banner = banner_resp,
+			tos = tos_resp,
+			grasp = grasp_http,
+		},
+	}
+	if slot == nil {
+		if !ws.serve_plaintext(
+			relay,
+			listener,
+			cfg.max_connections,
+			&state.http,
+			plaintext_upgrade_key,
+			serve_http,
+		) {
+			fmt.eprintln("fastr: cannot start plaintext reactor")
+			os.exit(1)
+		}
+		return
 	}
 	// Main accepts too, even if a helper cannot start.
 	for _ in 0 ..< 3 {
@@ -226,12 +247,7 @@ Accept_Ctx :: struct {
 	next_conn_id:    u64,
 	relay:           ^ws.Relay,
 	slot:            ^tls.Cert_Slot,
-	nip11:           string,
-	index:           string,
-	icon:            string,
-	banner:          string,
-	tos:             string,
-	grasp:           ^Grasp_Http,
+	http:            Http_Routes,
 }
 
 @(private = "file")
@@ -269,12 +285,7 @@ accept_loop :: proc(state: ^Accept_Ctx) {
 		ctx.slot = state.slot
 		ctx.active = &state.active
 		ctx.conn_id = sync.atomic_add(&state.next_conn_id, 1) + 1
-		ctx.nip11 = state.nip11
-		ctx.index = state.index
-		ctx.icon = state.icon
-		ctx.banner = state.banner
-		ctx.tos = state.tos
-		ctx.grasp = state.grasp
+		ctx.http = &state.http
 		if thread.create_and_start_with_poly_data(ctx, conn_entry, self_cleanup = true) == nil {
 			net.close(client)
 			sync.atomic_sub(&state.active, 1)
@@ -381,9 +392,6 @@ stats_loop :: proc(ctx: ^Stats_Ctx) {
 	}
 }
 
-// Peek at the first bytes of an incoming connection. NIP-11 requests get the
-// relay info document; plain HTTP gets the index page; WebSocket upgrades go
-// to the connection handler even if the client sends the NIP-11 Accept header.
 @(private)
 conn_entry :: proc(ctx: ^Conn_Ctx) {
 	defer {
@@ -421,43 +429,62 @@ conn_entry :: proc(ctx: ^Conn_Ctx) {
 		return
 	}
 
-	// GRASP-01: OPTIONS preflight requests get 204 with permissive CORS,
-	// regardless of path.
-	if req.method == "OPTIONS" {
-		_ = tls.stream_send(&ctx.stream, transmute([]u8)string(OPTIONS_RESPONSE))
-		return
-	}
-	if grasp_try_handle(ctx.grasp, &ctx.stream, &req, extra) {
+	if serve_http_before_upgrade(ctx.http, &ctx.stream, &req, extra) {
 		return
 	}
 
-	if key, ok := ws.websocket_upgrade_key(&req); ok {
-		ws.handle_connection(ctx.relay, &ctx.stream, key, extra, ctx.conn_id)
-		return
-	}
-
-	if accept, has_accept := ws.header_get(&req, "accept"); has_accept {
-		if strings.contains(accept, "application/nostr+json") {
-			_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.nip11)
+	when tls.ENABLED {
+		if key, ok := ws.websocket_upgrade_key(&req); ok {
+			ws.handle_connection(ctx.relay, &ctx.stream, key, extra, ctx.conn_id)
 			return
 		}
 	}
 
-	if req.path == "/icon.png" {
-		_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.icon)
-		return
+	serve_relay_http(ctx.http, &ctx.stream, &req)
+}
+
+@(private = "file")
+serve_http :: proc(user: rawptr, stream: ^tls.Server_Stream, req: ^ws.Request, extra: []u8) {
+	http := (^Http_Routes)(user)
+	if !serve_http_before_upgrade(http, stream, req, extra) {
+		serve_relay_http(http, stream, req)
 	}
-	if req.path == "/banner.png" {
-		_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.banner)
-		return
+}
+
+@(private = "file")
+serve_http_before_upgrade :: proc(
+	http: ^Http_Routes,
+	stream: ^tls.Server_Stream,
+	req: ^ws.Request,
+	extra: []u8,
+) -> bool {
+	// GRASP-01 preflight applies to every path.
+	if req.method == "OPTIONS" {
+		_ = tls.stream_send(stream, transmute([]u8)string(OPTIONS_RESPONSE))
+		return true
 	}
-	if req.path == "/tos.txt" {
-		_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.tos)
-		return
+	return grasp_try_handle(http.grasp, stream, req, extra)
+}
+
+@(private = "file")
+serve_relay_http :: proc(http: ^Http_Routes, stream: ^tls.Server_Stream, req: ^ws.Request) {
+	if accept, has_accept := ws.header_get(req, "accept"); has_accept {
+		if strings.contains(accept, "application/nostr+json") {
+			_ = tls.stream_send(stream, transmute([]u8)http.nip11)
+			return
+		}
 	}
 
-	// Plain browser visit / probe.
-	_ = tls.stream_send(&ctx.stream, transmute([]u8)ctx.index)
+	response := http.index
+	switch req.path {
+	case "/icon.png":
+		response = http.icon
+	case "/banner.png":
+		response = http.banner
+	case "/tos.txt":
+		response = http.tos
+	}
+	_ = tls.stream_send(stream, transmute([]u8)response)
 }
 
 // Import events from a JSONL file into the store at `dir`.

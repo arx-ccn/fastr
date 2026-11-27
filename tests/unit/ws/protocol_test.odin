@@ -476,7 +476,6 @@ test_encode_header_length_forms :: proc(t: ^testing.T) {
 
 @(test)
 test_pong_then_messages :: proc(t: ^testing.T) {
-	// All frames are already buffered; conn_next must not wait for more TCP data.
 	c: Conn
 	conn_init(
 		&c,
@@ -512,11 +511,11 @@ test_pong_then_messages :: proc(t: ^testing.T) {
 		},
 	)
 	defer conn_destroy(&c)
-	msg, err := conn_next(&c)
+	msg, err := conn_parse(&c)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, msg.msg_type, Message_Type.Text)
 	testing.expect_value(t, string(msg.data), "x")
-	msg, err = conn_next(&c)
+	msg, err = conn_parse(&c)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, msg.msg_type, Message_Type.Binary)
 	testing.expect_value(t, string(msg.data), "ab")

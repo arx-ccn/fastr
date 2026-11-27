@@ -112,13 +112,16 @@ when tls.ENABLED {
 		if !ok {
 			return
 		}
+		routes := Http_Routes {
+			nip11 = TEST_NIP11,
+			grasp = &f.grasp,
+		}
 		ctx := new(Conn_Ctx)
 		ctx^ = {
 			stream = {sock = sock},
 			slot = &f.state.slot,
 			active = &f.active,
-			nip11 = TEST_NIP11,
-			grasp = &f.grasp,
+			http = &routes,
 		}
 		sync.atomic_add(&f.active, 1)
 		conn_entry(ctx)

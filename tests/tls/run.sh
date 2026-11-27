@@ -106,7 +106,7 @@ read -r _ _ send_max </proc/sys/net/ipv4/tcp_wmem
 ((send_max <= 8 * 1024 * 1024)) || fail 'Backpressure fixture requires tcp_wmem maximum <= 8 MiB'
 start_relay backpressure "${manual[@]}"
 await 5 nip11 || fail 'Backpressure relay not ready'
-timeout 150 "$work/fastr-smoke" tls-backpressure
+timeout 150 "$work/fastr-smoke" backpressure
 stop_relay
 
 start_relay capped "${manual[@]}" FASTR_MAX_CONNECTIONS=1

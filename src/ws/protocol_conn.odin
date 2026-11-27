@@ -1,6 +1,6 @@
-// Blocking-socket plumbing over the pure protocol layer.
+// Socket and buffer handling over the pure protocol layer.
 //
-// One thread owns the socket and drives conn_next; writes may come from
+// One thread reads the socket and drives conn_parse; writes may come from
 // the same thread or a dedicated writer.
 //
 // Buffer ownership:
@@ -9,7 +9,7 @@
 //   - Conn: owns a fixed 16 KiB receive buffer and the Reader's message
 //     buffer (allocated from the allocator passed to conn_init; bounded
 //     by max_message_bytes). Incoming.data points into Conn storage and
-//     is valid until the next conn_next call.
+//     is valid until the next conn_parse call.
 //   - Writers: payloads <= WRITE_STACK_LIMIT are framed into a stack
 //     buffer and sent with one syscall, zero heap allocation; larger
 //     payloads send a stack header then the caller's payload (two sends).
@@ -35,7 +35,7 @@ Conn :: struct {
 Incoming :: struct {
 	event:      Event, // .Message, .Ping, or .Close (pongs are eaten)
 	msg_type:   Message_Type, // valid when event == .Message
-	data:       []u8, // message bytes or control payload; valid until next conn_next
+	data:       []u8, // message bytes or control payload; valid until next conn_parse
 	close_code: u16, // valid when event == .Close; CLOSE_NO_STATUS if absent
 }
 
@@ -103,28 +103,8 @@ conn_destroy :: proc(c: ^Conn) {
 	reader_destroy(&c.reader)
 }
 
-// conn_next blocks until a complete message, a ping, or a close frame
-// arrives. Pongs are consumed silently. On a frame-protocol error the
-// caller should send close_code_for_error(err) via conn_write_close and
-// drop the connection; on .Close the caller echoes a close frame.
-// Incoming.data is valid until the next conn_next call.
-conn_next :: proc(c: ^Conn) -> (msg: Incoming, err: Error) {
-	for {
-		incoming, parse_err := conn_parse(c)
-		if parse_err != .None || incoming.event != .None {
-			return incoming, parse_err
-		}
-		n, rerr := tls.stream_recv(c.stream, conn_read_buf(c))
-		if rerr != .None {
-			return {}, .Socket
-		}
-		if n == 0 {
-			return {}, .Closed
-		}
-		c.rend += n
-	}
-}
-
+// Parse the next message, ping, or close from the receive buffer. Pongs
+// are consumed silently. An empty event means the caller must read more.
 @(private)
 conn_parse :: proc(c: ^Conn) -> (msg: Incoming, err: Error) {
 	for c.rstart < c.rend {

@@ -149,16 +149,20 @@ drop_msg :: proc(msg: Out_Msg) {
 // is closed and drained, or stops sending (but keeps draining) on error.
 @(private)
 writer_loop :: proc(cs: ^Conn_State) {
+	o := cs.outbox
+	defer if o.plain_owner != nil {
+		plain_release(o.plain_owner)
+	}
 	dead := false
 	for {
-		msg, ok := chan.recv(cs.outbox.ch)
+		msg, ok := chan.recv(o.ch)
 		if !ok {
 			return
 		}
 		defer {
-			sync.guard(&cs.outbox.send_mu)
-			cs.outbox.pending -= 1
-			cs.outbox.failed = dead
+			sync.guard(&o.send_mu)
+			o.pending -= 1
+			o.failed = dead
 		}
 		if dead {
 			drop_msg(msg)
@@ -196,9 +200,19 @@ outbox_start_writer :: proc(o: ^Outbox) -> bool {
 	ch, err := chan.create(chan.Chan(Out_Msg), OUTBOX_CAPACITY, context.allocator)
 	if err == nil {
 		o.ch = ch
-		o.writer = thread.create_and_start_with_poly_data(o.state, writer_loop)
+		if owner := o.plain_owner; owner != nil {
+			sync.atomic_add(&owner.refs, 1)
+		}
+		o.writer = thread.create_and_start_with_poly_data(
+			o.state,
+			writer_loop,
+			self_cleanup = o.plain_owner != nil,
+		)
 		if o.writer != nil {
 			return true
+		}
+		if o.plain_owner != nil {
+			plain_release(o.plain_owner)
 		}
 		chan.destroy(ch)
 		o.ch = {}
@@ -263,98 +277,43 @@ live_visible :: proc(cs: ^Conn_State, shared: ^Shared_Event) -> bool {
 // ---------------------------------------------------------------------------
 // Connection lifecycle
 
-// Upgrade and run the client until either side closes it.
-handle_connection :: proc(
+// cs is zero-initialized except that preload may point into cs.conn.rbuf.
+// Preserve the caller's outbox setup and leave context.temp_allocator alone.
+@(private)
+conn_state_init :: proc(
+	cs: ^Conn_State,
+	o: ^Outbox,
 	relay: ^Relay,
 	stream: ^tls.Server_Stream,
-	key: string,
-	preload: []u8,
 	conn_id: u64,
+	preload: []u8 = nil,
 ) {
-	wake: Maybe(linux.Fd)
-	when tls.ENABLED {
-		if stream.ssl != nil {
-			fd, err := linux.eventfd(0, {.NONBLOCK, .CLOEXEC})
-			if err != .NONE {
-				return
-			}
-			wake = fd
-		}
-	}
-	defer if fd, ok := wake.?; ok {
-		linux.close(fd)
-	}
-	if accept_upgrade(stream, key) != .None {
-		return
-	}
-
-	cs := new(Conn_State)
-	defer free(cs)
-	mem.dynamic_arena_init(&cs.scratch, block_size = 16 * 1024, out_band_size = 16 * 1024)
-	defer mem.dynamic_arena_destroy(&cs.scratch)
-	context.temp_allocator = mem.dynamic_arena_allocator(&cs.scratch)
 	cs.relay = relay
+	cs.outbox = o
+	mem.dynamic_arena_init(&cs.scratch, block_size = 16 * 1024, out_band_size = 16 * 1024)
 	conn_init(&cs.conn, stream, relay.cfg.max_message_bytes, preload)
-	defer conn_destroy(&cs.conn)
-
-	cs.outbox = new(Outbox)
-	cs.outbox.state = cs
-	cs.outbox.wake = wake
-	cs.outbox.conn_id = conn_id
-	when tls.ENABLED {
-		if wake != nil {
-			ch, err := chan.create(chan.Chan(Out_Msg), OUTBOX_CAPACITY, context.allocator)
-			assert(err == nil)
-			cs.outbox.ch = ch
-		}
-	}
-	defer {
-		chan.destroy(cs.outbox.ch)
-		delete(cs.replay_spare)
-		free(cs.outbox)
-	}
-
 	auth_state_init(&cs.auth)
-	defer {
-		for sub_id, session in cs.neg_subs {
-			neg_session_destroy(session)
-			delete(sub_id)
-		}
-		delete(cs.neg_subs)
-		if cs.neg_spare != nil {
-			neg_session_destroy(cs.neg_spare)
-		}
-		auth_state_destroy(&cs.auth)
-	}
-
-	when tls.ENABLED {
-		if stream.ssl != nil {
-			begin_auth(cs)
-			tls_ws_loop(cs)
-			return
-		}
-	}
-	plain_ws_loop(cs)
+	o.state = cs
+	o.conn_id = conn_id
 }
 
+// Call after detaching the outbox and draining its channel, using the same
+// context.allocator as the reader. The caller owns both structs and the socket.
 @(private)
-plain_ws_loop :: proc(cs: ^Conn_State) {
-	begin_auth(cs)
-	terminal := u16(0)
-	for {
-		incoming, err := conn_next(&cs.conn)
-		if err != .None {
-			terminal = close_code_for_error(err)
-			break
-		}
-		if incoming.event == .Close {
-			terminal = incoming.close_code
-			break
-		}
-		consume_incoming(cs, incoming)
+conn_state_destroy :: proc(cs: ^Conn_State) {
+	for sub_id, session in cs.neg_subs {
+		neg_session_destroy(session)
+		delete(sub_id)
 	}
-	close_outbox(cs, terminal)
-	outbox_join_writer(cs.outbox)
+	delete(cs.neg_subs)
+	if cs.neg_spare != nil {
+		neg_session_destroy(cs.neg_spare)
+	}
+	auth_state_destroy(&cs.auth)
+	chan.destroy(cs.outbox.ch)
+	delete(cs.replay_spare)
+	conn_destroy(&cs.conn)
+	mem.dynamic_arena_destroy(&cs.scratch)
 }
 
 @(private)
@@ -388,8 +347,9 @@ consume_incoming :: proc(cs: ^Conn_State, incoming: Incoming) {
 	}
 }
 
+// Send the last frame with the channel still open. This can start a writer.
 @(private)
-close_outbox :: proc(cs: ^Conn_State, terminal: u16 = 0) {
+detach_outbox :: proc(cs: ^Conn_State, terminal: u16) {
 	// The shard lock waits out any broadcaster that can still see the outbox.
 	if cs.live_count != 0 {
 		fanout_unsubscribe_all(&cs.relay.fanout, cs.outbox)
@@ -398,6 +358,11 @@ close_outbox :: proc(cs: ^Conn_State, terminal: u16 = 0) {
 	if terminal != 0 {
 		send_close(cs, terminal)
 	}
+}
+
+@(private)
+close_outbox :: proc(cs: ^Conn_State, terminal: u16 = 0) {
+	detach_outbox(cs, terminal)
 	chan.close(cs.outbox.ch)
 }
 

@@ -94,17 +94,18 @@ Out_Msg :: union {
 // Per-connection outbound endpoint registered with the fanout.
 // Unregister before freeing it: fanout buckets can point into subs.
 Outbox :: struct {
-	ch:      chan.Chan(Out_Msg),
+	ch:          chan.Chan(Out_Msg),
 	// The connection, for the threads that write to its socket while no
 	// writer owns it. Nil in an outbox that only queues.
-	state:   ^Conn_State,
-	writer:  ^thread.Thread,
-	wake:    Maybe(linux.Fd),
-	send_mu: sync.Mutex,
-	pending: int, // queued plus currently being written
-	failed:  bool,
-	conn_id: u64,
-	subs:    Subscription_Slot,
+	state:       ^Conn_State,
+	writer:      ^thread.Thread,
+	wake:        Maybe(linux.Fd),
+	send_mu:     sync.Mutex,
+	pending:     int, // queued plus currently being written
+	failed:      bool,
+	conn_id:     u64,
+	subs:        Subscription_Slot,
+	plain_owner: ^Plain_Client,
 }
 
 @(private)

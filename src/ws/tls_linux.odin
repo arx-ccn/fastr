@@ -1,5 +1,6 @@
 package ws
 
+import "core:mem"
 import "core:sync"
 import "core:sync/chan"
 import "core:sys/linux"
@@ -9,6 +10,39 @@ import "../nostr"
 import "../tls"
 
 when tls.ENABLED {
+	// Upgrade an established TLS stream and drive it on its owning thread.
+	handle_connection :: proc(
+		relay: ^Relay,
+		stream: ^tls.Server_Stream,
+		key: string,
+		preload: []u8,
+		conn_id: u64,
+	) {
+		wake, wake_err := linux.eventfd(0, {.NONBLOCK, .CLOEXEC})
+		if wake_err != .NONE {
+			return
+		}
+		defer linux.close(wake)
+		if accept_upgrade(stream, key) != .None {
+			return
+		}
+
+		cs := new(Conn_State)
+		defer free(cs)
+		o := new(Outbox)
+		defer free(o)
+		o.wake = wake
+		conn_state_init(cs, o, relay, stream, conn_id, preload)
+		context.temp_allocator = mem.dynamic_arena_allocator(&cs.scratch)
+		defer conn_state_destroy(cs)
+		ch, err := chan.create(chan.Chan(Out_Msg), OUTBOX_CAPACITY, context.allocator)
+		assert(err == nil)
+		o.ch = ch
+
+		begin_auth(cs)
+		tls_ws_loop(cs)
+	}
+
 	@(private = "file")
 	Tls_Output :: struct {
 		msg:     Out_Msg,

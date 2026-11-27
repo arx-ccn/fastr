@@ -44,7 +44,22 @@ Repo_Route :: struct {
 	url_path:  string,
 }
 
-// Handle a non-websocket HTTP request if it addresses a GRASP repo path.
+@(private)
+plaintext_upgrade_key :: proc(user: rawptr, req: ^ws.Request) -> string {
+	key, ok := ws.websocket_upgrade_key(req)
+	if !ok {
+		return ""
+	}
+	g := (^Http_Routes)(user).grasp
+	if g.enabled {
+		if _, matched := grasp_parse_path(g, req.path); matched {
+			return ""
+		}
+	}
+	return key
+}
+
+// Handle an HTTP request if it addresses a GRASP repo path.
 // Returns true when the request was consumed (response sent).
 grasp_try_handle :: proc(
 	g: ^Grasp_Http,
@@ -59,6 +74,7 @@ grasp_try_handle :: proc(
 	if !matched {
 		return false
 	}
+	grasp_resolve_path(g, &route)
 	if g.profiles != nil &&
 	   g.profiles.cfg.grasp_private &&
 	   !grasp_http_auth(g.profiles, route.url_path, req) {
@@ -148,19 +164,23 @@ grasp_parse_path :: proc(g: ^Grasp_Http, raw_path: string) -> (route: Repo_Route
 	if !dok || !grasp.ident_valid(ident) {
 		return {}, false
 	}
-
-	hex := make([dynamic]u8, 0, 64, context.temp_allocator)
-	pack.hex_encode_into(pubkey[:], &hex)
 	route.owner = pubkey
 	route.ident = ident
+	return route, true
+}
+
+@(private = "file")
+grasp_resolve_path :: proc(g: ^Grasp_Http, route: ^Repo_Route) {
+	hex := make([dynamic]u8, 0, 64, context.temp_allocator)
+	pack.hex_encode_into(route.owner[:], &hex)
 	base := g.dir
 	if route.pr_only {
 		base = strings.concatenate({base, "/prs"}, context.temp_allocator)
 	}
 	route.url_path = fmt.tprintf(
 		"/%s/%s.git",
-		nostr.npub_encode(pubkey, context.temp_allocator),
-		net.percent_encode(ident, context.temp_allocator),
+		nostr.npub_encode(route.owner, context.temp_allocator),
+		net.percent_encode(route.ident, context.temp_allocator),
 	)
 	if route.pr_only {
 		route.url_path = strings.concatenate({"/prs", route.url_path}, context.temp_allocator)
@@ -169,10 +189,9 @@ grasp_parse_path :: proc(g: ^Grasp_Http, raw_path: string) -> (route: Repo_Route
 		"%s/%s/%s.git",
 		base,
 		string(hex[:]),
-		ident,
+		route.ident,
 		allocator = context.temp_allocator,
 	)
-	return route, true
 }
 
 // GET /<repo>.git/info/refs?service=git-upload-pack

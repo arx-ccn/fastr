@@ -109,7 +109,7 @@ wait_recv_stall :: proc(c: ^wsclient.Conn) {
 }
 
 @(private)
-tls_backpressure :: proc(url, dial: string) {
+ws_backpressure :: proc(url, dial: string) {
 	N :: 500
 	seed := tls_smoke_conn(url, dial)
 	defer wsclient.conn_close(&seed)
@@ -137,9 +137,16 @@ tls_backpressure :: proc(url, dial: string) {
 	expect_live(&slow, "slow", ids[N - 1])
 	wait_recv_stall(&slow)
 
-	ev := smoke_signed(7, "dispatch during TLS backpressure", nil)
+	ev := smoke_signed(7, "dispatch during backpressure", nil)
 	smoke_req(&slow, client_event_json(&ev))
 	expect_live(&fast, "fast", ev.id)
+	if wsclient.send_frame(&slow, "ping", 0x9) != .None {
+		fail("send ping")
+	}
+	close := "\x03\xe8"
+	if slow.secure == nil && wsclient.send_frame(&slow, close, 0x8) != .None {
+		fail("queue close behind plaintext replay")
+	}
 	for i := N - 2; i >= 0; i -= 1 {
 		expect_live(&slow, "slow", ids[i])
 		free_all(context.temp_allocator)
@@ -150,26 +157,25 @@ tls_backpressure :: proc(url, dial: string) {
 		fail("slow publisher was rejected")
 	}
 
-	if wsclient.send_frame(&slow, "tls ping", 0x9) != .None {
-		fail("send ping")
-	}
 	opcode, payload, err := wsclient.recv_frame(&slow)
-	if err != .None || opcode != 0xA || string(payload) != "tls ping" {
+	if err != .None || opcode != 0xA || string(payload) != "ping" {
 		fail("bad pong: opcode %x, error %v", opcode, err)
 	}
-	close := "\x03\xe8"
-	if wsclient.send_frame(&slow, close, 0x8) != .None {
-		fail("send close")
-	}
 	when tls.ENABLED {
-		peer := slow.secure.?
-		if tls.SSL_shutdown(peer.ssl) < 0 {
-			fail("send TLS close_notify after WebSocket close")
+		if peer, secure := slow.secure.?; secure {
+			if wsclient.send_frame(&slow, close, 0x8) != .None {
+				fail("send close")
+			}
+			if tls.SSL_shutdown(peer.ssl) < 0 {
+				fail("send TLS close_notify after WebSocket close")
+			}
 		}
 	}
 	opcode, payload, err = wsclient.recv_frame(&slow)
 	if err != .None || opcode != 0x8 || string(payload) != close {
 		fail("bad close echo: opcode %x, error %v", opcode, err)
 	}
-	fmt.println("WSS backpressure: live dispatch, 500 ordered events, EOSE, OK, Pong, and Close")
+	fmt.println(
+		"WebSocket backpressure: live dispatch, 500 ordered events, EOSE, OK, Pong, and Close",
+	)
 }

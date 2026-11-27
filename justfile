@@ -67,6 +67,9 @@ smoke: build
         trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$FASTR_DATA_DIR"' EXIT
         sleep 1
         ./fastr-smoke
+        if [[ -z ${FASTR_WHITELIST:-} ]]; then
+            ./fastr-smoke plaintext-pipeline
+        fi
     )
     unset FASTR_WHITELIST FASTR_SYNC_PEERS
     smoke

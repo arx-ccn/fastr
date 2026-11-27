@@ -104,8 +104,10 @@ main :: proc() {
 					fail("rotate wait must be 1–300 seconds")
 				}
 				tls_reload(url, dial, os.args[2], time.Duration(seconds) * time.Second)
-			case "tls-backpressure":
-				tls_backpressure(url, dial)
+			case "backpressure":
+				ws_backpressure(url, dial)
+			case "plaintext-pipeline":
+				plain_pipeline(url, dial)
 			case:
 				fail("unknown mode %s", os.args[1])
 			}
