@@ -28,6 +28,11 @@ install_binary() {
     [ -f "$BINARY" ] || die "Binary not found: $BINARY  (run: just build)"
     info "Installing binary to $INSTALL_BIN"
     install -m 755 "$BINARY" "$INSTALL_BIN"
+    worker="$(dirname -- "$BINARY")/fastr-acme"
+    if [ -f "$worker" ]; then
+        info "Installing ACME worker to ${INSTALL_BIN}-acme"
+        install -m 755 "$worker" "${INSTALL_BIN}-acme"
+    fi
 }
 
 # ----------------------------------------------------------------------------

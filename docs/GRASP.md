@@ -25,8 +25,8 @@ FASTR_GRASP_DIR=/var/lib/fastr/repos \
 
 Git is required on `PATH` for sync. Private-peer discovery also requires
 curl; it handles bounded HTTP(S) NIP-11 downloads. The production container
-includes both and keeps WebSocket TLS enabled. TLS termination for incoming
-connections still belongs at the reverse proxy.
+includes both. Serve Git HTTPS and WSS on the same listener with
+[native TLS](../README.md#tls), or terminate TLS at your reverse proxy.
 
 Repository identifiers preserve case and accept UTF-8 and spaces; URL paths
 must percent-encode them. Identifiers are limited to 251 bytes and exclude

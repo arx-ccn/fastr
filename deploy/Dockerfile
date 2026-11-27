@@ -15,12 +15,15 @@
 #     --name fastr \
 #     fastr
 #
-# TLS termination is handled by your reverse proxy (nginx, Caddy, etc.).
-# Bind to 127.0.0.1 and proxy from there.
 # =============================================================================
 
+FROM docker.io/library/golang:1.27.4-bookworm AS acme-builder
+WORKDIR /build/cmd/fastr-acme
+COPY cmd/fastr-acme/ .
+RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -o ../../fastr-acme .
+
 # -----------------------------------------------------------------------------
-# Stage 1 — build
+# Build the relay
 # -----------------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 
@@ -55,7 +58,7 @@ RUN odin build cmd/fastr -out:fastr-bin -o:speed \
     && mkdir -p /data && chown 65532:65532 /data
 
 # -----------------------------------------------------------------------------
-# Stage 2 — runtime
+# Runtime
 # Non-root UID is 65532 — /data is pre-created with that ownership
 # so named volumes and bind mounts work without a separate init step.
 # -----------------------------------------------------------------------------
@@ -66,6 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/fastr-bin /fastr
+COPY --from=acme-builder /build/fastr-acme /fastr-acme
 COPY --chown=65532:65532 --from=builder /data /data
 
 ENV FASTR_ADDR=0.0.0.0 \

@@ -159,10 +159,10 @@ just build    # -> ./fastr
 just test     # run all package test suites
 ```
 
-`wss://` sync peers link system OpenSSL (`libssl`). Build with
-`odin build cmd/fastr -define:FASTR_TLS=false` to compile the TLS client out
-(for a `ws://`-only build). The production container includes TLS, Git,
-and curl for GRASP synchronization.
+TLS uses system OpenSSL. Build with `odin build cmd/fastr -define:FASTR_TLS=false`
+to omit both `libssl` and `libcrypto`. That build serves plaintext and cannot
+connect to `wss://` sync peers. The production container includes TLS, Git,
+and curl.
 
 ```sh
 ./fastr                           # serve on 0.0.0.0:8080
@@ -178,7 +178,7 @@ Accepts bare event objects or `["EVENT", {...}]` envelopes, because the world is
 | `FASTR_PORT` | `8080` | Listen port |
 | `FASTR_ADDR` | `0.0.0.0` | Bind address |
 | `FASTR_DATA_DIR` | `./data` | Data directory |
-| `FASTR_MAX_CONNECTIONS` | `1024` | Max WebSocket connections |
+| `FASTR_MAX_CONNECTIONS` | `1024` | Max concurrent connections, including incomplete TLS handshakes |
 | `FASTR_MAX_SUBSCRIPTIONS` | `20` | Max subscriptions per connection |
 | `FASTR_MAX_FILTERS` | `32` | Max filters per subscription |
 | `FASTR_MAX_FILTER_VALUES` | `4096` | Max values in one filter field (`ids`, `authors`, `kinds`, `#x`). ngit puts every PR and issue id of a repository into one filter |
@@ -311,7 +311,52 @@ podman compose -f deploy/docker-compose.yml up -d
 
 ### TLS
 
-fastr does not handle TLS. Put a reverse proxy in front of it.
+On Linux, fastr serves HTTPS, WSS, and GRASP Git HTTPS on the same listener.
+Leave the TLS settings unset to keep plaintext or terminate TLS at a reverse
+proxy. A TLS listener does not accept plaintext.
+
+#### Use your own certificate
+
+Set both `FASTR_TLS_CERT_FILE` and `FASTR_TLS_KEY_FILE`. The certificate file
+starts with the leaf followed by any intermediate certificates. The PEM key
+must be unencrypted and readable by the relay user. Set `FASTR_URL` to the
+public WSS URL if it differs from the bind address and port.
+
+After renewal, replace the files or atomically switch their parent symlink to
+the new pair, then send `SIGHUP`. If the replacement fails validation, fastr
+keeps the current certificate. Reloads do not disconnect existing clients.
+
+#### Let fastr renew the certificate
+
+For a source build, install Go 1.26 or later and run `just build-acme`. Keep
+`fastr-acme` next to `fastr`; the container already includes it. The relay
+starts the worker itself. Do not configure manual PEM paths in this mode.
+
+Replace `relay.example.com` with your hostname. Point its DNS records at the
+relay and make the listener reachable on public TCP 443 at every advertised
+address. ACME uses TLS-ALPN-01, so it does not need port 80. Set
+`FASTR_ACME_ACCEPT_TOS=1` only after accepting your CA's terms.
+
+```sh
+podman run -d --name fastr \
+  -p 443:8080 -v fastr-data:/data \
+  -e FASTR_ACME_DOMAIN=relay.example.com \
+  -e FASTR_ACME_ACCEPT_TOS=1 \
+  fastr
+```
+
+The default directory is Let's Encrypt production. Set `FASTR_ACME_DIRECTORY`
+to an absolute HTTPS directory URL to use another CA or staging. Keep the data
+directory across restarts: it holds the ACME account key, certificate, and
+retry deadline. In managed mode the default `FASTR_URL` is `wss://<hostname>`.
+
+For systemd, install [`deploy/fastr-tls.conf`](deploy/fastr-tls.conf) as
+`/etc/systemd/system/fastr.service.d/tls.conf`, then set your TLS environment
+variables in a drop-in. This lets the existing non-root service bind TCP 443
+and makes `systemctl reload fastr` send `SIGHUP`. In managed mode, reload
+requests early renewal without bypassing the retry deadline.
+
+#### Keep a reverse proxy
 
 **nginx:**
 
@@ -341,8 +386,6 @@ relay.example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
-
-TLS termination belongs at the edge, not in the relay. One proxy, one job.
 
 ---
 

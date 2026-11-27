@@ -2,6 +2,9 @@
 build:
     odin build cmd/fastr -out:fastr -o:speed
 
+build-acme:
+    cd cmd/fastr-acme && CGO_ENABLED=0 go build -mod=readonly -trimpath -o ../../fastr-acme .
+
 # Build with debug info
 build-debug:
     odin build cmd/fastr -out:fastr-debug -debug
