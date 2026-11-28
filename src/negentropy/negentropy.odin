@@ -183,19 +183,24 @@ fingerprint :: proc(
 		}
 	}
 
-	input: [ID_SIZE + 10]u8
+	LENGTH_AT :: sha2.BLOCK_SIZE_256 - size_of(u64)
+	#assert(ID_SIZE + 10 < LENGTH_AT)
+	block: [sha2.BLOCK_SIZE_256]u8
 	#unroll for limb in 0 ..< 4 {
-		word := transmute([8]u8)u64le(acc[limb])
-		copy(input[limb * 8:], word[:])
+		endian.unchecked_put_u64le(block[limb * 8:], acc[limb])
 	}
-	n := encode_var_int_buf(input[ID_SIZE:], u64(end - begin))
+	n := ID_SIZE + encode_var_int_buf(block[ID_SIZE:], u64(end - begin))
+	// The input is at most 42 bytes. Its SHA-256 padding fits in this block.
+	block[n] = 0x80
+	endian.unchecked_put_u64be(block[LENGTH_AT:], u64(n) * 8)
 
 	ctx: sha2.Context_256
 	sha2.init_256(&ctx)
-	sha2.update(&ctx, input[:ID_SIZE + n])
-	hash: [32]u8
-	sha2.final(&ctx, hash[:])
-	copy(fp[:], hash[:FINGERPRINT_SIZE])
+	// update compresses a complete block. final would add padding again.
+	sha2.update(&ctx, block[:])
+	#unroll for i in 0 ..< FINGERPRINT_SIZE / size_of(u32) {
+		endian.unchecked_put_u32be(fp[i * 4:], ctx.h[i])
+	}
 	return fp, .None
 }
 

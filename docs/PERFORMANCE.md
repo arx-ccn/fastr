@@ -72,6 +72,9 @@ mailbox filter whose entries all qualify, it checks the record cap up front and
 fills the inventory from `index.o`. It fills merged runs backwards and restores
 ascending ID order within each timestamp. Queries that can require a record read
 keep their existing traversal and sort afterward.
+The fingerprint input, an ID sum and an item count, fits in one SHA-256
+block with padding. The relay reads the digest from the state after one
+block update.
 
 A filter whose `authors` are all full 32-byte keys reads those authors'
 postings: in-memory runs of index slots, newest first, built at boot and
