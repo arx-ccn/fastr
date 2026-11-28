@@ -199,6 +199,8 @@ After NEG-CLOSE, each connection can reuse one inventory with space for at
 most 64 items. The server writes reconciliation ranges directly into the
 reply. It rolls back a fingerprint range that exceeds the frame budget
 before writing the remaining range's fingerprint.
+For large ranges, it sums the IDs by bucket. If the peer fingerprint
+differs, the reply reuses those sums instead of reading the IDs again.
 
 [Measurements](BENCHMARKS.md#ingest-replies-and-author-postings-2026-11-27)
 cover ingest, author filters, boot time, and memory.

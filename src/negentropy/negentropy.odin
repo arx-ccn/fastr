@@ -171,25 +171,34 @@ fingerprint :: proc(
 	if begin > end || end > len(s.items) || begin < 0 {
 		return {}, .Bad_Range
 	}
+	return fingerprint_sum(sum_ids(s.items[begin:end]), end - begin), .None
+}
 
-	// 256-bit accumulator as four little-endian u64 limbs.
-	acc: [4]u64
-	for i in begin ..< end {
-		id := &s.items[i].id
+// A 256-bit sum modulo 2^256, stored as four little-endian limbs.
+@(private)
+Id_Sum :: [4]u64
+
+@(private)
+sum_ids :: proc(items: []Item) -> (acc: Id_Sum) {
+	for &item in items {
 		carry: u64
 		#unroll for limb in 0 ..< 4 {
-			v := endian.unchecked_get_u64le(id[limb * 8:])
+			v := endian.unchecked_get_u64le(item.id[limb * 8:])
 			acc[limb], carry = bits.add_u64(acc[limb], v, carry)
 		}
 	}
+	return
+}
 
+@(private)
+fingerprint_sum :: proc(acc: Id_Sum, count: int) -> (fp: [FINGERPRINT_SIZE]u8) {
 	LENGTH_AT :: sha2.BLOCK_SIZE_256 - size_of(u64)
 	#assert(ID_SIZE + 10 < LENGTH_AT)
 	block: [sha2.BLOCK_SIZE_256]u8
 	#unroll for limb in 0 ..< 4 {
 		endian.unchecked_put_u64le(block[limb * 8:], acc[limb])
 	}
-	n := ID_SIZE + encode_var_int_buf(block[ID_SIZE:], u64(end - begin))
+	n := ID_SIZE + encode_var_int_buf(block[ID_SIZE:], u64(count))
 	// The input is at most 42 bytes. Its SHA-256 padding fits in this block.
 	block[n] = 0x80
 	endian.unchecked_put_u64be(block[LENGTH_AT:], u64(n) * 8)
@@ -201,7 +210,23 @@ fingerprint :: proc(
 	#unroll for i in 0 ..< FINGERPRINT_SIZE / size_of(u32) {
 		endian.unchecked_put_u32be(fp[i * 4:], ctx.h[i])
 	}
-	return fp, .None
+	return fp
+}
+
+@(private)
+sum_buckets :: proc(items: []Item, sums: ^[BUCKETS]Id_Sum) -> (total: Id_Sum) {
+	width, extra := len(items) / BUCKETS, len(items) % BUCKETS
+	start := 0
+	for &sum, i in sums {
+		end := start + width + (1 if i < extra else 0)
+		sum = sum_ids(items[start:end])
+		carry: u64
+		#unroll for limb in 0 ..< 4 {
+			total[limb], carry = bits.add_u64(total[limb], sum[limb], carry)
+		}
+		start = end
+	}
+	return
 }
 
 // Varint ---------------------------------------------------------------------
@@ -341,14 +366,22 @@ reconcile :: proc(
 			skip = true
 		case .Fingerprint:
 			their_fp := get_fingerprint_bytes(&query) or_return
-			our_fp := fingerprint(n.storage, lower, upper) or_return
+			items := n.storage.items[lower:upper]
+			sums: [BUCKETS]Id_Sum = ---
+			bucketed := len(items) >= DOUBLE_BUCKETS
+			sum := sum_buckets(items, &sums) if bucketed else sum_ids(items)
+			our_fp := fingerprint_sum(sum, len(items))
 			if their_fp != our_fp {
 				if skip {
 					skip = false
 					encode_bound(n, &full, prev_bound)
 					encode_var_int(&full, u64(Mode.Skip))
 				}
-				split_range(n, lower, upper, curr_bound, &full) or_return
+				if bucketed {
+					write_fingerprint_buckets(n, lower, upper, curr_bound, &full, &sums) or_return
+				} else {
+					split_range(n, lower, upper, curr_bound, &full) or_return
+				}
 			} else {
 				skip = true
 			}
@@ -425,13 +458,30 @@ split_range :: proc(
 		return .None
 	}
 
+	return write_fingerprint_buckets(n, lower, upper, upper_bound, o, nil)
+}
+
+@(private)
+write_fingerprint_buckets :: proc(
+	n: ^Negentropy,
+	lower, upper: int,
+	upper_bound: Bound,
+	o: ^[dynamic]u8,
+	sums: ^[BUCKETS]Id_Sum,
+) -> Error {
+	num_elems := upper - lower
 	items_per_bucket := num_elems / BUCKETS
 	buckets_with_extra := num_elems % BUCKETS
 	curr := lower
 
 	for i in 0 ..< BUCKETS {
 		bucket_size := items_per_bucket + (1 if i < buckets_with_extra else 0)
-		fp := fingerprint(n.storage, curr, curr + bucket_size) or_return
+		fp: [FINGERPRINT_SIZE]u8
+		if sums != nil {
+			fp = fingerprint_sum(sums[i], bucket_size)
+		} else {
+			fp = fingerprint(n.storage, curr, curr + bucket_size) or_return
+		}
 		curr += bucket_size
 
 		next_bound: Bound
