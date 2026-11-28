@@ -328,16 +328,13 @@ reconcile :: proc(
 	prev_index := 0
 	skip := false
 
-	o := make([dynamic]u8, context.temp_allocator)
-
 	for len(query) > 0 {
-		clear(&o)
-
 		curr_bound := decode_bound(n, &query) or_return
 		mode := decode_mode(&query) or_return
 
 		lower := prev_index
 		upper := find_lower_bound(n.storage, prev_index, size, curr_bound)
+		committed := len(full)
 
 		switch mode {
 		case .Skip:
@@ -348,10 +345,10 @@ reconcile :: proc(
 			if their_fp != our_fp {
 				if skip {
 					skip = false
-					encode_bound(n, &o, prev_bound)
-					encode_var_int(&o, u64(Mode.Skip))
+					encode_bound(n, &full, prev_bound)
+					encode_var_int(&full, u64(Mode.Skip))
 				}
-				split_range(n, lower, upper, curr_bound, &o) or_return
+				split_range(n, lower, upper, curr_bound, &full) or_return
 			} else {
 				skip = true
 			}
@@ -365,16 +362,14 @@ reconcile :: proc(
 
 			if skip {
 				skip = false
-				// Keep the old size accounting: the skip prefix is committed
-				// together with the ID list, after selecting its range.
-				encode_bound(n, &o, prev_bound)
-				encode_var_int(&o, u64(Mode.Skip))
+				encode_bound(n, &full, prev_bound)
+				encode_var_int(&full, u64(Mode.Skip))
 			}
 
 			end_bound := curr_bound
 
 			for i in lower ..< upper {
-				if exceeded_frame_size_limit(n, len(full) + (i - lower) * ID_SIZE) {
+				if exceeded_frame_size_limit(n, committed + (i - lower) * ID_SIZE) {
 					end_bound = bound_from_item(n.storage.items[i])
 					// Shrink upper so the remaining range gets a fingerprint.
 					upper = i
@@ -382,17 +377,18 @@ reconcile :: proc(
 				}
 			}
 
-			append(&full, ..o[:])
-			clear(&o)
 			encode_bound(n, &full, end_bound)
 			encode_var_int(&full, u64(Mode.Id_List))
 			encode_var_int(&full, u64(upper - lower))
 			for i in lower ..< upper {
 				append(&full, ..n.storage.items[i].id[:])
 			}
+			// The ID list was already shortened to fit; keep it before the fingerprint.
+			committed = len(full)
 		}
 
-		if exceeded_frame_size_limit(n, len(full) + len(o)) {
+		if exceeded_frame_size_limit(n, len(full)) {
+			non_zero_resize(&full, committed)
 			// Frame size limit exceeded: stop range processing and return a
 			// fingerprint for the remaining range.
 			remaining_fp := fingerprint(n.storage, upper, size) or_return
@@ -401,7 +397,6 @@ reconcile :: proc(
 			append(&full, ..remaining_fp[:])
 			break
 		}
-		append(&full, ..o[:])
 
 		prev_index = upper
 		prev_bound = curr_bound

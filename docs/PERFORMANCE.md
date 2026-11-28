@@ -196,7 +196,9 @@ The WebSocket handshake writes its base64 accept key without allocating.
 WebSocket message scratch is reset after each message and retains at most
 64 KiB of blocks per connection.
 After NEG-CLOSE, each connection can reuse one inventory with space for at
-most 64 items. Reconciliation replies use message scratch until framed.
+most 64 items. The server writes reconciliation ranges directly into the
+reply. It rolls back a fingerprint range that exceeds the frame budget
+before writing the remaining range's fingerprint.
 
 [Measurements](BENCHMARKS.md#ingest-replies-and-author-postings-2026-11-27)
 cover ingest, author filters, boot time, and memory.
