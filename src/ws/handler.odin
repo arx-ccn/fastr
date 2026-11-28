@@ -729,9 +729,12 @@ handle_req :: proc(cs: ^Conn_State, sub_id: string, filters: []nostr.Filter) {
 			}
 			return false
 		})
-		ordered := make([dynamic]u8, 0, len(qctx.wire) + 64)
+		ordered: [dynamic]u8
+		non_zero_reserve(&ordered, len(qctx.wire) + 64)
+		non_zero_resize(&ordered, len(qctx.wire))
+		pos := 0
 		for hit in qctx.hits {
-			append(&ordered, ..qctx.wire[hit.start:hit.end])
+			pos += copy(ordered[pos:], qctx.wire[hit.start:hit.end])
 		}
 		delete(qctx.wire)
 		qctx.wire = ordered

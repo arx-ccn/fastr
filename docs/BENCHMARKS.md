@@ -773,3 +773,23 @@ run counted 10,000 relay syscalls before and zero after for each 10,000-event
 phase (fresh and duplicate). Startup counted one before and zero after.
 The timing runs were not traced. Raw results are in
 `~/.cache/fastr-bench/vdso-ulE6Ox/` (`timing.tsv` and `trace.tsv`).
+
+## Multi-filter replay buffer: 2026-11-28
+
+The REQ handler sets the output buffer length once and copies the sorted
+frames into place. The sort and wire order are unchanged.
+
+Magnitude's `relay-bench` sent 2,000 `multi_filter` REQs per run from eight
+connections to a reopened 100,000-event store. Each comparison balanced
+the order of the three builds across 12 rotations. Magnitude was at
+`e7892e152` with syncing enabled. Values are median requests per second.
+
+| Comparison | fastr `b176bf5` | fastr with direct copies | Magnitude |
+|---|---:|---:|---:|
+| First | 36,868 | 38,214 | 38,612 |
+| Repeat | 38,071 | 38,526 | 38,460 |
+
+The change gained 3.65% and 1.20% over the fastr baseline. The two results
+do not establish a lead over Magnitude. Raw results and checksums are in
+`~/.cache/fastr-bench/magnitude-current.4lWTGX/parity-candidate.bQvdQG/` and
+`~/.cache/fastr-bench/magnitude-current.4lWTGX/parity-candidate.FaWfIL/`.
