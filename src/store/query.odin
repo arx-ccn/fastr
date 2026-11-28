@@ -260,8 +260,9 @@ count_matches :: proc(
 
 @(private)
 Posting_Cursor :: struct {
-	run:  ^Posting_Run,
-	next: int,
+	run:        ^Posting_Run,
+	next:       int,
+	created_at: i64,
 }
 
 // A filter reads author postings while its authors hold at most one part in
@@ -320,6 +321,12 @@ cursor_seek :: proc(c: ^Posting_Cursor, kinds: []u16) -> bool {
 	return c.next < len(slots)
 }
 
+@(private)
+cursor_stamp :: #force_inline proc(c: ^Posting_Cursor, idx: rawptr) {
+	entries := cast([^][INDEX_ENTRY_SIZE]u8)idx
+	c.created_at = i64(endian.unchecked_get_u64le(entries[c.run.slots[c.next].slot][8:]))
+}
+
 // `heads` is a binary heap of unfinished cursors, the one with the newest
 // next posting first. Move the cursor at `i` down to where it belongs.
 @(private)
@@ -331,8 +338,10 @@ cursor_sift :: proc(heads: []Posting_Cursor, i: int, idx: rawptr) {
 			if child >= len(heads) {
 				break
 			}
-			a, b := heads[child], heads[newest]
-			if posting_newer(a.run.slots[a.next], b.run.slots[b.next], idx) {
+			a, b := &heads[child], &heads[newest]
+			if a.created_at > b.created_at ||
+			   (a.created_at == b.created_at &&
+					   posting_newer(a.run.slots[a.next], b.run.slots[b.next], idx)) {
 				newest = child
 			}
 		}
@@ -358,6 +367,11 @@ cursors_heap :: proc(cursors: []Posting_Cursor, kinds: []u16, idx: rawptr) -> []
 			heads = heads[:last]
 		}
 	}
+	if len(heads) > 1 {
+		for &c in heads {
+			cursor_stamp(&c, idx)
+		}
+	}
 	for i := len(heads) / 2 - 1; i >= 0; i -= 1 {
 		cursor_sift(heads, i, idx)
 	}
@@ -374,6 +388,8 @@ posting_next :: proc(heads: ^[]Posting_Cursor, kinds: []u16, idx: rawptr) -> Pos
 		last := len(heads) - 1
 		heads[0], heads[last] = heads[last], heads[0]
 		heads^ = heads[:last]
+	} else if len(heads) > 1 {
+		cursor_stamp(top, idx)
 	}
 	if len(heads) > 1 {
 		cursor_sift(heads^, 0, idx)

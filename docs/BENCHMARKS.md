@@ -793,3 +793,24 @@ The change gained 3.65% and 1.20% over the fastr baseline. The two results
 do not establish a lead over Magnitude. Raw results and checksums are in
 `~/.cache/fastr-bench/magnitude-current.4lWTGX/parity-candidate.bQvdQG/` and
 `~/.cache/fastr-bench/magnitude-current.4lWTGX/parity-candidate.FaWfIL/`.
+
+## Posting cursor timestamps: 2026-11-28
+
+The merge heap caches the timestamp of each cursor's current posting.
+It reads event IDs from the index only to break ties.
+
+The comparison used the same fixture and Magnitude revision as above.
+The reopened stores ran 2,000 requests per workload in each of 12
+rotations. The live stores ran 4,000 requests per workload in each of six
+rotations, after ingest on the same relay process. Each run used eight
+connections. Values are median requests per second.
+
+| `dm_catchup` store | fastr `0e3c63c` | fastr with cached timestamps | Magnitude |
+|---|---:|---:|---:|
+| Reopened | 36,322 | 37,240 | 36,936 |
+| Live | 34,979 | 36,566 | 36,707 |
+
+`dm_catchup` gained 2.53% and 4.54% over the fastr baseline. `time_window`
+gained 1.83% after reopening and lost 0.36% after live ingest. Raw results
+are in `~/.cache/fastr-bench/magnitude-current.4lWTGX/` under
+`parity-candidate.LhR6n4/` and `query-online.ggSh3F/`.
