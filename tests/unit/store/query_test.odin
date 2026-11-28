@@ -217,7 +217,8 @@ test_tag_filter_encodings :: proc(t: ^testing.T) {
 	s := test_open(t, dir)
 	defer store_close(s)
 
-	long_value := "a tag value longer than thirty-two bytes"
+	// The final uppercase byte fails lowercase hex decoding after a valid prefix.
+	long_value := "0123456789abcdef0123456789abcdef" + "0123456789abcdef0123456789abcdeA"
 	hash := hash_value(long_value)
 	raw32 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	hex64 := test_hex(transmute([]u8)raw32)

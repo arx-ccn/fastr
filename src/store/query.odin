@@ -31,10 +31,14 @@ build_tag_specs :: proc(filter: ^nostr.Filter, allocator := context.temp_allocat
 		for v in values {
 			tv: Tag_Value
 			vb := transmute([]u8)v
-			if len(v) == 64 && pack.is_hex(vb) {
-				_, _ = pack.hex_decode(vb, tv.bytes[:])
-				tv.length = 32
-			} else if len(v) <= 32 {
+			if len(v) == 64 {
+				if _, err := pack.hex_decode(vb, tv.bytes[:]); err == .None {
+					tv.length = 32
+					append(&decoded, tv)
+					continue
+				}
+			}
+			if len(v) <= 32 {
 				copy(tv.bytes[:], vb)
 				tv.length = u8(len(v))
 			} else {
@@ -404,20 +408,28 @@ tag_value_hash :: proc(name: u8, value: Tag_Value) -> u32 {
 tag_chain_heads :: proc(chains: ^Tag_Chains, specs: []Tag_Spec) -> (heads: []u32, records: int) {
 	records = max(int)
 	for spec in specs {
-		found := make([dynamic]u32, 0, len(spec.values), context.temp_allocator)
-		seen := make(map[u32]struct{}, context.temp_allocator)
+		found := non_zero_make([]u32, len(spec.values), context.temp_allocator)
+		seen: map[u32]struct{}
+		seen.allocator = context.temp_allocator
+		n := 0
 		named := 0
 		for value in spec.values {
 			bucket := tag_bucket(chains.buckets, tag_value_hash(spec.name, value))
-			if bucket.count == 0 || bucket.head in seen {
+			if bucket.count == 0 {
 				continue
 			}
-			seen[bucket.head] = {}
-			append(&found, bucket.head)
+			if len(spec.values) > 1 {
+				if bucket.head in seen {
+					continue
+				}
+				seen[bucket.head] = {}
+			}
+			found[n] = bucket.head
+			n += 1
 			named += int(bucket.count)
 		}
 		if named < records {
-			heads, records = found[:], named
+			heads, records = found[:n], named
 		}
 	}
 	return

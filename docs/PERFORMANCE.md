@@ -214,7 +214,8 @@ response construction before the WebSocket write:
   alongside candidate index slots. It checks each event's tag range without
   building a full matching-offset map. Rare filters may still scan the whole
   index. Heap ordering, visibility rules, recipient checks, and timestamp
-  ceilings remain in force.
+  ceilings remain in force. Query setup validates hex tag values as it decodes
+  them and tracks duplicate chain heads only for tags with multiple values.
 - `src/pack/pack.odin` scans unescaped bytes and valid ASCII prefixes in 16-byte
   SIMD blocks. The ASCII scan overlaps the last block when fewer than 16 bytes
   remain. For a short packed field it loads the 16 bytes ending at the field
