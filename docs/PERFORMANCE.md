@@ -163,6 +163,8 @@ Client `EVENT` and `AUTH` messages, relay `EVENT` messages, bare JSONL
 events and HTTP auth events use the same native field decoder. It reads the
 seven event fields without building a JSON object tree. Tag strings and
 content belong to the caller's allocator; the input buffer can be reused.
+When a SIMD block contains a quote, backslash, control byte, or non-ASCII
+byte, scalar decoding starts at that byte instead of rescanning the block.
 The event decoder checks unknown fields and trailing envelope elements. The
 GRASP watcher still requires exactly three envelope elements. Duplicate keys,
 trailing commas, trailing data, and out-of-range timestamps or kinds are

@@ -1,6 +1,7 @@
 package nostr
 
 import "core:fmt"
+import "core:math/bits"
 import "core:mem"
 import "core:simd"
 import "core:strings"
@@ -86,7 +87,9 @@ read_event_text :: proc(s: ^string) -> (Event_Text, bool) {
 				simd.lanes_lt(v, simd.u8x16(' ')) |
 				simd.lanes_eq(v, simd.u8x16('"')) |
 				simd.lanes_eq(v, simd.u8x16('\\'))
-			if simd.extract_msbs(stop) != {} {
+			mask := transmute(u16)simd.extract_msbs(stop)
+			if mask != 0 {
+				i += int(bits.trailing_zeros(mask))
 				break
 			}
 		}
